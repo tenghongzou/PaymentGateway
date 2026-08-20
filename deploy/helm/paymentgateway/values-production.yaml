@@ -1,0 +1,118 @@
+# Production overrides. helm upgrade -f values.yaml -f values-production.yaml --set global.imageTag=v1.2.3
+global:
+  env: production
+  logLevel: info
+  autoMigrate: false              # migrations run only via the pre-upgrade Job (expand/contract, see docs/07-deployment.md)
+  imagePullPolicy: IfNotPresent
+  redis:
+    addr: clustercfg.pg-prod-redis.xxxxxx.apne1.cache.amazonaws.com:6379
+    cidrs: ["10.10.0.0/16"]
+  postgres:
+    host: pg-prod.cluster-xyz.ap-northeast-1.rds.amazonaws.com
+    cidrs: ["10.10.0.0/16"]
+  kafka:
+    brokers: b-1.pg-prod.kafka.ap-northeast-1.amazonaws.com:9096,b-2.pg-prod.kafka.ap-northeast-1.amazonaws.com:9096,b-3.pg-prod.kafka.ap-northeast-1.amazonaws.com:9096
+    cidrs: ["10.10.0.0/16"]
+  topologySpread:
+    whenUnsatisfiable: DoNotSchedule
+  imagePullSecrets:
+    - name: ghcr-pull-secret
+
+externalSecrets:
+  refreshInterval: 15m
+
+migrations:
+  hooks: pre-upgrade
+
+serviceDefaults:
+  replicas: 3
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { memory: 1Gi }
+  hpa:
+    minReplicas: 3
+    maxReplicas: 20
+  pdb:
+    minAvailable: 2
+  tolerations: []
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/part-of: paymentgateway
+
+services:
+  api-gateway:
+    replicas: 4
+    resources:
+      requests: { cpu: 500m, memory: 512Mi }
+      limits: { memory: 2Gi }
+    hpa:
+      minReplicas: 4
+      maxReplicas: 40
+      targetCPUUtilizationPercentage: 55
+    pdb:
+      minAvailable: 3
+    ingress:
+      hosts:
+        - api.paymentgateway.example.com
+      tls:
+        secretName: api-paymentgateway-tls
+      rateLimit:
+        rps: 300
+        connections: 200
+  payment-service:
+    replicas: 4
+    resources:
+      requests: { cpu: 500m, memory: 512Mi }
+      limits: { memory: 2Gi }
+    hpa:
+      minReplicas: 4
+      maxReplicas: 40
+      targetCPUUtilizationPercentage: 60
+    pdb:
+      minAvailable: 3
+  ledger-service:
+    hpa:
+      maxReplicas: 12
+      # Scale on Kafka consumer lag exposed through prometheus-adapter (or switch to KEDA ScaledObject)
+      customMetrics:
+        - type: External
+          external:
+            metric:
+              name: kafka_consumergroup_lag
+              selector:
+                matchLabels:
+                  consumergroup: ledger-service
+            target:
+              type: AverageValue
+              averageValue: "1000"
+  webhook-service:
+    replicas: 3
+    hpa:
+      maxReplicas: 16
+      customMetrics:
+        - type: External
+          external:
+            metric:
+              name: pg_webhook_pending_deliveries
+            target:
+              type: AverageValue
+              averageValue: "2000"
+  reconciliation-service:
+    replicas: 1
+    hpa:
+      enabled: false
+    pdb:
+      enabled: false
+  provider-mock:
+    enabled: false                # never run the mock PSP in production
+  provider-stripe:
+    replicas: 3
+    hpa:
+      minReplicas: 3
+      maxReplicas: 12

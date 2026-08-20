@@ -1,0 +1,32 @@
+// 錯誤細節共用訊息。
+//
+// gRPC 服務回傳錯誤時，應以 google.rpc.Status 的 details 夾帶本訊息（透過 status.WithDetails），
+// api-gateway 據此轉譯為 REST 錯誤格式（docs/01-architecture.md §8）：
+//
+//   { "error": { "type": "...", "code": "...", "message": "...", "param": "...", "request_id": "req_..." } }
+//
+// request_id 由 api-gateway 自行附加，不在本訊息內。
+syntax = "proto3";
+
+package pg.common.v1;
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/common/v1;commonv1";
+
+// ErrorDetail 為跨服務統一的業務錯誤描述。
+message ErrorDetail {
+  // 錯誤大類。必須為下列其中之一（與 REST 的 error.type 一致）：
+  //   invalid_request_error | authentication_error | idempotency_error |
+  //   rate_limit_error | provider_error | api_error
+  string type = 1;
+
+  // 機器可讀的錯誤碼，snake_case，例：amount_too_small、card_declined、idempotency_key_in_use。
+  // 完整清單見 docs/03-api.md「錯誤碼總表」。新增 code 屬向後相容變更；變更既有 code 語意屬 breaking change。
+  string code = 2;
+
+  // 人類可讀的說明（英文），僅供除錯與顯示，客戶端不得依賴其內容做邏輯判斷。
+  string message = 3;
+
+  // 導致錯誤的欄位名稱（JSON 路徑，例：amount.currency、payment_method.card_token.token）。
+  // 與特定欄位無關時留空。
+  string param = 4;
+}

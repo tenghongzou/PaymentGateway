@@ -1,0 +1,193 @@
+// webhook-service（gRPC :9004，DB pg_webhook）對內契約。
+//
+// 職責：消費 payment.events → 依商戶的 WebhookEndpoint 訂閱產生 delivery → HTTP POST 給商戶，
+//       HMAC-SHA256 簽章（X-PG-Signature: t=<ts>,v1=<hmac>）、指數退避重試、死信（dead_letter）。
+// 本 gRPC 介面供 api-gateway（商戶查詢 /events 的送達狀態、手動重送）與後台使用。
+//
+// 重試策略：最多 8 次，間隔 1m、5m、30m、2h、6h、12h、24h、24h（約 3 天）；
+// 全部失敗 → DEAD_LETTER（死信），並計入端點連續失敗計數（觸發 AUTO_DISABLED）。
+syntax = "proto3";
+
+package pg.webhook.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pg/common/v1/pagination.proto";
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/webhook/v1;webhookv1";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// WebhookService 提供 delivery 查詢與重送。
+service WebhookService {
+  // 列出 delivery，可依商戶 / 端點 / 事件 / 狀態 / 時間篩選；依 created_at DESC 排序。
+  rpc ListDeliveries(ListDeliveriesRequest) returns (ListDeliveriesResponse);
+
+  // 依 ID 取得 delivery（含所有 attempts）。跨商戶回 NOT_FOUND。
+  rpc GetDelivery(GetDeliveryRequest) returns (GetDeliveryResponse);
+
+  // 手動重送：將 delivery 排入立即重試（不計入自動重試次數上限）。
+  // 前置狀態：FAILED、DEAD_LETTER 或 SUCCEEDED（商戶要求重放）。PENDING / IN_FLIGHT 回 FAILED_PRECONDITION。
+  // 端點為 DISABLED / DELETED 時回 FAILED_PRECONDITION。
+  rpc RetryDelivery(RetryDeliveryRequest) returns (RetryDeliveryResponse);
+
+  // 列出系統支援的所有事件類型（供商戶設定端點訂閱與文件生成）。
+  rpc ListEventTypes(ListEventTypesRequest) returns (ListEventTypesResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// DeliveryStatus 為 delivery 狀態（與 pg_webhook 資料庫定義一致）。
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  // 等待送出（含等待重試）。
+  DELIVERY_STATUS_PENDING = 1;
+  // 送出中。
+  DELIVERY_STATUS_IN_FLIGHT = 2;
+  // 已送達（商戶回 2xx）。
+  DELIVERY_STATUS_SUCCEEDED = 3;
+  // 最近一次嘗試失敗，仍會重試（next_retry_at 有值）。
+  DELIVERY_STATUS_FAILED = 4;
+  // 重試次數用盡，進入死信（dead_letter）；不再自動重試，可由 RetryDelivery 手動重送。
+  DELIVERY_STATUS_DEAD_LETTER = 5;
+  // 端點被刪除 / 停用，delivery 取消。
+  DELIVERY_STATUS_CANCELED = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Domain messages
+// ---------------------------------------------------------------------------
+
+// DeliveryAttempt 為一次 HTTP 送達嘗試。
+message DeliveryAttempt {
+  // 嘗試序號，從 1 開始。
+  int32 attempt_number = 1;
+  // 送出時間。
+  google.protobuf.Timestamp attempted_at = 2;
+  // 商戶端回應的 HTTP 狀態碼；連線失敗為 0。
+  int32 response_status = 3;
+  // 回應 body 前 1KB（除錯用）。
+  string response_body_snippet = 4;
+  // 連線 / 逾時錯誤訊息（無 HTTP 回應時）。
+  string error = 5;
+  // 耗時（毫秒）。
+  int64 duration_ms = 6;
+  // 是否成功（2xx）。
+  bool succeeded = 7;
+}
+
+// Delivery 為一筆「事件 → 端點」的送達任務。
+message Delivery {
+  // delivery ID，格式 whd_ + ULID。
+  string id = 1;
+  // 所屬商戶。
+  string merchant_id = 2;
+  // 目標端點。
+  string endpoint_id = 3;
+  // 目標 URL（建立 delivery 時的快照）。
+  string endpoint_url = 4;
+  // 事件 ID（evt_…）。
+  string event_id = 5;
+  // 事件類型（例：payment.captured）。
+  string event_type = 6;
+  // 狀態。
+  DeliveryStatus status = 7;
+  // 已嘗試次數。
+  int32 attempt_count = 8;
+  // 自動重試上限（預設 8）。
+  int32 max_attempts = 9;
+  // 下次重試時間（FAILED 時）。
+  google.protobuf.Timestamp next_retry_at = 10;
+  // 最近一次嘗試時間。
+  google.protobuf.Timestamp last_attempted_at = 11;
+  // 最近一次回應狀態碼。
+  int32 last_response_status = 12;
+  // 最近一次錯誤。
+  string last_error = 13;
+  // 送給商戶的 JSON payload（Event 物件序列化；與 REST /events/{id} 內容一致）。GetDelivery 時回傳，List 時為空。
+  bytes payload = 14;
+  // 所有嘗試（GetDelivery 時回傳）。
+  repeated DeliveryAttempt attempts = 15;
+  bool livemode = 16;
+  google.protobuf.Timestamp created_at = 17;
+  google.protobuf.Timestamp updated_at = 18;
+  // 成功送達時間。
+  google.protobuf.Timestamp delivered_at = 19;
+  // 進入死信的時間（DEAD_LETTER 時）。
+  google.protobuf.Timestamp dead_lettered_at = 20;
+}
+
+// EventTypeInfo 為事件類型描述。
+message EventTypeInfo {
+  // 事件名稱（例：payment.captured）。
+  string name = 1;
+  // 說明（繁體中文）。
+  string description = 2;
+  // payload 中 data.object 的資源類型：payment | refund | dispute。
+  string object_type = 3;
+  // 是否為終態事件（商戶收到後該資源不會再變化）。
+  bool terminal = 4;
+}
+
+// ---------------------------------------------------------------------------
+// RPC messages
+// ---------------------------------------------------------------------------
+
+// ListDeliveriesRequest 列出 delivery。
+message ListDeliveriesRequest {
+  // 商戶 ID。必填。
+  string merchant_id = 1;
+  pg.common.v1.PageRequest page = 2;
+  // 依端點篩選。
+  string endpoint_id = 3;
+  // 依事件篩選（查某事件送到哪些端點）。
+  string event_id = 4;
+  // 依事件類型篩選。
+  string event_type = 5;
+  // 依狀態篩選（多選 OR）。
+  repeated DeliveryStatus statuses = 6;
+  google.protobuf.Timestamp created_after = 7;
+  google.protobuf.Timestamp created_before = 8;
+  optional bool livemode = 9;
+}
+
+// ListDeliveriesResponse 列表結果。
+message ListDeliveriesResponse {
+  repeated Delivery deliveries = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// GetDeliveryRequest 查詢 delivery。
+message GetDeliveryRequest {
+  string merchant_id = 1;
+  string delivery_id = 2;
+}
+
+// GetDeliveryResponse 回傳 delivery（含 payload 與 attempts）。
+message GetDeliveryResponse {
+  Delivery delivery = 1;
+}
+
+// RetryDeliveryRequest 手動重送。
+message RetryDeliveryRequest {
+  string merchant_id = 1;
+  string delivery_id = 2;
+  // 冪等鍵（避免重複點擊造成多次重送）。必填。
+  string idempotency_key = 3;
+}
+
+// RetryDeliveryResponse 回傳排入重試後的 delivery（status=PENDING）。
+message RetryDeliveryResponse {
+  Delivery delivery = 1;
+}
+
+// ListEventTypesRequest 無參數。
+message ListEventTypesRequest {}
+
+// ListEventTypesResponse 回傳所有事件類型。
+message ListEventTypesResponse {
+  repeated EventTypeInfo event_types = 1;
+}

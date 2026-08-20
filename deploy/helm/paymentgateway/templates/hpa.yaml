@@ -1,0 +1,45 @@
+{{- range $name, $raw := .Values.services }}
+{{- $svc := include "pg.mergeSvc" (dict "root" $ "raw" $raw) | fromYaml }}
+{{- if and $svc.enabled $svc.hpa.enabled }}
+{{- $ctx := dict "root" $ "name" $name "svc" $svc }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "pg.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "pg.labels" $ctx | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "pg.fullname" $ctx }}
+  minReplicas: {{ $svc.hpa.minReplicas }}
+  maxReplicas: {{ $svc.hpa.maxReplicas }}
+  metrics:
+    {{- if $svc.hpa.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $svc.hpa.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if $svc.hpa.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ $svc.hpa.targetMemoryUtilizationPercentage }}
+    {{- end }}
+    {{- with $svc.hpa.customMetrics }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $svc.hpa.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

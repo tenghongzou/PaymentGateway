@@ -1,0 +1,2707 @@
+openapi: 3.1.0
+info:
+  title: PaymentGateway Merchant API
+  version: "1.0.0"
+  summary: 商戶對外 REST API（由 api-gateway 提供）
+  description: |
+    多商戶支付閘道的商戶端 REST API。所有端點皆由 `api-gateway`（HTTP :8080）提供，
+    內部再轉譯為 gRPC 呼叫各服務。設計細節見 `docs/03-api.md`，架構決策見 `docs/01-architecture.md`，
+    簽章權威定義見 `docs/06-security-compliance.md` §3.3，錯誤碼權威清單見 `docs/02-domain-and-ledger.md` §10。
+
+    ## 通用規則
+    - **金額**一律為整數最小貨幣單位（`amount_minor`），絕不使用小數。
+    - **時間**一律為 RFC 3339 UTC 字串（例：`2026-08-20T03:04:05Z`）。
+    - **ID** 皆帶資源前綴：`pay_`、`re_`、`dp_`、`we_`、`key_`、`evt_`、`jrn_`、`att_`。
+    - **認證**：`Authorization: Bearer pk_live_…` + `X-Timestamp` + `X-Signature: v1=<hex>`（HMAC-SHA256 over canonical string）。
+    - **冪等**：所有 `POST` / `PATCH` / `DELETE` 必須帶 `Idempotency-Key`（UUID，24 小時內有效）。
+    - **分頁**：`limit` + `cursor`，回應格式 `{ "data": [], "has_more": bool, "next_cursor": string|null }`。
+    - **錯誤**：統一格式 `{ "error": { "type", "code", "message", "param", "request_id" } }`。
+    - **環境**：`pk_test_` 金鑰的所有操作皆在測試模式（`livemode: false`），付款路由到 provider-mock。
+    - **請款**：v1 每筆付款只能請款一次；金額可小於授權金額，剩餘授權額度於請款後釋放。
+    - **商戶狀態**：`suspended` 商戶不可建立付款（`403 merchant_suspended`），退款與既有付款善後仍允許；`closed` 商戶所有寫入皆回 `403 merchant_closed`，僅允許查詢。
+  contact:
+    name: PaymentGateway Platform Team
+    email: platform@paymentgateway.example.com
+  license:
+    name: Proprietary
+  x-api-version-policy: |
+    路徑版本 /v1。向後相容變更（新增欄位、新增端點、新增 enum 值、新增事件類型）不升版；
+    breaking change 才升 /v2，舊版至少維護 12 個月並提前 6 個月公告 Sunset。
+
+servers:
+  - url: https://api.paymentgateway.example.com/v1
+    description: 正式環境
+  - url: http://localhost:8080/v1
+    description: 本機開發（docker-compose）
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Payments
+    description: 付款的建立、查詢、請款、取消與 3DS 確認。
+  - name: Refunds
+    description: 退款的建立與查詢。
+  - name: Disputes
+    description: 爭議（拒付）查詢與證據提交。
+  - name: Webhook Endpoints
+    description: 商戶接收事件通知的端點管理。
+  - name: API Keys
+    description: API 金鑰管理。
+  - name: Ledger
+    description: 商戶餘額與帳本日記帳查詢（唯讀）。
+  - name: Events
+    description: 商戶可查詢自己的事件（與 webhook payload 相同）。
+  - name: PSP Inbound
+    description: PSP（Stripe、Adyen…）回呼入口；不適用商戶認證。
+  - name: System
+    description: 健康檢查。
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Payments
+  # ---------------------------------------------------------------------------
+  /payments:
+    post:
+      tags: [Payments]
+      operationId: createPayment
+      summary: 建立付款
+      description: |
+        建立付款並同步向 PSP 授權。依 `capture_method` 決定是否立即請款。需要 `payments:write` scope；商戶須為 `active`。
+
+        **回應狀態對照**：
+        - `201` + `status: authorized`：授權成功，待請款（`capture_method: manual`）。
+        - `201` + `status: captured`：授權並請款完成（`capture_method: automatic`）。
+        - `201` + `status: requires_action`：需客戶完成 3DS / 導向，見 `next_action`；完成後呼叫 `/payments/{id}/confirm`。
+        - `201` + `status: failed`：PSP 拒絕（decline）。**拒絕不是 API 錯誤**：資源已建立，`last_error` 說明原因。
+        - `4xx`：請求本身有問題，未建立資源。
+
+        冪等：相同 `Idempotency-Key` 重送會回傳第一次的結果（含 `Idempotent-Replayed: true` header）。
+        若 `status: requires_action` 的付款在 `next_action.expires_at` 前未確認，會轉為 `expired`。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePaymentRequest"
+            examples:
+              card_automatic:
+                summary: 信用卡，自動請款
+                value:
+                  amount: { amount_minor: 150000, currency: TWD }
+                  capture_method: automatic
+                  payment_method:
+                    type: card
+                    card:
+                      token: tok_stripe_1NXyz
+                      token_provider: stripe
+                  customer:
+                    id: cus_8891
+                    email: buyer@example.com
+                    ip_address: 203.0.113.7
+                    user_agent: Mozilla/5.0
+                  description: 訂單 #A10023
+                  return_url: https://shop.example.com/checkout/return
+                  statement_descriptor: SHOP A10023
+                  metadata: { order_id: A10023 }
+              card_manual_3ds:
+                summary: 信用卡，手動請款，強制 3DS
+                value:
+                  amount: { amount_minor: 499000, currency: TWD }
+                  capture_method: manual
+                  payment_method:
+                    type: card
+                    card: { token: tok_stripe_9AbC, token_provider: stripe }
+                  customer: { id: cus_1, email: a@example.com, ip_address: 203.0.113.9, user_agent: Mozilla/5.0 }
+                  three_ds: required
+                  return_url: https://shop.example.com/checkout/return
+              bank_transfer:
+                summary: 銀行轉帳（非同步）
+                value:
+                  amount: { amount_minor: 1200000, currency: TWD }
+                  payment_method:
+                    type: bank_transfer
+                    bank_transfer: { country: TW, payer_name: 王小明 }
+                  description: 發票 INV-2026-0042
+      responses:
+        "201":
+          description: 付款已建立（見 `status` 判斷結果）。
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+            Location:
+              description: 新資源位置。
+              schema: { type: string, examples: ["/v1/payments/pay_01J5X9Q3K8T2M4N6P8R0S2T4V6"] }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+              examples:
+                captured: { $ref: "#/components/examples/PaymentCaptured" }
+                requires_action: { $ref: "#/components/examples/PaymentRequiresAction" }
+                failed: { $ref: "#/components/examples/PaymentFailed" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+    get:
+      tags: [Payments]
+      operationId: listPayments
+      summary: 列出付款
+      description: 依建立時間新到舊列出付款；支援狀態、時間、客戶、metadata 篩選。
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/CreatedGte"
+        - $ref: "#/components/parameters/CreatedLt"
+        - $ref: "#/components/parameters/Sort"
+        - name: status
+          in: query
+          description: 狀態篩選，可逗號分隔多個（OR）。
+          schema:
+            type: string
+            examples: ["captured,partially_refunded"]
+        - name: customer_id
+          in: query
+          description: 客戶 ID 精確比對。
+          schema: { type: string }
+        - name: currency
+          in: query
+          description: 幣別篩選（ISO 4217）。
+          schema: { type: string, pattern: "^[A-Z]{3}$" }
+        - name: provider
+          in: query
+          description: 供應商篩選（例：stripe）。
+          schema: { type: string }
+        - name: metadata
+          in: query
+          description: |
+            metadata 精確比對，deep object 格式：`metadata[order_id]=A10023`。最多 3 組（AND）。
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            additionalProperties: { type: string }
+      responses:
+        "200":
+          description: 付款列表。
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /payments/{id}:
+    parameters:
+      - $ref: "#/components/parameters/PaymentId"
+    get:
+      tags: [Payments]
+      operationId: getPayment
+      summary: 取得付款
+      description: 依 ID 取得付款，含所有授權嘗試（`attempts`）。
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      responses:
+        "200":
+          description: 付款。
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+              examples:
+                captured: { $ref: "#/components/examples/PaymentCaptured" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /payments/{id}/capture:
+    parameters:
+      - $ref: "#/components/parameters/PaymentId"
+    post:
+      tags: [Payments]
+      operationId: capturePayment
+      summary: 請款
+      description: |
+        對已授權的付款請款。**v1 每筆付款只能請款一次**：`amount` 可小於授權金額（例如缺貨部分不收），
+        請款後剩餘授權額度立即釋放，付款狀態轉為 `captured`、`captured_amount` 為實際請款金額。
+        - 前置狀態：`authorized`；其他狀態（含已 `captured`）回 `409 invalid_state_transition`。
+        - `amount` 省略 = 請款全額。超過授權金額回 `422 capture_amount_exceeds_authorized`。
+        - PSP 拒絕請款時回 `402 provider_error`，付款狀態**不變**（仍為 `authorized`，可重試或取消）。
+        - `suspended` 商戶仍可請款既有付款；`closed` 商戶回 `403 merchant_closed`。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CapturePaymentRequest" }
+            examples:
+              partial_amount:
+                summary: 只請款部分金額（剩餘釋放）
+                value: { amount: { amount_minor: 300000, currency: TWD } }
+              full:
+                summary: 全額請款
+                value: {}
+      responses:
+        "200":
+          description: 請款成功，回傳更新後付款（`status: captured`）。
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402": { $ref: "#/components/responses/PaymentRequired" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /payments/{id}/void:
+    parameters:
+      - $ref: "#/components/parameters/PaymentId"
+    post:
+      tags: [Payments]
+      operationId: voidPayment
+      summary: 取消授權
+      description: |
+        取消尚未請款的授權。
+        - 前置狀態：`authorized` → 轉為 `voided`（終態）。
+        - 已請款的付款請改用退款（`POST /refunds`）；其他狀態回 `409 invalid_state_transition`。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VoidPaymentRequest" }
+            example: { reason: requested_by_customer }
+      responses:
+        "200":
+          description: 已取消授權。
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402": { $ref: "#/components/responses/PaymentRequired" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /payments/{id}/confirm:
+    parameters:
+      - $ref: "#/components/parameters/PaymentId"
+    post:
+      tags: [Payments]
+      operationId: confirmPayment
+      summary: 確認付款（3DS / 導向完成後）
+      description: |
+        客戶完成 3DS challenge 或錢包導向並回到 `return_url` 後，商戶把 PSP 帶回的查詢參數原樣放入
+        `provider_params` 呼叫本端點，閘道會向 PSP 完成授權。
+        - 前置狀態：`requires_action`。
+        - 成功：`authorized`（manual）或 `captured`（automatic）。
+        - 3DS 失敗：回 `200` 且 `status: failed`（狀態已轉移，不是 API 錯誤）。
+        - 重複呼叫回傳當前付款狀態。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConfirmPaymentRequest" }
+            example:
+              provider_params:
+                payment_intent: pi_3NXyz
+                redirect_status: succeeded
+      responses:
+        "200":
+          description: 確認完成，回傳更新後付款（可能為 `failed`）。
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402": { $ref: "#/components/responses/PaymentRequired" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  # ---------------------------------------------------------------------------
+  # Refunds
+  # ---------------------------------------------------------------------------
+  /refunds:
+    post:
+      tags: [Refunds]
+      operationId: createRefund
+      summary: 建立退款
+      description: |
+        對已請款的付款退款，可部分、可多次。
+        - 付款前置狀態：`captured`、`partially_refunded`。
+        - `amount` 省略 = 退還全部可退金額（已請款 − 已退款 − 退款中）。超過回 `422 refund_amount_exceeds_captured`。
+        - 多數 PSP 非同步處理：回 `201` + `status: pending`，最終結果以 `refund.succeeded` / `refund.failed` webhook 通知。
+        - PSP 同步拒絕：回 `201` + `status: failed`（資源已建立）。
+        - `suspended` 商戶**仍可退款**（保護消費者）；`closed` 商戶回 `403 merchant_closed`。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRefundRequest" }
+            example:
+              payment_id: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6
+              amount: { amount_minor: 50000, currency: TWD }
+              reason: requested_by_customer
+              metadata: { rma: RMA-778 }
+      responses:
+        "201":
+          description: 退款已建立。
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Refund" }
+              examples:
+                pending: { $ref: "#/components/examples/RefundPending" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+    get:
+      tags: [Refunds]
+      operationId: listRefunds
+      summary: 列出退款
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/CreatedGte"
+        - $ref: "#/components/parameters/CreatedLt"
+        - $ref: "#/components/parameters/Sort"
+        - name: payment_id
+          in: query
+          description: 只列出某付款的退款。
+          schema: { type: string }
+        - name: status
+          in: query
+          description: 狀態篩選，逗號分隔（`pending,succeeded,failed`）。
+          schema: { type: string }
+      responses:
+        "200":
+          description: 退款列表。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RefundList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /refunds/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: 退款 ID（`re_` 前綴）。
+        schema: { type: string, pattern: "^re_[0-9A-HJKMNP-TV-Z]{26}$" }
+    get:
+      tags: [Refunds]
+      operationId: getRefund
+      summary: 取得退款
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      responses:
+        "200":
+          description: 退款。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Refund" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  # ---------------------------------------------------------------------------
+  # Disputes
+  # ---------------------------------------------------------------------------
+  /disputes:
+    get:
+      tags: [Disputes]
+      operationId: listDisputes
+      summary: 列出爭議
+      description: 爭議由 PSP 回呼建立，商戶不能主動建立；以 `dispute.opened` webhook 得知。
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/CreatedGte"
+        - $ref: "#/components/parameters/CreatedLt"
+        - $ref: "#/components/parameters/Sort"
+        - name: payment_id
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          description: 狀態篩選，逗號分隔（`needs_response,under_review,won,lost,withdrawn`）。
+          schema: { type: string }
+      responses:
+        "200":
+          description: 爭議列表。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DisputeList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /disputes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/DisputeId"
+    get:
+      tags: [Disputes]
+      operationId: getDispute
+      summary: 取得爭議
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      responses:
+        "200":
+          description: 爭議。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dispute" }
+              examples:
+                needs_response: { $ref: "#/components/examples/DisputeNeedsResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /disputes/{id}/evidence:
+    parameters:
+      - $ref: "#/components/parameters/DisputeId"
+    post:
+      tags: [Disputes]
+      operationId: submitDisputeEvidence
+      summary: 提交爭議證據
+      description: |
+        整份覆寫證據內容。`submit: false` 只儲存草稿；`submit: true`（預設）送交 PSP 並將狀態轉為 `under_review`。
+        - 前置狀態：`needs_response`。
+        - 超過 `evidence_due_by` 回 `422 evidence_window_closed`。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitEvidenceRequest" }
+            example:
+              submit: true
+              evidence:
+                customer_name: 王小明
+                customer_email: buyer@example.com
+                product_description: 無線耳機 x1
+                shipping_carrier: 黑貓宅急便
+                shipping_tracking_number: "9012345678"
+                shipping_date: "2026-08-02T08:00:00Z"
+                uncategorized_text: 客戶已簽收，附簽收單。
+      responses:
+        "200":
+          description: 證據已儲存 / 送交。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dispute" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  # ---------------------------------------------------------------------------
+  # Webhook endpoints
+  # ---------------------------------------------------------------------------
+  /webhook-endpoints:
+    post:
+      tags: [Webhook Endpoints]
+      operationId: createWebhookEndpoint
+      summary: 建立 Webhook 端點
+      description: |
+        建立後回應中的 `secret`（`whsec_…`）**只會出現這一次**，請妥善保存以驗證 `X-PG-Signature`。
+        每個商戶最多 16 個端點。`url` 必須為 https（測試模式允許 `http://localhost`）。需要 `webhooks:manage` scope。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateWebhookEndpointRequest" }
+            example:
+              url: https://shop.example.com/webhooks/pg
+              description: 訂單系統
+              enabled_events: [payment.captured, payment.failed, refund.succeeded, dispute.opened]
+      responses:
+        "201":
+          description: 端點已建立（含一次性 `secret`）。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookEndpoint" }
+              example:
+                id: we_01J5XA0M2N4P6Q8R0S2T4V6W8X
+                object: webhook_endpoint
+                url: https://shop.example.com/webhooks/pg
+                description: 訂單系統
+                enabled_events: [payment.captured, payment.failed, refund.succeeded, dispute.opened]
+                status: enabled
+                secret: whsec_Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdo
+                metadata: {}
+                livemode: true
+                created_at: "2026-08-20T03:00:00Z"
+                updated_at: "2026-08-20T03:00:00Z"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+    get:
+      tags: [Webhook Endpoints]
+      operationId: listWebhookEndpoints
+      summary: 列出 Webhook 端點
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: 端點列表（不含 secret）。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookEndpointList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /webhook-endpoints/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: 端點 ID（`we_` 前綴）。
+        schema: { type: string, pattern: "^we_[0-9A-HJKMNP-TV-Z]{26}$" }
+    get:
+      tags: [Webhook Endpoints]
+      operationId: getWebhookEndpoint
+      summary: 取得 Webhook 端點
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      responses:
+        "200":
+          description: 端點（不含 secret）。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookEndpoint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+    patch:
+      tags: [Webhook Endpoints]
+      operationId: updateWebhookEndpoint
+      summary: 更新 Webhook 端點
+      description: |
+        部分更新；只送要改的欄位。`rotate_secret: true` 會產生新 `secret`（回應中出現一次），
+        舊 secret 保留 24 小時，期間 `X-PG-Signature` 會同時附上兩把的 `v1` 簽章。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateWebhookEndpointRequest" }
+            examples:
+              change_events:
+                value: { enabled_events: ["*"] }
+              disable:
+                value: { status: disabled }
+              rotate:
+                value: { rotate_secret: true }
+      responses:
+        "200":
+          description: 更新後端點。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookEndpoint" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+    delete:
+      tags: [Webhook Endpoints]
+      operationId: deleteWebhookEndpoint
+      summary: 刪除 Webhook 端點
+      description: 刪除後尚未送達的通知會被取消。冪等：重複刪除回 `204`。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      responses:
+        "204":
+          description: 已刪除。
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  # ---------------------------------------------------------------------------
+  # API keys
+  # ---------------------------------------------------------------------------
+  /api-keys:
+    post:
+      tags: [API Keys]
+      operationId: createApiKey
+      summary: 建立 API 金鑰
+      description: |
+        需要 `api_keys:manage` scope（不足回 `403 insufficient_permissions`）。回應中的 `key`（`pk_live_…`）與 `signing_secret`（`sk_live_…`）
+        **只會出現這一次**。新金鑰的 `mode` 與呼叫時使用的金鑰相同（live 金鑰只能建 live 金鑰）。
+        每個商戶每種 mode 最多 10 把有效金鑰。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateApiKeyRequest" }
+            example:
+              name: 倉儲系統（唯讀）
+              scopes: [payments:read, refunds:read, events:read]
+              expires_at: "2027-08-20T00:00:00Z"
+      responses:
+        "201":
+          description: 金鑰已建立（含一次性 `key` 與 `signing_secret`）。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiKey" }
+              example:
+                id: key_01J5XB1N3P5Q7R9S1T3V5W7X9Y
+                object: api_key
+                name: 倉儲系統（唯讀）
+                mode: live
+                prefix: pk_live_ab12
+                scopes: [payments:read, refunds:read, events:read]
+                status: active
+                key: pk_live_ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78St90
+                signing_secret: sk_live_Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdo
+                last_used_at: null
+                expires_at: "2027-08-20T00:00:00Z"
+                created_at: "2026-08-20T03:00:00Z"
+                revoked_at: null
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+    get:
+      tags: [API Keys]
+      operationId: listApiKeys
+      summary: 列出 API 金鑰
+      description: 只回傳與呼叫金鑰相同 mode 的金鑰；不含 `key` / `signing_secret`。
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: include_inactive
+          in: query
+          description: 是否包含已撤銷 / 過期的金鑰。
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: 金鑰列表。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiKeyList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /api-keys/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: 金鑰 ID（`key_` 前綴）。
+        schema: { type: string, pattern: "^key_[0-9A-HJKMNP-TV-Z]{26}$" }
+    delete:
+      tags: [API Keys]
+      operationId: revokeApiKey
+      summary: 撤銷 API 金鑰
+      description: |
+        撤銷後立即失效（最多 60 秒快取延遲）。不可撤銷正在使用的金鑰本身（回 `409 cannot_revoke_current_key`）。
+        冪等：重複撤銷回 `200`。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      responses:
+        "200":
+          description: 已撤銷，回傳金鑰（`status: revoked`）。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiKey" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  # ---------------------------------------------------------------------------
+  # Ledger (read-only)
+  # ---------------------------------------------------------------------------
+  /ledger/balance:
+    get:
+      tags: [Ledger]
+      operationId: getBalance
+      summary: 取得餘額
+      description: |
+        回傳商戶每個幣別的餘額拆解：`available`（可撥款）、`pending`（退款清算中）、`reserved`（爭議凍結）。
+        需要 `ledger:read` scope。
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+        - name: currency
+          in: query
+          description: 只回傳指定幣別。
+          schema: { type: string, pattern: "^[A-Z]{3}$" }
+      responses:
+        "200":
+          description: 餘額（每幣別一筆）。
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Balance" }
+              example:
+                data:
+                  - currency: TWD
+                    available_minor: 12850000
+                    pending_minor: 50000
+                    reserved_minor: 499000
+                    payable_minor: 13399000
+                    as_of: "2026-08-20T03:04:05Z"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /ledger/journals:
+    get:
+      tags: [Ledger]
+      operationId: listJournals
+      summary: 列出日記帳
+      description: 依過帳時間新到舊列出商戶相關的日記帳（每筆含借貸分錄）。需要 `ledger:read` scope。
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: reference_type
+          in: query
+          description: 業務參照類型。
+          schema: { type: string, enum: [payment, refund, dispute, payout] }
+        - name: reference_id
+          in: query
+          description: 業務參照 ID（例：`pay_…`）。
+          schema: { type: string }
+        - name: currency
+          in: query
+          schema: { type: string, pattern: "^[A-Z]{3}$" }
+        - name: posted_gte
+          in: query
+          description: 過帳時間下限（含），RFC 3339。
+          schema: { type: string, format: date-time }
+        - name: posted_lt
+          in: query
+          description: 過帳時間上限（不含），RFC 3339。
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: 日記帳列表。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JournalList" }
+              example:
+                data:
+                  - id: jrn_01J5XC2P4Q6R8S0T2V4W6X8Y0Z
+                    object: journal
+                    source_type: payment_event
+                    reference: { type: payment, id: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6 }
+                    description: payment.captured pay_01J5X9Q3K8T2M4N6P8R0S2T4V6
+                    currency: TWD
+                    entries:
+                      - account_type: psp_receivable
+                        direction: debit
+                        amount: { amount_minor: 150000, currency: TWD }
+                      - account_type: merchant_payable
+                        direction: credit
+                        amount: { amount_minor: 145650, currency: TWD }
+                      - account_type: fee_revenue
+                        direction: credit
+                        amount: { amount_minor: 4350, currency: TWD }
+                    posted_at: "2026-08-20T03:04:06Z"
+                    effective_at: "2026-08-20T03:04:05Z"
+                has_more: false
+                next_cursor: null
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /ledger/journals/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: 日記帳 ID（`jrn_` 前綴）。
+        schema: { type: string, pattern: "^jrn_[0-9A-HJKMNP-TV-Z]{26}$" }
+    get:
+      tags: [Ledger]
+      operationId: getJournal
+      summary: 取得日記帳
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      responses:
+        "200":
+          description: 日記帳。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Journal" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  # ---------------------------------------------------------------------------
+  # Events
+  # ---------------------------------------------------------------------------
+  /events:
+    get:
+      tags: [Events]
+      operationId: listEvents
+      summary: 列出事件
+      description: |
+        列出商戶自己的事件（與 webhook 送出的 payload 完全相同），可用於補漏或稽核。保留 30 天。
+        需要 `events:read` scope。
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/CreatedGte"
+        - $ref: "#/components/parameters/CreatedLt"
+        - name: type
+          in: query
+          description: 事件類型篩選，逗號分隔；支援尾端萬用字元（`payment.*`）。
+          schema: { type: string, examples: ["payment.captured,refund.*"] }
+        - name: payment_id
+          in: query
+          description: 只列出與某付款相關的事件（含其退款、爭議）。
+          schema: { type: string }
+      responses:
+        "200":
+          description: 事件列表。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /events/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: 事件 ID（`evt_` 前綴）。
+        schema: { type: string, pattern: "^evt_[0-9A-HJKMNP-TV-Z]{26}$" }
+    get:
+      tags: [Events]
+      operationId: getEvent
+      summary: 取得事件
+      description: 收到 webhook 後可用事件 ID 回查，確認內容真實性（防偽造的第二道防線）。
+      parameters:
+        - $ref: "#/components/parameters/XTimestamp"
+        - $ref: "#/components/parameters/XSignature"
+      responses:
+        "200":
+          description: 事件。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Event" }
+              examples:
+                payment_captured: { $ref: "#/components/examples/EventPaymentCaptured" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  # ---------------------------------------------------------------------------
+  # PSP inbound webhooks
+  # ---------------------------------------------------------------------------
+  /psp/{provider}/webhook:
+    post:
+      tags: [PSP Inbound]
+      operationId: receivePspWebhook
+      summary: PSP 回呼入口
+      description: |
+        供 PSP（Stripe、Adyen、LINE Pay…）回呼使用；**不適用商戶認證**（無 Bearer / X-Signature / Idempotency-Key）。
+
+        安全機制：api-gateway 不解析 body，直接把原始 headers + body 轉交 payment-service，
+        再由對應的 provider adapter 以 `ParseWebhook` 驗證 PSP 簽章（例如 Stripe 的 `Stripe-Signature`）。
+        驗簽失敗回 `400`；未知 provider 回 `404`；驗簽成功但事件不相關回 `200`（讓 PSP 不再重送）。
+
+        處理是非同步的：本端點只負責驗簽與持久化，回 `200` 後由 payment-service 套用狀態轉移。
+        PSP 重送同一事件會被 `(provider, provider_event_id)` 去重。
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: 供應商識別碼。
+          schema: { type: string, enum: [stripe, adyen, linepay, ecpay, mock] }
+      requestBody:
+        required: true
+        description: PSP 原生 payload（格式由 PSP 決定，原樣轉交）。
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+          application/x-www-form-urlencoded:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: 已接收（含驗簽成功但忽略的事件）。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: boolean, const: true }
+              example: { received: true }
+        "400":
+          description: 簽章無效或 payload 無法解析。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  type: invalid_request_error
+                  code: webhook_signature_invalid
+                  message: Provider webhook signature verification failed.
+                  param: null
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1A
+        "404":
+          description: 未知的 provider。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  type: invalid_request_error
+                  code: resource_missing
+                  message: "Unknown provider: foo."
+                  param: provider
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1B
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  # ---------------------------------------------------------------------------
+  # System
+  # ---------------------------------------------------------------------------
+  /healthz:
+    get:
+      tags: [System]
+      operationId: healthz
+      summary: 存活檢查
+      description: 只確認程序存活，不檢查依賴。供 Kubernetes livenessProbe 使用。
+      security: []
+      responses:
+        "200":
+          description: 存活。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+              example: { status: ok }
+  /readyz:
+    get:
+      tags: [System]
+      operationId: readyz
+      summary: 就緒檢查
+      description: 檢查 Redis 與下游 gRPC 服務連線。任一關鍵依賴失敗回 `503`。供 readinessProbe 使用。
+      security: []
+      responses:
+        "200":
+          description: 就緒。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+              example:
+                status: ok
+                checks:
+                  redis: ok
+                  merchant-service: ok
+                  payment-service: ok
+                  ledger-service: ok
+                  webhook-service: ok
+        "503":
+          description: 尚未就緒。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+              example:
+                status: unavailable
+                checks:
+                  redis: ok
+                  merchant-service: ok
+                  payment-service: "error: connection refused"
+                  ledger-service: ok
+                  webhook-service: ok
+
+# =============================================================================
+# Webhooks (OpenAPI 3.1) — 閘道送給商戶端點的通知
+# =============================================================================
+webhooks:
+  payment.created:
+    post:
+      summary: 付款已建立（尚未授權）。
+      description: 通常與 `payment.captured` / `payment.requires_action` 幾乎同時到達；順序不保證，請以 `created_at` 與資源狀態為準。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  payment.requires_action:
+    post:
+      summary: 付款需要客戶完成 3DS / 導向。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  payment.authorized:
+    post:
+      summary: 授權成功，待請款（僅 `capture_method: manual`）。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  payment.captured:
+    post:
+      summary: 請款成功。
+      description: 最重要的事件：收到後才可視為款項入帳。`data.object.captured_amount` 為實際請款金額（可小於 `amount`）。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Event" }
+            examples:
+              payment_captured: { $ref: "#/components/examples/EventPaymentCaptured" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  payment.voided:
+    post:
+      summary: 授權已取消。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  payment.failed:
+    post:
+      summary: 付款失敗（終態）；`data.object.last_error` 說明原因。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  payment.expired:
+    post:
+      summary: 付款逾期（3DS 未完成或授權未請款）。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  refund.created:
+    post:
+      summary: 退款已建立並送交 PSP（`status: pending`）。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  refund.succeeded:
+    post:
+      summary: 退款成功。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Event" }
+            examples:
+              refund_succeeded: { $ref: "#/components/examples/EventRefundSucceeded" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  refund.failed:
+    post:
+      summary: 退款失敗；`data.object.failure_code` 說明原因。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  dispute.opened:
+    post:
+      summary: 爭議開啟；請在 `evidence_due_by` 前提交證據。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  dispute.evidence_submitted:
+    post:
+      summary: 證據已送交 PSP（`status: under_review`）。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  dispute.won:
+    post:
+      summary: 爭議商戶勝訴，凍結金額釋放。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+  dispute.lost:
+    post:
+      summary: 爭議商戶敗訴，款項扣除。
+      parameters: [{ $ref: "#/components/parameters/XPGSignature" }, { $ref: "#/components/parameters/XPGEventId" }]
+      requestBody: { $ref: "#/components/requestBodies/WebhookEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookAck" }
+
+# =============================================================================
+# Components
+# =============================================================================
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API key (pk_live_… / pk_test_…)
+      description: |
+        `Authorization: Bearer pk_live_…`。**同時必須**帶 `X-Timestamp` 與 `X-Signature` header
+        （OpenAPI 無法以 securityScheme 表達 HMAC，故以 parameters 定義）。權威定義：`docs/06-security-compliance.md` §3.3。
+
+        **Canonical string**（四行以 `\n` 分隔，結尾無換行）：
+        ```
+        <X-Timestamp>                 Unix 秒，例 1755658245
+        <HTTP method 大寫>            例 POST
+        <request target>              path + "?" + 原始 query string（不重新編碼）；無 query 時只有 path，例 /v1/payments
+        <hex(sha256(raw_body))>       GET / DELETE 無 body 時為 sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        ```
+        `X-Signature: v1=` + `hex(HMAC-SHA256(signing_secret, canonical))`。`signing_secret` 為建立金鑰時一次性回傳的 `sk_live_…` / `sk_test_…`（含前綴的完整字串）。
+        時間窗 ±300 秒；同一簽章 300 秒內重複出現回 `401 signature_replayed`。
+        request target 必須包含 `/v1` 前綴（即 server URL 的 path 部分 + 端點路徑）。
+
+        閘道驗證順序與錯誤碼（02 §10 / 06 §3.3）：
+        `invalid_api_key`（401）→ `api_key_revoked` / `api_key_expired`（401）→ `merchant_suspended` / `merchant_closed`（403）
+        → `signature_missing` / `timestamp_out_of_window`（401）→ `signature_invalid`（401）→ `signature_replayed`（401）→ `insufficient_permissions`（403）。
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        冪等鍵（UUID v4 建議）。商戶範圍內唯一，24 小時內有效。
+        相同 key + 相同 payload → 回傳第一次的結果並附 `Idempotent-Replayed: true`；
+        相同 key + 不同 payload → `409 idempotency_key_payload_mismatch`；
+        第一次請求尚在處理中 → `409 idempotency_key_in_use`。
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        examples: ["4b3f9d2e-8a1c-4f6b-9e7d-2c5a8b1f0e3d"]
+    XTimestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      description: 請求簽章時間（Unix 秒，UTC）；為 canonical string 的第一行。與伺服器時間差超過 300 秒回 `401 timestamp_out_of_window`。
+      schema: { type: integer, format: int64, examples: [1755658245] }
+    XSignature:
+      name: X-Signature
+      in: header
+      required: true
+      description: |
+        `v1=<hex(HMAC-SHA256(signing_secret, canonical))>`，hex 為小寫 64 字元。
+        `canonical = X-Timestamp + "\n" + METHOD + "\n" + request_target + "\n" + hex(sha256(raw_body))`，
+        詳見 securitySchemes.bearerAuth 與 `docs/06-security-compliance.md` §3.3。
+      schema:
+        type: string
+        pattern: "^v1=[0-9a-f]{64}$"
+        examples: ["v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"]
+    XPGSignature:
+      name: X-PG-Signature
+      in: header
+      required: true
+      description: |
+        閘道送給商戶的 webhook 簽章：`t=<unix_ts>,v1=<hex_hmac>[,v1=<hex_hmac>]`。
+        `v1 = hex(HMAC-SHA256(whsec_secret, t + "." + raw_body))`。secret 輪替期間會有兩個 `v1`，任一符合即可。
+        建議拒絕 `t` 與現在相差超過 300 秒的通知。
+      schema: { type: string, examples: ["t=1755658245,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"] }
+    XPGEventId:
+      name: X-PG-Event-Id
+      in: header
+      required: true
+      description: 事件 ID（與 body 的 `id` 相同），方便在解析 body 前去重。
+      schema: { type: string, examples: ["evt_01J5XE4R6S8T0V2W4X6Y8Z0A2B"] }
+    Limit:
+      name: limit
+      in: query
+      description: 每頁筆數，1–100，預設 20。
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      description: 上一頁回應的 `next_cursor`；不透明字串，請勿自行組裝。
+      schema: { type: string }
+    CreatedGte:
+      name: created_gte
+      in: query
+      description: 建立時間下限（含），RFC 3339。
+      schema: { type: string, format: date-time }
+    CreatedLt:
+      name: created_lt
+      in: query
+      description: 建立時間上限（不含），RFC 3339。
+      schema: { type: string, format: date-time }
+    Sort:
+      name: sort
+      in: query
+      description: 排序；目前只支援依建立時間。
+      schema: { type: string, enum: [created_at.desc, created_at.asc], default: created_at.desc }
+    PaymentId:
+      name: id
+      in: path
+      required: true
+      description: 付款 ID（`pay_` 前綴）。
+      schema: { type: string, pattern: "^pay_[0-9A-HJKMNP-TV-Z]{26}$" }
+    DisputeId:
+      name: id
+      in: path
+      required: true
+      description: 爭議 ID（`dp_` 前綴）。
+      schema: { type: string, pattern: "^dp_[0-9A-HJKMNP-TV-Z]{26}$" }
+
+  headers:
+    XRequestId:
+      description: 本次請求的追蹤 ID（`req_` 前綴）；回報問題時請附上。
+      schema: { type: string, examples: ["req_01J5XD3Q5R7S9T1V3W5X7Y9Z1A"] }
+    IdempotentReplayed:
+      description: 為 `true` 時表示本回應是先前相同 `Idempotency-Key` 請求的重放。
+      schema: { type: boolean }
+    RateLimitLimit:
+      description: 目前時間窗（每分鐘）的請求上限。
+      schema: { type: integer }
+    RateLimitRemaining:
+      description: 目前時間窗剩餘可用請求數。
+      schema: { type: integer }
+    RateLimitReset:
+      description: 時間窗重置的 Unix 秒。
+      schema: { type: integer, format: int64 }
+    RetryAfter:
+      description: 建議幾秒後重試。
+      schema: { type: integer }
+
+  requestBodies:
+    WebhookEvent:
+      required: true
+      description: 事件物件（與 `GET /events/{id}` 回傳內容完全相同）。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Event" }
+
+  responses:
+    WebhookAck:
+      description: 商戶端點應在 10 秒內回任何 2xx 表示已收到；其他狀態碼或逾時會觸發重試（最多 8 次，約 3 天），重試用盡進入 dead_letter。
+    BadRequest:
+      description: 請求格式錯誤（JSON 無法解析、缺必填參數、型別錯誤、缺 `Idempotency-Key`）。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            parameter_missing:
+              summary: 缺必填欄位
+              value:
+                error:
+                  type: invalid_request_error
+                  code: parameter_missing
+                  message: "Missing required parameter: amount."
+                  param: amount
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1C
+            parameter_invalid:
+              summary: 型別 / 格式錯誤
+              value:
+                error:
+                  type: invalid_request_error
+                  code: parameter_invalid
+                  message: "amount.currency must be a 3-letter ISO 4217 code."
+                  param: amount.currency
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1D
+            idempotency_key_missing:
+              summary: 缺 Idempotency-Key
+              value:
+                error:
+                  type: idempotency_error
+                  code: idempotency_key_missing
+                  message: "Idempotency-Key header is required for this request."
+                  param: Idempotency-Key
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1E
+    Unauthorized:
+      description: |
+        認證失敗（金鑰不存在 / 格式錯誤 / 已撤銷 / 已過期、簽章缺失或錯誤、時間戳逾時、簽章重放）。
+        錯誤碼：`invalid_api_key`、`api_key_revoked`、`api_key_expired`、`signature_missing`、`signature_invalid`、`timestamp_out_of_window`、`signature_replayed`。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            invalid_api_key:
+              summary: 金鑰不存在或格式錯誤
+              value:
+                error:
+                  type: authentication_error
+                  code: invalid_api_key
+                  message: "Invalid API key provided: pk_live_ab12…"
+                  param: Authorization
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1F
+            api_key_revoked:
+              summary: 金鑰已撤銷
+              value:
+                error:
+                  type: authentication_error
+                  code: api_key_revoked
+                  message: "This API key has been revoked."
+                  param: Authorization
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1E
+            signature_invalid:
+              summary: HMAC 不符
+              value:
+                error:
+                  type: authentication_error
+                  code: signature_invalid
+                  message: "X-Signature does not match the canonical request (timestamp, method, target, body hash)."
+                  param: X-Signature
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1G
+            timestamp_out_of_window:
+              summary: 時間戳超出 ±300 秒
+              value:
+                error:
+                  type: authentication_error
+                  code: timestamp_out_of_window
+                  message: "X-Timestamp is more than 300 seconds away from server time."
+                  param: X-Timestamp
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1H
+            signature_replayed:
+              summary: 簽章重放
+              value:
+                error:
+                  type: authentication_error
+                  code: signature_replayed
+                  message: "This signature was already used within the replay window."
+                  param: X-Signature
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1I
+    PaymentRequired:
+      description: PSP 拒絕對既有資源的操作（請款 / 取消 / 確認被拒），資源狀態不變。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            card_declined:
+              value:
+                error:
+                  type: provider_error
+                  code: card_declined
+                  message: "The card issuer declined the capture (insufficient_funds)."
+                  param: null
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1J
+            provider_unavailable:
+              value:
+                error:
+                  type: provider_error
+                  code: provider_unavailable
+                  message: "The payment provider is temporarily unavailable. Please retry with the same Idempotency-Key."
+                  param: null
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1K
+    Forbidden:
+      description: |
+        已認證但無權限。錯誤碼：`insufficient_permissions`（金鑰 scope 不足）、`merchant_suspended`（商戶暫停：不可建立付款；退款與既有付款善後仍允許）、
+        `merchant_closed`（商戶已關閉：所有寫入拒絕，僅允許查詢）。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            insufficient_permissions:
+              summary: scope 不足
+              value:
+                error:
+                  type: authentication_error
+                  code: insufficient_permissions
+                  message: "This API key does not have the payments:write scope."
+                  param: null
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1M
+            merchant_suspended:
+              summary: 商戶暫停（建立付款時）
+              value:
+                error:
+                  type: authentication_error
+                  code: merchant_suspended
+                  message: "This merchant account is suspended; new payments are not allowed. Refunds remain available."
+                  param: null
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1N
+            merchant_closed:
+              summary: 商戶已關閉
+              value:
+                error:
+                  type: authentication_error
+                  code: merchant_closed
+                  message: "This merchant account is closed; only read operations are allowed."
+                  param: null
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1O
+    NotFound:
+      description: 資源不存在（或不屬於此商戶）。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              type: invalid_request_error
+              code: resource_missing
+              message: "No such payment: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6."
+              param: id
+              request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1P
+    Conflict:
+      description: 冪等衝突或狀態不允許此操作。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            idempotency_key_in_use:
+              value:
+                error:
+                  type: idempotency_error
+                  code: idempotency_key_in_use
+                  message: "A request with this Idempotency-Key is still being processed."
+                  param: Idempotency-Key
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1Q
+            idempotency_key_payload_mismatch:
+              value:
+                error:
+                  type: idempotency_error
+                  code: idempotency_key_payload_mismatch
+                  message: "This Idempotency-Key was already used with a different request payload."
+                  param: Idempotency-Key
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1R
+            invalid_state_transition:
+              value:
+                error:
+                  type: invalid_request_error
+                  code: invalid_state_transition
+                  message: "Cannot capture a payment with status 'captured'."
+                  param: null
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1S
+    UnprocessableEntity:
+      description: 請求格式正確但違反業務規則。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            amount_too_small:
+              value:
+                error:
+                  type: invalid_request_error
+                  code: amount_too_small
+                  message: "Amount must be at least 50 minor units for USD."
+                  param: amount.amount_minor
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1T
+            refund_amount_exceeds_captured:
+              value:
+                error:
+                  type: invalid_request_error
+                  code: refund_amount_exceeds_captured
+                  message: "Refund amount 200000 exceeds refundable amount 100000."
+                  param: amount.amount_minor
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1V
+            currency_not_supported:
+              value:
+                error:
+                  type: invalid_request_error
+                  code: currency_not_supported
+                  message: "Currency XYZ is not supported."
+                  param: amount.currency
+                  request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1W
+    TooManyRequests:
+      description: 超過限流（預設每商戶每分鐘 600 次；建立付款另有每秒 50 次上限）。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+        X-RateLimit-Limit: { $ref: "#/components/headers/RateLimitLimit" }
+        X-RateLimit-Remaining: { $ref: "#/components/headers/RateLimitRemaining" }
+        X-RateLimit-Reset: { $ref: "#/components/headers/RateLimitReset" }
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              type: rate_limit_error
+              code: rate_limit_exceeded
+              message: "Too many requests. Retry after 12 seconds."
+              param: null
+              request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1X
+    InternalServerError:
+      description: 閘道或內部服務錯誤；可安全地用相同 `Idempotency-Key` 重試。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              type: api_error
+              code: internal_error
+              message: "An unexpected error occurred. Please retry; if the problem persists contact support with request_id."
+              param: null
+              request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1Y
+    ServiceUnavailable:
+      description: 內部服務暫時不可用（部署中、依賴故障）；請依 `Retry-After` 重試。
+      headers:
+        X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              type: api_error
+              code: service_unavailable
+              message: "Service temporarily unavailable."
+              param: null
+              request_id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1Z
+
+  # ---------------------------------------------------------------------------
+  # Schemas
+  # ---------------------------------------------------------------------------
+  schemas:
+    Money:
+      type: object
+      description: 金額值物件。`amount_minor` 為最小貨幣單位整數（TWD 100 元 = 100、USD 1.00 = 100）。
+      required: [amount_minor, currency]
+      properties:
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 最小貨幣單位的金額，非負整數。
+          examples: [150000]
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+          description: ISO 4217 幣別代碼（大寫 3 碼）。
+          examples: [TWD]
+
+    Timestamp:
+      type: string
+      format: date-time
+      description: RFC 3339 UTC 時間。
+      examples: ["2026-08-20T03:04:05Z"]
+
+    NullableTimestamp:
+      type: [string, "null"]
+      format: date-time
+      description: RFC 3339 UTC 時間；尚未發生時為 `null`。
+
+    Metadata:
+      type: object
+      description: 自由格式鍵值對。key 最長 40 字、value 最長 500 字、最多 50 組。會原樣出現在 webhook 與查詢回應。
+      maxProperties: 50
+      additionalProperties:
+        type: string
+        maxLength: 500
+      propertyNames:
+        maxLength: 40
+        pattern: "^[A-Za-z0-9_.-]+$"
+
+    # --- Enums ---------------------------------------------------------------
+    PaymentStatus:
+      type: string
+      description: |
+        付款狀態（對應 `docs/01-architecture.md` §5.2 狀態機；canonical 全集 12 個）：
+        - `created`：已建立，尚未送 PSP（極短暫）
+        - `requires_action`：需客戶完成 3DS / 導向
+        - `authorized`：已授權，待請款
+        - `captured`：已請款（`captured_amount` 可小於 `amount`；v1 僅單次請款）
+        - `partially_refunded`：已部分退款
+        - `refunded`：已全額退款（終態）
+        - `voided`：授權已取消（終態）
+        - `failed`：授權失敗（終態）
+        - `expired`：逾期（終態）
+        - `disputed`：有進行中的爭議
+        - `chargeback_won` / `chargeback_lost`：爭議結果（終態）
+      enum:
+        - created
+        - requires_action
+        - authorized
+        - captured
+        - partially_refunded
+        - refunded
+        - voided
+        - failed
+        - expired
+        - disputed
+        - chargeback_won
+        - chargeback_lost
+    RefundStatus:
+      type: string
+      description: 退款狀態：`pending` → `succeeded` | `failed`。
+      enum: [pending, succeeded, failed]
+    DisputeStatus:
+      type: string
+      description: 爭議狀態。`needs_response` 期間可提交證據；`won` / `lost` / `withdrawn` 為終態。
+      enum: [needs_response, under_review, won, lost, withdrawn]
+    CaptureMethod:
+      type: string
+      description: "`automatic`：授權並立即請款（預設）；`manual`：先授權，再呼叫 capture。"
+      enum: [automatic, manual]
+    PaymentMethodType:
+      type: string
+      enum: [card, wallet, bank_transfer]
+    AttemptStatus:
+      type: string
+      description: |
+        單次向 PSP 嘗試（授權或請款）的結果：
+        - `pending`：已送出，等待 PSP 回應
+        - `requires_action`：PSP 要求額外驗證（3DS / 導向）
+        - `approved`：PSP 核准（授權或請款成功）
+        - `declined`：PSP 明確拒絕（`error_category` 為 `declined_hard` / `declined_soft` / `fraud_suspected` / `invalid_request`）
+        - `unavailable`：PSP 不可用且確認未處理本請求，已 failover 到下一個 PSP
+        - `unknown`：逾時、結果不明；系統會在 1 小時內向 PSP 查詢並收斂為 `approved` / `declined` / `unavailable`，期間不會 failover（避免重複扣款）
+      enum: [pending, requires_action, approved, declined, unavailable, unknown]
+    ProviderErrorCategory:
+      type: string
+      description: PSP 錯誤的正規化分類（決定是否 failover 與商戶應如何處理）。
+      enum: [declined_hard, declined_soft, provider_unavailable, invalid_request, fraud_suspected, authentication_required, unknown]
+    ThreeDsPreference:
+      type: string
+      description: "`automatic`：由 PSP / 發卡行決定；`required`：強制 3DS；`avoid`：盡量避免（PSP 仍可能強制）。"
+      enum: [automatic, required, avoid]
+    WalletType:
+      type: string
+      enum: [apple_pay, google_pay, line_pay]
+    EventType:
+      type: string
+      description: 事件類型（與 webhook 名稱相同）。
+      enum:
+        - payment.created
+        - payment.requires_action
+        - payment.authorized
+        - payment.captured
+        - payment.voided
+        - payment.failed
+        - payment.expired
+        - refund.created
+        - refund.succeeded
+        - refund.failed
+        - dispute.opened
+        - dispute.evidence_submitted
+        - dispute.won
+        - dispute.lost
+
+    # --- Error ---------------------------------------------------------------
+    Error:
+      type: object
+      description: 統一錯誤格式（`docs/01-architecture.md` §8）；錯誤碼權威清單見 `docs/02-domain-and-ledger.md` §10。
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, code, message, request_id]
+          properties:
+            type:
+              type: string
+              description: 錯誤大類。
+              enum: [invalid_request_error, authentication_error, idempotency_error, rate_limit_error, provider_error, api_error]
+            code:
+              type: string
+              description: 機器可讀錯誤碼（snake_case）。完整清單見 `docs/03-api.md` §7 與 `docs/02-domain-and-ledger.md` §10。
+              examples: [amount_too_small]
+            message:
+              type: string
+              description: 人類可讀說明（英文）；內容可能變動，請勿用於邏輯判斷。
+            param:
+              type: [string, "null"]
+              description: 導致錯誤的欄位（JSON 路徑或 header 名稱）；無關欄位時為 `null`。
+              examples: [amount.currency]
+            request_id:
+              type: string
+              description: 請求追蹤 ID，與 `X-Request-Id` 相同。
+              examples: [req_01J5XD3Q5R7S9T1V3W5X7Y9Z1A]
+
+    ErrorDetail:
+      type: object
+      description: 內嵌於資源的錯誤摘要（例如 `Payment.last_error`），格式同 `Error.error` 但無 `request_id`。
+      required: [type, code, message]
+      properties:
+        type: { type: string }
+        code: { type: string }
+        message: { type: string }
+        param: { type: [string, "null"] }
+
+    # --- Pagination ----------------------------------------------------------
+    PageInfo:
+      type: object
+      description: 分頁包裝的共用欄位。
+      required: [has_more, next_cursor]
+      properties:
+        has_more:
+          type: boolean
+          description: 是否還有下一頁。
+        next_cursor:
+          type: [string, "null"]
+          description: 下一頁游標；無下一頁時為 `null`。
+    PaymentList:
+      allOf:
+        - $ref: "#/components/schemas/PageInfo"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: "#/components/schemas/Payment" }
+    RefundList:
+      allOf:
+        - $ref: "#/components/schemas/PageInfo"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: "#/components/schemas/Refund" }
+    DisputeList:
+      allOf:
+        - $ref: "#/components/schemas/PageInfo"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: "#/components/schemas/Dispute" }
+    WebhookEndpointList:
+      allOf:
+        - $ref: "#/components/schemas/PageInfo"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: "#/components/schemas/WebhookEndpoint" }
+    ApiKeyList:
+      allOf:
+        - $ref: "#/components/schemas/PageInfo"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: "#/components/schemas/ApiKey" }
+    JournalList:
+      allOf:
+        - $ref: "#/components/schemas/PageInfo"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: "#/components/schemas/Journal" }
+    EventList:
+      allOf:
+        - $ref: "#/components/schemas/PageInfo"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items: { $ref: "#/components/schemas/Event" }
+
+    # --- Payment -------------------------------------------------------------
+    CardTokenInput:
+      type: object
+      description: PSP tokenization / hosted fields 取得的卡片 token。**本系統不接受卡號（PAN）**。
+      required: [token, token_provider]
+      properties:
+        token:
+          type: string
+          description: PSP 發出的 token（例：Stripe `pm_…` / `tok_…`）。
+        token_provider:
+          type: string
+          description: 發出 token 的 PSP（`stripe`、`adyen`、`mock`…）。付款將鎖定在此 PSP，不會 failover。
+        brand:
+          type: string
+          description: 卡組織（前端 tokenization 回傳時可帶入，協助路由）。
+        last4: { type: string, pattern: "^[0-9]{4}$" }
+        exp_month: { type: integer, minimum: 1, maximum: 12 }
+        exp_year: { type: integer, minimum: 2000 }
+        holder_name: { type: string, maxLength: 100 }
+    WalletInput:
+      type: object
+      required: [type]
+      properties:
+        type: { $ref: "#/components/schemas/WalletType" }
+        encrypted_payload:
+          type: string
+          description: 錢包端加密 payload（Apple Pay / Google Pay 必填；LINE Pay 為導向式，省略）。
+    BankTransferInput:
+      type: object
+      required: [country]
+      properties:
+        country:
+          type: string
+          pattern: "^[A-Z]{2}$"
+          description: 客戶銀行國別（ISO 3166-1 alpha-2）。
+        bank_code: { type: string }
+        payer_name: { type: string, maxLength: 100 }
+    PaymentMethodInput:
+      type: object
+      description: 付款方式；以 `type` 區分，並提供對應的子物件。
+      required: [type]
+      properties:
+        type: { $ref: "#/components/schemas/PaymentMethodType" }
+        card: { $ref: "#/components/schemas/CardTokenInput" }
+        wallet: { $ref: "#/components/schemas/WalletInput" }
+        bank_transfer: { $ref: "#/components/schemas/BankTransferInput" }
+      oneOf:
+        - required: [card]
+          properties: { type: { const: card } }
+        - required: [wallet]
+          properties: { type: { const: wallet } }
+        - required: [bank_transfer]
+          properties: { type: { const: bank_transfer } }
+    Customer:
+      type: object
+      description: 客戶資訊。`ip_address` 與 `user_agent` 為 3DS 所需；回應中會遮罩。
+      properties:
+        id: { type: string, maxLength: 100, description: 商戶端客戶 ID。 }
+        email: { type: string, format: email }
+        name: { type: string, maxLength: 100 }
+        phone: { type: string, description: E.164 格式。 }
+        ip_address: { type: string, description: 客戶端 IP（請求時提供；回應遮罩）。 }
+        user_agent: { type: string, description: 客戶端 User-Agent（請求時提供；回應省略）。 }
+        billing_country: { type: string, pattern: "^[A-Z]{2}$" }
+        billing_postal_code: { type: string }
+    PaymentMethodDetails:
+      type: object
+      description: 付款後可揭露的付款工具非敏感資訊。
+      required: [type]
+      properties:
+        type: { $ref: "#/components/schemas/PaymentMethodType" }
+        card:
+          type: object
+          properties:
+            brand: { type: string, examples: [visa] }
+            last4: { type: string, examples: ["4242"] }
+            exp_month: { type: integer }
+            exp_year: { type: integer }
+            issuer: { type: string }
+            issuer_country: { type: string }
+            funding: { type: string, enum: [credit, debit, prepaid, unknown] }
+            three_ds_result: { type: string, enum: [authenticated, attempted, not_authenticated, not_supported, unknown] }
+        wallet:
+          type: object
+          properties:
+            type: { $ref: "#/components/schemas/WalletType" }
+        bank_transfer:
+          type: object
+          properties:
+            country: { type: string }
+            bank_code: { type: string }
+            account_last4: { type: string }
+    NextAction:
+      type: object
+      description: "`status: requires_action` 時客戶端需完成的動作；以 `type` 區分。"
+      required: [type, expires_at]
+      properties:
+        type:
+          type: string
+          enum: [redirect, three_ds_challenge, display]
+        redirect:
+          type: object
+          description: 將客戶導向外部頁面（3DS challenge 頁、錢包付款頁）。
+          properties:
+            url: { type: string, format: uri }
+            method: { type: string, enum: [GET, POST] }
+            form_fields:
+              type: object
+              additionalProperties: { type: string }
+        three_ds_challenge:
+          type: object
+          description: 在商戶頁面內嵌 3DS 2.x challenge。
+          properties:
+            acs_url: { type: string, format: uri }
+            creq: { type: string }
+            transaction_id: { type: string }
+            version: { type: string }
+        display:
+          type: object
+          description: 向客戶顯示資訊（虛擬帳號、超商代碼、QR code）。
+          properties:
+            type: { type: string, enum: [bank_account, convenience_store_code, qr_code] }
+            details:
+              type: object
+              additionalProperties: { type: string }
+        expires_at:
+          $ref: "#/components/schemas/Timestamp"
+    PaymentAttempt:
+      type: object
+      description: 一次向特定 PSP 的嘗試（授權或請款）；failover 會產生多筆。
+      required: [id, sequence, provider, status, created_at]
+      properties:
+        id: { type: string, examples: [att_01J5X9Q3K8T2M4N6P8R0S2T4V7] }
+        sequence: { type: integer, minimum: 1 }
+        provider: { type: string, examples: [stripe] }
+        provider_reference: { type: [string, "null"] }
+        status: { $ref: "#/components/schemas/AttemptStatus" }
+        error_category:
+          oneOf:
+            - $ref: "#/components/schemas/ProviderErrorCategory"
+            - type: "null"
+          description: "`declined` / `unavailable` 時填入。"
+        error_code: { type: [string, "null"], description: PSP 原始錯誤碼。 }
+        error_message: { type: [string, "null"] }
+        routing_reason:
+          type: string
+          description: "路由決策原因：`rule:<priority>` | `fallback` | `token_provider` | `default`。"
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        completed_at:
+          allOf: [{ $ref: "#/components/schemas/NullableTimestamp" }]
+          description: PSP 回應時間；`unknown` 收斂完成時為收斂時間。
+    Payment:
+      type: object
+      description: 付款資源。
+      required: [id, object, amount, captured_amount, refunded_amount, status, capture_method, payment_method, livemode, created_at, updated_at]
+      properties:
+        id: { type: string, examples: [pay_01J5X9Q3K8T2M4N6P8R0S2T4V6] }
+        object: { type: string, const: payment }
+        amount: { $ref: "#/components/schemas/Money" }
+        captured_amount:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: 已請款金額（可小於 `amount`；v1 單次請款）。
+        refunded_amount:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: 累計已成功退款金額（不含 pending）。
+        status: { $ref: "#/components/schemas/PaymentStatus" }
+        capture_method: { $ref: "#/components/schemas/CaptureMethod" }
+        payment_method: { $ref: "#/components/schemas/PaymentMethodDetails" }
+        customer:
+          oneOf:
+            - $ref: "#/components/schemas/Customer"
+            - type: "null"
+        metadata: { $ref: "#/components/schemas/Metadata" }
+        description: { type: [string, "null"], maxLength: 1000 }
+        return_url: { type: [string, "null"], format: uri }
+        statement_descriptor: { type: [string, "null"], maxLength: 22 }
+        provider:
+          type: [string, "null"]
+          description: 最終使用的 PSP。
+        provider_reference:
+          type: [string, "null"]
+          description: PSP 端交易參照（對帳用）。
+        next_action:
+          oneOf:
+            - $ref: "#/components/schemas/NextAction"
+            - type: "null"
+        last_error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorDetail"
+            - type: "null"
+          description: "`status: failed` 時必有；曾 failover 的成功付款也可能有值。"
+        attempts:
+          type: array
+          items: { $ref: "#/components/schemas/PaymentAttempt" }
+        latest_dispute_id: { type: [string, "null"] }
+        livemode: { type: boolean }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        authorized_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        captured_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        expires_at:
+          allOf: [{ $ref: "#/components/schemas/NullableTimestamp" }]
+          description: 授權到期時間（manual capture 時有意義）。
+    CreatePaymentRequest:
+      type: object
+      required: [amount, payment_method]
+      properties:
+        amount: { $ref: "#/components/schemas/Money" }
+        capture_method:
+          allOf: [{ $ref: "#/components/schemas/CaptureMethod" }]
+          default: automatic
+        payment_method: { $ref: "#/components/schemas/PaymentMethodInput" }
+        customer: { $ref: "#/components/schemas/Customer" }
+        metadata: { $ref: "#/components/schemas/Metadata" }
+        description: { type: string, maxLength: 1000 }
+        return_url:
+          type: string
+          format: uri
+          description: 3DS / 導向完成後的回跳 URL（https）。wallet 與可能觸發 3DS 的卡片付款建議必填。
+        statement_descriptor:
+          type: string
+          maxLength: 22
+          pattern: "^[\\x20-\\x7E]*$"
+          description: 帳單描述（ASCII，最長 22 字）；未填使用商戶預設。
+        three_ds:
+          allOf: [{ $ref: "#/components/schemas/ThreeDsPreference" }]
+          default: automatic
+    CapturePaymentRequest:
+      type: object
+      description: v1 每筆付款只能請款一次；請款後剩餘授權額度釋放。
+      properties:
+        amount:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: 請款金額；省略 = 全額。必須 <= 授權金額，幣別必須與付款相同。
+    VoidPaymentRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          enum: [requested_by_customer, duplicate, fraudulent, abandoned]
+    ConfirmPaymentRequest:
+      type: object
+      required: [provider_params]
+      properties:
+        provider_params:
+          type: object
+          description: PSP 回跳 URL 帶回的查詢參數，原樣轉交（例：`cres`、`PaRes`、`MD`、`payment_intent`）。
+          additionalProperties: { type: string }
+
+    # --- Refund --------------------------------------------------------------
+    Refund:
+      type: object
+      required: [id, object, payment_id, amount, status, livemode, created_at, updated_at]
+      properties:
+        id: { type: string, examples: [re_01J5XF5S7T9V1W3X5Y7Z9A1B3C] }
+        object: { type: string, const: refund }
+        payment_id: { type: string }
+        amount: { $ref: "#/components/schemas/Money" }
+        status: { $ref: "#/components/schemas/RefundStatus" }
+        reason:
+          type: [string, "null"]
+          enum: [requested_by_customer, duplicate, fraudulent, other, null]
+        provider: { type: [string, "null"] }
+        provider_reference: { type: [string, "null"] }
+        failure_code: { type: [string, "null"], description: "`status: failed` 時的錯誤碼。" }
+        failure_message: { type: [string, "null"] }
+        metadata: { $ref: "#/components/schemas/Metadata" }
+        livemode: { type: boolean }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        completed_at: { $ref: "#/components/schemas/NullableTimestamp" }
+    CreateRefundRequest:
+      type: object
+      required: [payment_id]
+      properties:
+        payment_id: { type: string }
+        amount:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: 退款金額；省略 = 全部可退金額。
+        reason:
+          type: string
+          enum: [requested_by_customer, duplicate, fraudulent, other]
+        metadata: { $ref: "#/components/schemas/Metadata" }
+
+    # --- Dispute -------------------------------------------------------------
+    DisputeEvidence:
+      type: object
+      description: 爭議證據；欄位皆可選，愈完整勝率愈高。
+      properties:
+        customer_name: { type: string }
+        customer_email: { type: string, format: email }
+        customer_purchase_ip: { type: string }
+        billing_address: { type: string }
+        product_description: { type: string }
+        shipping_address: { type: string }
+        shipping_carrier: { type: string }
+        shipping_tracking_number: { type: string }
+        shipping_date: { type: string, format: date-time }
+        service_date: { type: string, format: date-time }
+        refund_policy: { type: string }
+        refund_policy_disclosure: { type: string }
+        customer_communication: { type: string }
+        uncategorized_text: { type: string, maxLength: 20000 }
+        file_ids:
+          type: array
+          maxItems: 10
+          items: { type: string }
+          description: 附件檔案 ID（檔案上傳 API 於 Phase 1 提供）。
+    Dispute:
+      type: object
+      required: [id, object, payment_id, amount, status, reason, livemode, opened_at, created_at, updated_at]
+      properties:
+        id: { type: string, examples: [dp_01J5XG6T8V0W2X4Y6Z8A0B2C4D] }
+        object: { type: string, const: dispute }
+        payment_id: { type: string }
+        amount: { $ref: "#/components/schemas/Money" }
+        fee:
+          oneOf:
+            - $ref: "#/components/schemas/Money"
+            - type: "null"
+          description: PSP 收取的爭議處理費（若有）。
+        status: { $ref: "#/components/schemas/DisputeStatus" }
+        reason:
+          type: string
+          description: 正規化原因。
+          enum: [fraudulent, product_not_received, product_unacceptable, duplicate, subscription_canceled, credit_not_processed, unrecognized, general]
+        provider: { type: string }
+        evidence_due_by: { $ref: "#/components/schemas/NullableTimestamp" }
+        evidence:
+          oneOf:
+            - $ref: "#/components/schemas/DisputeEvidence"
+            - type: "null"
+        evidence_submitted_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        livemode: { type: boolean }
+        opened_at: { $ref: "#/components/schemas/Timestamp" }
+        closed_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+    SubmitEvidenceRequest:
+      type: object
+      required: [evidence]
+      properties:
+        evidence: { $ref: "#/components/schemas/DisputeEvidence" }
+        submit:
+          type: boolean
+          default: true
+          description: "`true` 送交 PSP；`false` 僅儲存草稿。"
+
+    # --- Webhook endpoint ----------------------------------------------------
+    WebhookEndpoint:
+      type: object
+      required: [id, object, url, enabled_events, status, livemode, created_at, updated_at]
+      properties:
+        id: { type: string, examples: [we_01J5XA0M2N4P6Q8R0S2T4V6W8X] }
+        object: { type: string, const: webhook_endpoint }
+        url: { type: string, format: uri }
+        description: { type: [string, "null"], maxLength: 200 }
+        enabled_events:
+          type: array
+          description: 訂閱的事件類型；`["*"]` 表示全部。
+          items: { type: string }
+        status:
+          type: string
+          description: "`auto_disabled`：連續失敗超過 7 天被系統停用，可透過 PATCH `status: enabled` 重新啟用。"
+          enum: [enabled, disabled, auto_disabled]
+        secret:
+          type: string
+          description: "簽章 secret（`whsec_…`）。**只在建立與輪替回應出現一次**。"
+        metadata: { $ref: "#/components/schemas/Metadata" }
+        livemode: { type: boolean }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+    CreateWebhookEndpointRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: https URL（測試模式允許 http://localhost）。
+        description: { type: string, maxLength: 200 }
+        enabled_events:
+          type: array
+          items: { type: string }
+          description: 省略或 `["*"]` 表示訂閱全部事件。
+        metadata: { $ref: "#/components/schemas/Metadata" }
+    UpdateWebhookEndpointRequest:
+      type: object
+      description: 只送要改的欄位。
+      minProperties: 1
+      properties:
+        url: { type: string, format: uri }
+        description: { type: string, maxLength: 200 }
+        enabled_events:
+          type: array
+          items: { type: string }
+        status: { type: string, enum: [enabled, disabled] }
+        metadata: { $ref: "#/components/schemas/Metadata" }
+        rotate_secret:
+          type: boolean
+          description: 為 `true` 時輪替 secret，回應中 `secret` 為新值（僅此一次），舊 secret 保留 24 小時。
+
+    # --- API key -------------------------------------------------------------
+    ApiKey:
+      type: object
+      required: [id, object, name, mode, prefix, scopes, status, created_at]
+      properties:
+        id: { type: string, examples: [key_01J5XB1N3P5Q7R9S1T3V5W7X9Y] }
+        object: { type: string, const: api_key }
+        name: { type: string, maxLength: 100 }
+        mode: { type: string, enum: [live, test] }
+        prefix: { type: string, description: 顯示用前綴（例 `pk_live_ab12`）。 }
+        scopes:
+          type: array
+          description: 授權範圍；空陣列表示全部。不足時回 `403 insufficient_permissions`。
+          items:
+            type: string
+            enum: [payments:read, payments:write, refunds:read, refunds:write, disputes:read, disputes:write, webhooks:manage, api_keys:manage, ledger:read, events:read]
+        status: { type: string, enum: [active, revoked, expired] }
+        key:
+          type: string
+          description: "明文 API key（`pk_live_…`）。**只在建立回應出現一次**。"
+        signing_secret:
+          type: string
+          description: "請求簽章 secret（`sk_live_…`），為計算 `X-Signature` 的 HMAC 金鑰（含前綴的完整字串）。**只在建立回應出現一次**。"
+        last_used_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        expires_at: { $ref: "#/components/schemas/NullableTimestamp" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        revoked_at: { $ref: "#/components/schemas/NullableTimestamp" }
+    CreateApiKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 100 }
+        scopes:
+          type: array
+          items: { type: string }
+          description: 省略表示全部範圍。
+        expires_at:
+          type: string
+          format: date-time
+          description: 到期時間（未來）；省略表示永不過期。
+
+    # --- Ledger --------------------------------------------------------------
+    Balance:
+      type: object
+      description: 商戶單一幣別的餘額拆解。`payable = available + pending + reserved`。
+      required: [currency, available_minor, pending_minor, reserved_minor, payable_minor, as_of]
+      properties:
+        currency: { type: string, pattern: "^[A-Z]{3}$" }
+        available_minor: { type: integer, format: int64, description: 可撥款餘額。 }
+        pending_minor: { type: integer, format: int64, description: 退款清算中（尚未確認）的金額。 }
+        reserved_minor: { type: integer, format: int64, description: 爭議凍結的金額。 }
+        payable_minor: { type: integer, format: int64, description: 平台應付商戶總額。 }
+        as_of: { $ref: "#/components/schemas/Timestamp" }
+    JournalEntry:
+      type: object
+      required: [account_type, direction, amount]
+      properties:
+        account_type:
+          type: string
+          enum: [merchant_payable, psp_receivable, fee_revenue, refund_clearing, chargeback_reserve]
+        direction: { type: string, enum: [debit, credit] }
+        amount: { $ref: "#/components/schemas/Money" }
+        description: { type: [string, "null"] }
+    Journal:
+      type: object
+      description: 一筆日記帳（不可變；借貸總額相等）。
+      required: [id, object, source_type, currency, entries, posted_at, effective_at]
+      properties:
+        id: { type: string, examples: [jrn_01J5XC2P4Q6R8S0T2V4W6X8Y0Z] }
+        object: { type: string, const: journal }
+        source_type:
+          type: string
+          enum: [payment_event, reconciliation_adjustment, manual_adjustment, reversal, payout]
+        reference:
+          type: [object, "null"]
+          properties:
+            type: { type: string, enum: [payment, refund, dispute, payout] }
+            id: { type: string }
+        description: { type: string }
+        currency: { type: string }
+        entries:
+          type: array
+          minItems: 2
+          items: { $ref: "#/components/schemas/JournalEntry" }
+        reversed_by_journal_id: { type: [string, "null"] }
+        posted_at: { $ref: "#/components/schemas/Timestamp" }
+        effective_at: { $ref: "#/components/schemas/Timestamp" }
+
+    # --- Event ---------------------------------------------------------------
+    Event:
+      type: object
+      description: 事件物件；webhook body 與 `GET /events/{id}` 內容完全相同。
+      required: [id, object, type, api_version, livemode, created_at, data]
+      properties:
+        id: { type: string, examples: [evt_01J5XE4R6S8T0V2W4X6Y8Z0A2B] }
+        object: { type: string, const: event }
+        type: { $ref: "#/components/schemas/EventType" }
+        api_version:
+          type: string
+          description: 產生此事件時的 API 版本。
+          const: v1
+        livemode: { type: boolean }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        payment_id:
+          type: string
+          description: 相關付款 ID（退款、爭議事件也會帶）。
+        request:
+          type: [object, "null"]
+          description: 觸發此事件的 API 請求（由 PSP webhook 觸發時為 `null`）。
+          properties:
+            id: { type: string, examples: [req_01J5XD3Q5R7S9T1V3W5X7Y9Z1A] }
+            idempotency_key: { type: [string, "null"] }
+        data:
+          type: object
+          required: [object]
+          properties:
+            object:
+              description: 事件發生後的資源完整快照。
+              oneOf:
+                - $ref: "#/components/schemas/Payment"
+                - $ref: "#/components/schemas/Refund"
+                - $ref: "#/components/schemas/Dispute"
+              discriminator:
+                propertyName: object
+                mapping:
+                  payment: "#/components/schemas/Payment"
+                  refund: "#/components/schemas/Refund"
+                  dispute: "#/components/schemas/Dispute"
+
+    Readiness:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        checks:
+          type: object
+          additionalProperties: { type: string }
+
+  # ---------------------------------------------------------------------------
+  # Examples
+  # ---------------------------------------------------------------------------
+  examples:
+    PaymentCaptured:
+      summary: 授權並請款完成
+      value:
+        id: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6
+        object: payment
+        amount: { amount_minor: 150000, currency: TWD }
+        captured_amount: { amount_minor: 150000, currency: TWD }
+        refunded_amount: { amount_minor: 0, currency: TWD }
+        status: captured
+        capture_method: automatic
+        payment_method:
+          type: card
+          card: { brand: visa, last4: "4242", exp_month: 12, exp_year: 2028, issuer_country: TW, funding: credit, three_ds_result: not_supported }
+        customer: { id: cus_8891, email: buyer@example.com, ip_address: "203.0.113.*" }
+        metadata: { order_id: A10023 }
+        description: 訂單 #A10023
+        return_url: https://shop.example.com/checkout/return
+        statement_descriptor: SHOP A10023
+        provider: stripe
+        provider_reference: pi_3NXyzABC
+        next_action: null
+        last_error: null
+        attempts:
+          - id: att_01J5X9Q3K8T2M4N6P8R0S2T4V7
+            sequence: 1
+            provider: stripe
+            provider_reference: pi_3NXyzABC
+            status: approved
+            error_category: null
+            error_code: null
+            error_message: null
+            routing_reason: token_provider
+            created_at: "2026-08-20T03:04:05Z"
+            completed_at: "2026-08-20T03:04:05Z"
+        latest_dispute_id: null
+        livemode: true
+        created_at: "2026-08-20T03:04:05Z"
+        updated_at: "2026-08-20T03:04:05Z"
+        authorized_at: "2026-08-20T03:04:05Z"
+        captured_at: "2026-08-20T03:04:05Z"
+        expires_at: null
+    PaymentRequiresAction:
+      summary: 需要 3DS
+      value:
+        id: pay_01J5X9R4M9V3N5P7Q9S1T3V5W7
+        object: payment
+        amount: { amount_minor: 499000, currency: TWD }
+        captured_amount: { amount_minor: 0, currency: TWD }
+        refunded_amount: { amount_minor: 0, currency: TWD }
+        status: requires_action
+        capture_method: manual
+        payment_method: { type: card, card: { brand: mastercard, last4: "4444" } }
+        customer: { id: cus_1, email: a@example.com }
+        metadata: {}
+        description: null
+        return_url: https://shop.example.com/checkout/return
+        statement_descriptor: null
+        provider: stripe
+        provider_reference: pi_3NXyzDEF
+        next_action:
+          type: redirect
+          redirect:
+            url: https://hooks.stripe.com/3d_secure_2/hosted?merchant=acct_1&session=src_xxx
+            method: GET
+          expires_at: "2026-08-20T03:19:05Z"
+        last_error: null
+        attempts:
+          - id: att_01J5X9R4M9V3N5P7Q9S1T3V5W8
+            sequence: 1
+            provider: stripe
+            provider_reference: pi_3NXyzDEF
+            status: requires_action
+            error_category: authentication_required
+            error_code: null
+            error_message: null
+            routing_reason: token_provider
+            created_at: "2026-08-20T03:04:05Z"
+            completed_at: "2026-08-20T03:04:06Z"
+        latest_dispute_id: null
+        livemode: true
+        created_at: "2026-08-20T03:04:05Z"
+        updated_at: "2026-08-20T03:04:06Z"
+        authorized_at: null
+        captured_at: null
+        expires_at: null
+    PaymentFailed:
+      summary: PSP 拒絕（資源已建立）
+      value:
+        id: pay_01J5X9S5N0W4P6Q8R0T2V4W6X8
+        object: payment
+        amount: { amount_minor: 150000, currency: TWD }
+        captured_amount: { amount_minor: 0, currency: TWD }
+        refunded_amount: { amount_minor: 0, currency: TWD }
+        status: failed
+        capture_method: automatic
+        payment_method: { type: card, card: { brand: visa, last4: "0002" } }
+        customer: null
+        metadata: {}
+        description: null
+        return_url: null
+        statement_descriptor: null
+        provider: stripe
+        provider_reference: pi_3NXyzGHI
+        next_action: null
+        last_error:
+          type: provider_error
+          code: card_declined
+          message: "The card was declined (insufficient_funds)."
+          param: null
+        attempts:
+          - id: att_01J5X9S5N0W4P6Q8R0T2V4W6X9
+            sequence: 1
+            provider: stripe
+            provider_reference: pi_3NXyzGHI
+            status: declined
+            error_category: declined_soft
+            error_code: insufficient_funds
+            error_message: Your card has insufficient funds.
+            routing_reason: token_provider
+            created_at: "2026-08-20T03:04:05Z"
+            completed_at: "2026-08-20T03:04:06Z"
+        latest_dispute_id: null
+        livemode: true
+        created_at: "2026-08-20T03:04:05Z"
+        updated_at: "2026-08-20T03:04:06Z"
+        authorized_at: null
+        captured_at: null
+        expires_at: null
+    RefundPending:
+      summary: 退款受理中
+      value:
+        id: re_01J5XF5S7T9V1W3X5Y7Z9A1B3C
+        object: refund
+        payment_id: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6
+        amount: { amount_minor: 50000, currency: TWD }
+        status: pending
+        reason: requested_by_customer
+        provider: stripe
+        provider_reference: re_3NXyzJKL
+        failure_code: null
+        failure_message: null
+        metadata: { rma: RMA-778 }
+        livemode: true
+        created_at: "2026-08-21T01:00:00Z"
+        updated_at: "2026-08-21T01:00:00Z"
+        completed_at: null
+    DisputeNeedsResponse:
+      summary: 待提交證據
+      value:
+        id: dp_01J5XG6T8V0W2X4Y6Z8A0B2C4D
+        object: dispute
+        payment_id: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6
+        amount: { amount_minor: 150000, currency: TWD }
+        fee: { amount_minor: 45000, currency: TWD }
+        status: needs_response
+        reason: product_not_received
+        provider: stripe
+        evidence_due_by: "2026-09-05T23:59:59Z"
+        evidence: null
+        evidence_submitted_at: null
+        livemode: true
+        opened_at: "2026-08-25T10:00:00Z"
+        closed_at: null
+        created_at: "2026-08-25T10:00:02Z"
+        updated_at: "2026-08-25T10:00:02Z"
+    EventPaymentCaptured:
+      summary: payment.captured 事件
+      value:
+        id: evt_01J5XE4R6S8T0V2W4X6Y8Z0A2B
+        object: event
+        type: payment.captured
+        api_version: v1
+        livemode: true
+        created_at: "2026-08-20T03:04:05Z"
+        payment_id: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6
+        request: { id: req_01J5XD3Q5R7S9T1V3W5X7Y9Z1A, idempotency_key: 4b3f9d2e-8a1c-4f6b-9e7d-2c5a8b1f0e3d }
+        data:
+          object:
+            id: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6
+            object: payment
+            amount: { amount_minor: 150000, currency: TWD }
+            captured_amount: { amount_minor: 150000, currency: TWD }
+            refunded_amount: { amount_minor: 0, currency: TWD }
+            status: captured
+            capture_method: automatic
+            payment_method: { type: card, card: { brand: visa, last4: "4242" } }
+            customer: { id: cus_8891 }
+            metadata: { order_id: A10023 }
+            provider: stripe
+            provider_reference: pi_3NXyzABC
+            next_action: null
+            last_error: null
+            attempts: []
+            livemode: true
+            created_at: "2026-08-20T03:04:05Z"
+            updated_at: "2026-08-20T03:04:05Z"
+            authorized_at: "2026-08-20T03:04:05Z"
+            captured_at: "2026-08-20T03:04:05Z"
+    EventRefundSucceeded:
+      summary: refund.succeeded 事件
+      value:
+        id: evt_01J5XH7V9W1X3Y5Z7A9B1C3D5E
+        object: event
+        type: refund.succeeded
+        api_version: v1
+        livemode: true
+        created_at: "2026-08-21T01:05:00Z"
+        payment_id: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6
+        request: null
+        data:
+          object:
+            id: re_01J5XF5S7T9V1W3X5Y7Z9A1B3C
+            object: refund
+            payment_id: pay_01J5X9Q3K8T2M4N6P8R0S2T4V6
+            amount: { amount_minor: 50000, currency: TWD }
+            status: succeeded
+            reason: requested_by_customer
+            provider: stripe
+            provider_reference: re_3NXyzJKL
+            failure_code: null
+            failure_message: null
+            metadata: { rma: RMA-778 }
+            livemode: true
+            created_at: "2026-08-21T01:00:00Z"
+            updated_at: "2026-08-21T01:05:00Z"
+            completed_at: "2026-08-21T01:05:00Z"

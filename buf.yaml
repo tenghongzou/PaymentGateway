@@ -1,0 +1,20 @@
+# buf v2 configuration. Protobuf sources live under api/proto (module root),
+# package layout: pg/<service>/v1/*.proto  ->  Go: api/gen/go/pg/<service>/v1/
+version: v2
+modules:
+  - path: api/proto
+lint:
+  use:
+    - STANDARD
+  enum_zero_value_suffix: _UNSPECIFIED
+  rpc_allow_google_protobuf_empty_requests: true
+  rpc_allow_google_protobuf_empty_responses: true
+  service_suffix: Service
+  # ProviderAdapter 是 01 文件刻意的命名（所有 PSP adapter 實作同一介面），不加 Service 後綴
+  ignore_only:
+    SERVICE_SUFFIX:
+      - api/proto/pg/provider/v1/provider.proto
+breaking:
+  use:
+    - FILE
+  ignore_unstable_packages: true

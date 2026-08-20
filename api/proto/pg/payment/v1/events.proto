@@ -1,0 +1,251 @@
+// Kafka topic `payment.events` 的訊息格式。
+//
+// 生產者：payment-service（透過 Transactional Outbox，見 docs/01-architecture.md §6.2）。
+// 消費者：ledger-service（記帳）、webhook-service（通知商戶）、reconciliation-service（對帳基準）。
+//
+// 規則：
+//   - Kafka message key = payment_id，保證同一付款的事件在同一 partition 內有序。
+//     退款與爭議事件亦以其所屬 payment_id 為 key，與付款事件共用 topic，確保順序
+//     （01 文件列出的 refund.events topic 保留給 Phase 3 報表用途；v1 不另行發佈）。
+//   - Kafka headers：event_id、event_type、merchant_id、trace_id（W3C traceparent）、content-type=application/x-protobuf。
+//   - 消費者必須以 event_id 去重（processed_events 表）。
+//   - 每個 payload 都自帶記帳所需資訊（金額、幣別在 Money 內、供應商、手續費），消費者不需回查 payment-service。
+//   - 事件為不可變事實；欄位只增不刪（見 docs/03-api.md proto 演進規則）。
+syntax = "proto3";
+
+package pg.payment.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pg/common/v1/money.proto";
+import "pg/payment/v1/payment.proto";
+import "pg/provider/v1/provider.proto";
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/payment/v1;paymentv1";
+
+// PaymentEventType 為事件類型；字串名稱（去掉前綴、小寫、第一個 _ 轉 .）即為對商戶的 webhook 事件名稱，
+// 例：PAYMENT_EVENT_TYPE_PAYMENT_CAPTURED → payment.captured。
+enum PaymentEventType {
+  PAYMENT_EVENT_TYPE_UNSPECIFIED = 0;
+  // payment.created — 付款已建立（尚未授權）。
+  PAYMENT_EVENT_TYPE_PAYMENT_CREATED = 1;
+  // payment.requires_action — 需要客戶完成 3DS / 導向。
+  PAYMENT_EVENT_TYPE_PAYMENT_REQUIRES_ACTION = 2;
+  // payment.authorized — 授權成功（manual capture 時發出；automatic 時直接發 captured）。
+  PAYMENT_EVENT_TYPE_PAYMENT_AUTHORIZED = 3;
+  // payment.captured — 請款成功（部分請款每次都發一筆，payload.is_final 標示是否為最終）。
+  PAYMENT_EVENT_TYPE_PAYMENT_CAPTURED = 4;
+  // payment.voided — 授權已取消。
+  PAYMENT_EVENT_TYPE_PAYMENT_VOIDED = 5;
+  // payment.failed — 付款失敗（終態）。
+  PAYMENT_EVENT_TYPE_PAYMENT_FAILED = 6;
+  // payment.expired — 付款逾期（終態）。
+  PAYMENT_EVENT_TYPE_PAYMENT_EXPIRED = 7;
+  // refund.created — 退款已建立並送交 PSP（pending）。
+  PAYMENT_EVENT_TYPE_REFUND_CREATED = 8;
+  // refund.succeeded — 退款成功。
+  PAYMENT_EVENT_TYPE_REFUND_SUCCEEDED = 9;
+  // refund.failed — 退款失敗。
+  PAYMENT_EVENT_TYPE_REFUND_FAILED = 10;
+  // dispute.opened — 爭議開啟。
+  PAYMENT_EVENT_TYPE_DISPUTE_OPENED = 11;
+  // dispute.evidence_submitted — 證據已送交 PSP。
+  PAYMENT_EVENT_TYPE_DISPUTE_EVIDENCE_SUBMITTED = 12;
+  // dispute.won — 爭議商戶勝訴（payload 為 DisputeClosed）。
+  PAYMENT_EVENT_TYPE_DISPUTE_WON = 13;
+  // dispute.lost — 爭議商戶敗訴（payload 為 DisputeClosed）。
+  PAYMENT_EVENT_TYPE_DISPUTE_LOST = 14;
+}
+
+// PaymentEvent 為事件信封。
+message PaymentEvent {
+  // 事件 ID，格式 evt_ + ULID；全域唯一，消費者去重依據。
+  string event_id = 1;
+  // 事件類型。
+  PaymentEventType event_type = 2;
+  // 事件發生時間（狀態轉移被提交的時間，非發佈時間）。
+  google.protobuf.Timestamp occurred_at = 3;
+  // 所屬商戶。
+  string merchant_id = 4;
+  // 所屬付款（所有事件皆有，含退款與爭議事件）。
+  string payment_id = 5;
+  // 是否為正式環境。ledger-service 只對 livemode=true 記帳到正式帳本（test 記到 test 帳本）。
+  bool livemode = 6;
+  // 發生當下 Payment 的版本號（每次狀態轉移 +1），消費者可用於偵測漏事件。
+  int64 payment_version = 7;
+  // 觸發事件的請求 trace id（W3C trace-id，32 hex），用於跨服務追蹤。
+  string trace_id = 8;
+  // 事件發生後 Payment 的狀態（快照），方便消費者不需重建狀態機。
+  PaymentStatus payment_status = 9;
+
+  // 事件內容（依 event_type 擇一）。
+  oneof payload {
+    PaymentCreated payment_created = 20;
+    PaymentRequiresAction payment_requires_action = 21;
+    PaymentAuthorized payment_authorized = 22;
+    PaymentCaptured payment_captured = 23;
+    PaymentVoided payment_voided = 24;
+    PaymentFailed payment_failed = 25;
+    PaymentExpired payment_expired = 26;
+    RefundCreated refund_created = 27;
+    RefundSucceeded refund_succeeded = 28;
+    RefundFailed refund_failed = 29;
+    DisputeOpened dispute_opened = 30;
+    DisputeEvidenceSubmitted dispute_evidence_submitted = 31;
+    DisputeClosed dispute_closed = 32;
+  }
+}
+
+// PaymentCreated — 付款建立。
+message PaymentCreated {
+  // 請求金額（含幣別）。
+  pg.common.v1.Money amount = 1;
+  // 請款方式。
+  CaptureMethod capture_method = 2;
+  // 付款方式大類。
+  PaymentMethodType payment_method_type = 3;
+  // 客戶 ID（若有）。
+  string customer_id = 4;
+  // 商戶 metadata（webhook 需原樣帶給商戶）。
+  map<string, string> metadata = 5;
+  // 描述。
+  string description = 6;
+}
+
+// PaymentRequiresAction — 需要客戶動作。
+message PaymentRequiresAction {
+  pg.common.v1.Money amount = 1;
+  // 選定的供應商。
+  string provider = 2;
+  // 動作類型：redirect | three_ds_challenge | display。
+  string action_type = 3;
+  // 動作有效期限。
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+// PaymentAuthorized — 授權成功。ledger：不記帳（授權不是資金移動），僅供 webhook 與報表。
+message PaymentAuthorized {
+  // 授權金額。
+  pg.common.v1.Money amount = 1;
+  string provider = 2;
+  string provider_reference = 3;
+  // 預估手續費（若 PSP 同步提供；否則為空）。
+  pg.common.v1.Money fee = 4;
+  // 授權有效期限。
+  google.protobuf.Timestamp authorization_expires_at = 5;
+  // 付款工具資訊。
+  PaymentMethodDetails payment_method_details = 6;
+}
+
+// PaymentCaptured — 請款成功。ledger：借 psp_receivable / 貸 merchant_payable（扣 fee 後）+ 貸 fee_revenue。
+message PaymentCaptured {
+  // 本次請款金額。
+  pg.common.v1.Money amount = 1;
+  // 累計已請款金額。
+  pg.common.v1.Money total_captured_amount = 2;
+  string provider = 3;
+  string provider_reference = 4;
+  // 本次請款的 PSP 手續費；PSP 未同步提供時為 0，由 reconciliation 於結算檔到達後以調整分錄修正。
+  pg.common.v1.Money fee = 5;
+  // 是否為最終請款（剩餘授權已釋放）。
+  bool is_final = 6;
+  // 付款工具資訊。
+  PaymentMethodDetails payment_method_details = 7;
+  map<string, string> metadata = 8;
+}
+
+// PaymentVoided — 授權取消。ledger：不記帳。
+message PaymentVoided {
+  // 被釋放的授權金額。
+  pg.common.v1.Money amount = 1;
+  string provider = 2;
+  string provider_reference = 3;
+  string reason = 4;
+}
+
+// PaymentFailed — 付款失敗（終態）。ledger：不記帳。
+message PaymentFailed {
+  pg.common.v1.Money amount = 1;
+  // 最後一次嘗試的供應商（可能為空：路由無可用供應商）。
+  string provider = 2;
+  // 正規化錯誤分類。
+  pg.provider.v1.ProviderErrorCategory error_category = 3;
+  // 商戶可見錯誤碼（例：card_declined）。
+  string error_code = 4;
+  string error_message = 5;
+  // 嘗試次數。
+  int32 attempt_count = 6;
+}
+
+// PaymentExpired — 逾期。ledger：不記帳。
+message PaymentExpired {
+  pg.common.v1.Money amount = 1;
+  string provider = 2;
+  // 逾期前的狀態：requires_action | authorized。
+  string previous_status = 3;
+}
+
+// RefundCreated — 退款已送交 PSP。ledger：借 refund_clearing / 貸 merchant_payable（預扣）。
+message RefundCreated {
+  string refund_id = 1;
+  pg.common.v1.Money amount = 2;
+  string provider = 3;
+  string reason = 4;
+  map<string, string> metadata = 5;
+}
+
+// RefundSucceeded — 退款成功。ledger：貸 psp_receivable / 借 refund_clearing 沖銷預扣；fee 若 PSP 另收則另記手續費分錄。
+message RefundSucceeded {
+  string refund_id = 1;
+  pg.common.v1.Money amount = 2;
+  string provider = 3;
+  // PSP 端退款參照。
+  string provider_reference = 4;
+  // PSP 退款手續費（PSP 另收時為正值；無則 0）。
+  pg.common.v1.Money fee = 5;
+}
+
+// RefundFailed — 退款失敗。ledger：反向沖銷 RefundCreated 的預扣。
+message RefundFailed {
+  string refund_id = 1;
+  pg.common.v1.Money amount = 2;
+  string provider = 3;
+  string error_code = 4;
+  string error_message = 5;
+}
+
+// DisputeOpened — 爭議開啟。ledger：借 chargeback_reserve / 貸 merchant_payable（凍結爭議金額 + 爭議費）。
+message DisputeOpened {
+  string dispute_id = 1;
+  // 爭議金額。
+  pg.common.v1.Money amount = 2;
+  string provider = 3;
+  string provider_reference = 4;
+  // 正規化原因。
+  string reason = 5;
+  // 證據提交期限。
+  google.protobuf.Timestamp evidence_due_by = 6;
+  // 爭議處理費。
+  pg.common.v1.Money fee = 7;
+}
+
+// DisputeEvidenceSubmitted — 證據已送交。ledger：不記帳。
+message DisputeEvidenceSubmitted {
+  string dispute_id = 1;
+  string provider = 2;
+  google.protobuf.Timestamp submitted_at = 3;
+}
+
+// DisputeClosed — 爭議結案（event_type 為 DISPUTE_WON 或 DISPUTE_LOST）。
+// ledger：WON → 釋放 chargeback_reserve 回 merchant_payable；LOST → chargeback_reserve 轉 psp_receivable（扣款確認）。
+message DisputeClosed {
+  string dispute_id = 1;
+  pg.common.v1.Money amount = 2;
+  string provider = 3;
+  string provider_reference = 4;
+  // 結果。
+  pg.provider.v1.DisputeOutcome outcome = 5;
+  // 爭議處理費（最終值；LOST 時通常不退，WON 時部分 PSP 退還）。
+  pg.common.v1.Money fee = 6;
+  // 結案時間（PSP 端）。
+  google.protobuf.Timestamp closed_at = 7;
+}

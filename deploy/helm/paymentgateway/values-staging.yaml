@@ -1,0 +1,61 @@
+# Staging overrides: cheaper, chattier, auto-migrating. helm upgrade -f values.yaml -f values-staging.yaml
+global:
+  env: staging
+  logLevel: debug
+  autoMigrate: true               # services migrate on boot; migration Job is still rendered for parity
+  imageTag: ""                    # set by CI to the commit SHA: --set global.imageTag=sha-<sha>
+  imagePullPolicy: Always
+  redis:
+    addr: pg-staging-redis.internal:6379
+    cidrs: ["10.30.0.0/16"]
+  postgres:
+    host: pg-staging.cluster-abc.ap-northeast-1.rds.amazonaws.com
+    cidrs: ["10.30.0.0/16"]
+  kafka:
+    brokers: b-1.pg-staging.kafka.ap-northeast-1.amazonaws.com:9094,b-2.pg-staging.kafka.ap-northeast-1.amazonaws.com:9094
+    cidrs: ["10.30.0.0/16"]
+  topologySpread:
+    whenUnsatisfiable: ScheduleAnyway
+
+serviceDefaults:
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 96Mi }
+    limits: { memory: 384Mi }
+  hpa:
+    minReplicas: 1
+    maxReplicas: 3
+  pdb:
+    enabled: false
+
+services:
+  api-gateway:
+    replicas: 2
+    hpa:
+      minReplicas: 2
+      maxReplicas: 4
+    pdb:
+      enabled: true
+      minAvailable: 1
+    env:
+      PG_RATE_LIMIT_RPS: "1000"
+    ingress:
+      hosts:
+        - api.staging.paymentgateway.example.com
+      tls:
+        secretName: api-staging-paymentgateway-tls
+      rateLimit:
+        rps: 500
+        connections: 200
+      annotations:
+        cert-manager.io/cluster-issuer: letsencrypt-staging
+  payment-service:
+    replicas: 2
+    hpa:
+      minReplicas: 2
+      maxReplicas: 4
+  provider-mock:
+    enabled: true
+  provider-stripe:
+    env:
+      PG_STRIPE_API_BASE_URL: https://api.stripe.com   # test-mode keys come from Vault paymentgateway/staging/provider-stripe

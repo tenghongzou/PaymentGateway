@@ -1,0 +1,99 @@
+package idempotency
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// RedisStore 為 Redis 實作（SETNX 鎖 + JSON 值）。
+type RedisStore struct {
+	rdb     redis.UniversalClient
+	ttl     time.Duration
+	lockTTL time.Duration
+}
+
+// NewRedisStore 建立 Redis 儲存；ttl ≤ 0 時用 DefaultTTL。
+func NewRedisStore(rdb redis.UniversalClient, ttl time.Duration) *RedisStore {
+	if ttl <= 0 {
+		ttl = DefaultTTL
+	}
+	return &RedisStore{rdb: rdb, ttl: ttl, lockTTL: DefaultLockTTL}
+}
+
+// Begin 實作 Store。
+func (s *RedisStore) Begin(ctx context.Context, merchantID, key, requestHash string) (State, *Response, error) {
+	k := redisKey(merchantID, key)
+	rec := record{State: stateInProgress, RequestHash: requestHash, CreatedAt: time.Now().UTC()}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return StateNew, nil, fmt.Errorf("idempotency: marshal: %w", err)
+	}
+	ok, err := s.rdb.SetNX(ctx, k, raw, s.lockTTL).Result()
+	if err != nil {
+		return StateNew, nil, fmt.Errorf("idempotency: setnx: %w", err)
+	}
+	if ok {
+		return StateNew, nil, nil
+	}
+	cur, err := s.rdb.Get(ctx, k).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			// 鎖在 SETNX 與 GET 之間過期：視為處理中，讓商戶稍後重試。
+			return StateNew, nil, ErrInProgress
+		}
+		return StateNew, nil, fmt.Errorf("idempotency: get: %w", err)
+	}
+	var existing record
+	if err := json.Unmarshal(cur, &existing); err != nil {
+		return StateNew, nil, fmt.Errorf("idempotency: unmarshal: %w", err)
+	}
+	if existing.RequestHash != requestHash {
+		return StateNew, nil, ErrMismatch
+	}
+	if existing.State == stateInProgress {
+		return StateNew, nil, ErrInProgress
+	}
+	return StateCompleted, existing.Response, nil
+}
+
+// Complete 實作 Store。
+func (s *RedisStore) Complete(ctx context.Context, merchantID, key string, resp Response) error {
+	k := redisKey(merchantID, key)
+	cur, err := s.rdb.Get(ctx, k).Bytes()
+	var rec record
+	switch {
+	case err == nil:
+		if uerr := json.Unmarshal(cur, &rec); uerr != nil {
+			rec = record{}
+		}
+	case errors.Is(err, redis.Nil):
+	default:
+		return fmt.Errorf("idempotency: get: %w", err)
+	}
+	rec.State = stateCompleted
+	rec.Response = &resp
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = time.Now().UTC()
+	}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("idempotency: marshal: %w", err)
+	}
+	if err := s.rdb.Set(ctx, k, raw, s.ttl).Err(); err != nil {
+		return fmt.Errorf("idempotency: set: %w", err)
+	}
+	return nil
+}
+
+// Abort 實作 Store。
+func (s *RedisStore) Abort(ctx context.Context, merchantID, key string) error {
+	if err := s.rdb.Del(ctx, redisKey(merchantID, key)).Err(); err != nil {
+		return fmt.Errorf("idempotency: del: %w", err)
+	}
+	return nil
+}

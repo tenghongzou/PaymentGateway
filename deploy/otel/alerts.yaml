@@ -1,0 +1,171 @@
+# Prometheus alerting rules for PaymentGateway.
+# Metric names follow docs/01-architecture.md section 6.5 plus OTel HTTP/gRPC semantic conventions
+# as exported by the collector's prometheus exporter.
+# Severity: page (on-call is woken up) | ticket (next business day) | info.
+groups:
+  - name: pg.outbox
+    rules:
+      - alert: PGOutboxLagHigh
+        expr: max by (service) (pg_outbox_lag_seconds) > 30
+        for: 5m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "Outbox relay lag > 30s on {{ $labels.service }}"
+          description: "Oldest unpublished outbox row is {{ $value | humanizeDuration }} old. Events (payment.*, ledger.*) are not reaching Kafka. Runbook: docs/runbooks/outbox-lag.md"
+      - alert: PGOutboxRelayStalled
+        expr: sum by (service) (rate(pg_outbox_published_total[10m])) == 0 and sum by (service) (pg_outbox_pending) > 0
+        for: 10m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "Outbox relay stalled on {{ $labels.service }}"
+          description: "Pending outbox rows exist but nothing was published in 10m (relay crashed / Kafka unreachable / advisory lock stuck)."
+
+  - name: pg.webhook
+    rules:
+      - alert: PGWebhookDeadLetterIncreasing
+        expr: sum(increase(pg_webhook_delivery_total{result="dead_letter"}[15m])) > 0
+        for: 0m
+        labels: { severity: ticket, team: payments }
+        annotations:
+          summary: "Webhook deliveries are being dead-lettered"
+          description: "{{ $value | humanize }} deliveries exhausted retries in the last 15m. Check merchant endpoint health; replay from the dead-letter table."
+      - alert: PGWebhookFailureRateHigh
+        expr: |
+          sum(rate(pg_webhook_delivery_total{result!="success"}[10m]))
+            /
+          sum(rate(pg_webhook_delivery_total[10m])) > 0.25
+        for: 10m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "Webhook failure ratio > 25%"
+          description: "Sustained webhook failures across merchants usually indicate an egress/DNS problem on our side rather than a single merchant."
+      - alert: PGWebhookBacklogHigh
+        expr: sum(pg_webhook_pending_deliveries) > 10000
+        for: 10m
+        labels: { severity: ticket, team: payments }
+        annotations:
+          summary: "Webhook backlog > 10k pending deliveries"
+          description: "Scale webhook-service dispatcher replicas or investigate slow merchant endpoints."
+
+  - name: pg.provider
+    rules:
+      - alert: PGProviderErrorRateHigh
+        expr: |
+          sum by (provider) (rate(pg_provider_request_total{result="error"}[5m]))
+            /
+          sum by (provider) (rate(pg_provider_request_total[5m])) > 0.10
+        for: 5m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "Provider {{ $labels.provider }} error rate > 10%"
+          description: "Routing should already be failing over; verify with pg_payment_total{provider}. Consider manually disabling the provider in routing rules."
+      - alert: PGProviderLatencyP99High
+        expr: histogram_quantile(0.99, sum by (le, provider) (rate(pg_provider_latency_seconds_bucket[5m]))) > 5
+        for: 10m
+        labels: { severity: ticket, team: payments }
+        annotations:
+          summary: "Provider {{ $labels.provider }} p99 latency > 5s"
+      - alert: PGProviderUnhealthy
+        expr: pg_provider_healthy == 0
+        for: 2m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "Provider adapter {{ $labels.provider }} reports unhealthy"
+      - alert: PGPaymentFailureRateHigh
+        expr: |
+          sum(rate(pg_payment_total{status="failed"}[10m]))
+            /
+          sum(rate(pg_payment_total{status=~"failed|authorized|captured"}[10m])) > 0.20
+        for: 10m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "Payment failure ratio > 20% (all providers)"
+
+  - name: pg.ledger
+    rules:
+      - alert: PGLedgerImbalanceDetected
+        expr: sum(increase(pg_ledger_imbalance_total[5m])) > 0
+        for: 0m
+        labels: { severity: page, team: payments, pci: "true" }
+        annotations:
+          summary: "LEDGER IMBALANCE DETECTED"
+          description: "A journal with unequal debits/credits was rejected or detected. This must be 0 forever. Freeze ledger writes and page the ledger owner. Runbook: docs/runbooks/ledger-imbalance.md"
+      - alert: PGLedgerConsumerLagHigh
+        expr: max by (topic) (kafka_consumergroup_lag{consumergroup="ledger-service"}) > 5000
+        for: 10m
+        labels: { severity: ticket, team: payments }
+        annotations:
+          summary: "ledger-service consumer lag > 5000 on {{ $labels.topic }}"
+          description: "Merchant balances are stale. Scale ledger-service consumers (bounded by partition count)."
+
+  - name: pg.http
+    rules:
+      - alert: PGGatewayP99LatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_request_duration_seconds_bucket{service_name="api-gateway", http_route!~"/healthz|/readyz|/metrics"}[5m]))
+          ) > 0.3
+        for: 10m
+        labels: { severity: ticket, team: payments }
+        annotations:
+          summary: "api-gateway p99 latency > 300ms (SLO)"
+          description: "SLO from docs/01-architecture.md: create payment P99 < 300ms excluding PSP round-trip. Check pg_provider_latency_seconds to separate PSP time."
+      - alert: PGGateway5xxRateHigh
+        expr: |
+          sum(rate(http_server_request_duration_seconds_count{service_name="api-gateway", http_response_status_code=~"5.."}[5m]))
+            /
+          sum(rate(http_server_request_duration_seconds_count{service_name="api-gateway"}[5m])) > 0.01
+        for: 5m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "api-gateway 5xx ratio > 1%"
+      - alert: PGGrpcErrorRateHigh
+        expr: |
+          sum by (service_name) (rate(rpc_server_duration_milliseconds_count{rpc_grpc_status_code!~"0|3|5|6|7|16"}[5m]))
+            /
+          sum by (service_name) (rate(rpc_server_duration_milliseconds_count[5m])) > 0.05
+        for: 5m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "gRPC server error ratio > 5% on {{ $labels.service_name }}"
+          description: "Excludes client-side codes (InvalidArgument, NotFound, AlreadyExists, PermissionDenied, Unauthenticated)."
+      - alert: PGRateLimitRejectionsHigh
+        expr: sum by (merchant_id) (rate(pg_rate_limit_rejected_total[5m])) > 50
+        for: 10m
+        labels: { severity: info, team: payments }
+        annotations:
+          summary: "Merchant {{ $labels.merchant_id }} is being rate limited > 50 rps"
+
+  - name: pg.infra
+    rules:
+      - alert: PGServiceDown
+        expr: up{job=~"pg-services|otel-collector"} == 0
+        for: 2m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.service }} target down"
+      - alert: PGDBPoolSaturated
+        expr: pg_db_pool_acquired_conns / pg_db_pool_max_conns > 0.9
+        for: 5m
+        labels: { severity: ticket, team: payments }
+        annotations:
+          summary: "pgx pool > 90% utilised on {{ $labels.service_name }}"
+      - alert: PGKafkaConsumerLagHigh
+        expr: max by (consumergroup, topic) (kafka_consumergroup_lag{consumergroup=~".*-service"}) > 10000
+        for: 10m
+        labels: { severity: ticket, team: payments }
+        annotations:
+          summary: "Kafka consumer {{ $labels.consumergroup }} lag > 10k on {{ $labels.topic }}"
+      - alert: PGIdempotencyStoreErrors
+        expr: sum(rate(pg_idempotency_errors_total[5m])) > 1
+        for: 5m
+        labels: { severity: page, team: payments }
+        annotations:
+          summary: "Idempotency store (Redis) errors"
+          description: "Gateway cannot guarantee idempotency; writes should fail closed (503) rather than double-charge."
+      - alert: PGReconciliationMismatch
+        expr: sum by (provider) (increase(pg_reconciliation_mismatch_total[1h])) > 0
+        for: 0m
+        labels: { severity: ticket, team: finance }
+        annotations:
+          summary: "Reconciliation mismatches for {{ $labels.provider }} in the last hour"

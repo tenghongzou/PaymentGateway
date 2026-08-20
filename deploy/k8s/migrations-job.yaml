@@ -1,0 +1,107 @@
+# Standalone database migration Job (kubectl-applyable), equivalent to the Helm pre-upgrade hook rendered by
+# deploy/helm/paymentgateway/templates/migration-job.yaml. Use it for:
+#   - the very first install (the Helm hook is pre-upgrade only, because the ExternalSecret-backed Secret
+#     does not exist before the first release is installed), or
+#   - ad-hoc `migrate down 1` during an incident.
+#
+# How it works
+#   * Same image as the service (ghcr.io/tenghongzou/paymentgateway/<service>:<tag>); the image ships
+#     /migrations/<short-name>/NNNN_*.up.sql|.down.sql for every service.
+#   * The service binary exposes a `migrate` sub-command (golang-migrate embedded via pkg/pgdb):
+#         /app migrate up            # apply all pending migrations
+#         /app migrate down 1        # roll back one step
+#         /app migrate version       # print current version / dirty flag
+#     It reads PG_DATABASE_URL and PG_MIGRATIONS_DIR (root dir; the service appends its short name,
+#     e.g. /migrations/payment). Exit code != 0 fails the Job, which blocks the Helm upgrade.
+#   * Migrations MUST be expand/contract safe: old pods keep running while the Job executes.
+#
+# Usage (first install):
+#   helm upgrade --install paymentgateway deploy/helm/paymentgateway -n payments -f values-production.yaml \
+#        --set migrations.enabled=false
+#   for svc in merchant payment ledger webhook reconciliation; do
+#     sed -e "s/__SERVICE__/${svc}-service/g" -e "s/__TAG__/v1.0.0/g" -e "s/__REV__/$(date +%s)/g" \
+#         deploy/k8s/migrations-job.yaml | kubectl -n payments apply -f -
+#   done
+#   (provider-mock / provider-stripe / api-gateway own no database and need no Job.)
+#
+# Placeholders: __SERVICE__ (e.g. payment-service), __TAG__ (image tag), __REV__ (unique suffix).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: paymentgateway-__SERVICE__-migrate-__REV__
+  labels:
+    app.kubernetes.io/name: __SERVICE__
+    app.kubernetes.io/part-of: paymentgateway
+    app.kubernetes.io/role: migration
+  annotations:
+    # Harmless outside Helm; when copied into a chart these make it a pre-upgrade hook.
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: __SERVICE__
+        app.kubernetes.io/part-of: paymentgateway
+        app.kubernetes.io/role: migration
+      annotations:
+        sidecar.istio.io/inject: "false"
+        linkerd.io/inject: disabled
+    spec:
+      restartPolicy: Never
+      # Same ServiceAccount as the service so NetworkPolicies / IRSA behave identically.
+      serviceAccountName: paymentgateway-__SERVICE__
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/tenghongzou/paymentgateway/__SERVICE__:__TAG__
+          imagePullPolicy: IfNotPresent
+          command: ["/app"]
+          args: ["migrate", "up"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            # Rendered by the chart: ConfigMap <release>-<service> and Secret <release>-<service>-env
+            - configMapRef:
+                name: paymentgateway-__SERVICE__
+            - secretRef:
+                name: paymentgateway-__SERVICE__-env
+          env:
+            - name: PG_AUTO_MIGRATE
+              value: "false"
+            - name: PG_MIGRATIONS_DIR
+              value: /migrations
+            # DDL role (<svc>_owner). Optional: when absent the Job falls back to PG_DATABASE_URL from the secret.
+            - name: PG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: paymentgateway-__SERVICE__-env
+                  key: PG_MIGRATE_DATABASE_URL
+                  optional: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi

@@ -1,0 +1,23 @@
+{{- range $name, $raw := .Values.services }}
+{{- $svc := include "pg.mergeSvc" (dict "root" $ "raw" $raw) | fromYaml }}
+{{- if and $svc.enabled $svc.pdb.enabled }}
+{{- $ctx := dict "root" $ "name" $name "svc" $svc }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pg.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "pg.labels" $ctx | nindent 4 }}
+spec:
+  {{- if $svc.pdb.maxUnavailable }}
+  maxUnavailable: {{ $svc.pdb.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ $svc.pdb.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "pg.selectorLabels" $ctx | nindent 6 }}
+{{- end }}
+{{- end }}

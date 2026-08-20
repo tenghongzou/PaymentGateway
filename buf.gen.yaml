@@ -1,0 +1,18 @@
+# buf v2 code generation. Run `make proto` (uses this file when buf is installed,
+# otherwise falls back to scripts/protoc-gen.sh, which produces an identical layout).
+version: v2
+clean: false
+managed:
+  enabled: false   # go_package is set explicitly in every .proto (full import path under api/gen/go)
+plugins:
+  - local: protoc-gen-go
+    out: api/gen/go
+    opt:
+      - paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: api/gen/go
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=true
+inputs:
+  - directory: api/proto

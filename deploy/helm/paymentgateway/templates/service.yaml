@@ -1,0 +1,35 @@
+{{- range $name, $raw := .Values.services }}
+{{- $svc := include "pg.mergeSvc" (dict "root" $ "raw" $raw) | fromYaml }}
+{{- if $svc.enabled }}
+{{- $ctx := dict "root" $ "name" $name "svc" $svc }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pg.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "pg.labels" $ctx | nindent 4 }}
+  {{- with $svc.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $svc.service.type }}
+  selector:
+    {{- include "pg.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $svc.httpPort }}
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+    {{- if $svc.grpcPort }}
+    - name: grpc
+      port: {{ $svc.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: grpc
+    {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,21 @@
+# binaries / tools
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage*.txt
+
+# env / secrets
+.env
+.env.*
+!.env.example
+deploy/compose/.env
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# go
+vendor/

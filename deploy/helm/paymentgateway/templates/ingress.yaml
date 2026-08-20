@@ -1,0 +1,52 @@
+{{- range $name, $raw := .Values.services }}
+{{- $svc := include "pg.mergeSvc" (dict "root" $ "raw" $raw) | fromYaml }}
+{{- if and $svc.enabled $svc.ingress.enabled }}
+{{- $ctx := dict "root" $ "name" $name "svc" $svc }}
+{{- $ing := $svc.ingress }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "pg.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "pg.labels" $ctx | nindent 4 }}
+  annotations:
+    {{- with $ing.rateLimit }}
+    # Edge rate limiting (per client IP). Merchant-level limits are enforced inside api-gateway (Redis).
+    nginx.ingress.kubernetes.io/limit-rps: {{ .rps | quote }}
+    nginx.ingress.kubernetes.io/limit-connections: {{ .connections | quote }}
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: {{ .burstMultiplier | default 3 | quote }}
+    {{- end }}
+    {{- with $ing.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with $ing.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if and $ing.tls $ing.tls.enabled }}
+  tls:
+    - hosts:
+        {{- range $ing.hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ $ing.tls.secretName }}
+  {{- end }}
+  rules:
+    {{- range $host := $ing.hosts }}
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- range $p := ($ing.paths | default (list "/")) }}
+          - path: {{ $p }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "pg.fullname" $ctx }}
+                port:
+                  name: http
+          {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

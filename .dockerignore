@@ -1,0 +1,26 @@
+# Keep the build context small: only Go sources, proto artifacts and migrations are needed.
+.git
+.github
+.idea
+.vscode
+.DS_Store
+bin/
+dist/
+coverage*.out
+*.test
+*.out
+*.log
+docs/
+deploy/
+!deploy/docker/
+test/e2e/
+api/proto/
+scripts/
+Makefile
+buf.yaml
+buf.gen.yaml
+.golangci.yaml
+.env
+.env.*
+**/*.md
+**/testdata/

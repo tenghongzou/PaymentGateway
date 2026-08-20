@@ -1,0 +1,33 @@
+PaymentGateway {{ .Chart.Version }} (app {{ .Values.global.imageTag | default .Chart.AppVersion }}) deployed to namespace {{ .Release.Namespace }} as release {{ .Release.Name }}.
+Environment: {{ .Values.global.env }}
+
+Services:
+{{- range $name, $raw := .Values.services }}
+{{- $svc := include "pg.mergeSvc" (dict "root" $ "raw" $raw) | fromYaml }}
+{{- if $svc.enabled }}
+  - {{ include "pg.fullname" (dict "root" $ "name" $name "svc" $svc) }}  http:{{ $svc.httpPort }}{{ if $svc.grpcPort }} grpc:{{ $svc.grpcPort }}{{ end }}{{ if $svc.database }} db:{{ $svc.database }}{{ end }}
+{{- end }}
+{{- end }}
+
+{{- $gw := index .Values.services "api-gateway" }}
+{{- if and $gw $gw.ingress $gw.ingress.enabled }}
+
+Public API:
+{{- range $gw.ingress.hosts }}
+  https://{{ . }}/healthz
+{{- end }}
+{{- end }}
+
+Next steps:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} get externalsecrets     # all must be SecretSynced
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pg.prefix" . }}-api-gateway 8080:8080
+
+{{- if .Values.migrations.enabled }}
+
+Migrations: a Job per database service runs as a "{{ .Values.migrations.hooks }}" hook ({{ join " " .Values.migrations.command }} {{ join " " .Values.migrations.args }}).
+{{- if not .Values.global.autoMigrate }}
+On a FIRST install nothing migrates automatically (hook is pre-upgrade only): run deploy/k8s/migrations-job.yaml or
+install with --set global.autoMigrate=true once.
+{{- end }}
+{{- end }}

@@ -1,0 +1,19 @@
+apiVersion: v2
+name: paymentgateway
+description: Multi-tenant payment gateway (api-gateway, merchant, payment, ledger, webhook, reconciliation, provider adapters)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/tenghongzou/paymentgateway
+sources:
+  - https://github.com/tenghongzou/paymentgateway
+keywords:
+  - payments
+  - grpc
+  - fintech
+maintainers:
+  - name: PaymentGateway DevOps
+annotations:
+  # External CRDs used (optional): external-secrets.io (ExternalSecret), networking.k8s.io (Ingress)
+  artifacthub.io/crds: "external-secrets.io/v1 ExternalSecret (optional, externalSecrets.enabled)"

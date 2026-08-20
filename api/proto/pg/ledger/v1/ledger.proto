@@ -1,0 +1,368 @@
+// ledger-service（gRPC :9003，DB pg_ledger）對內契約。
+//
+// 職責：雙式記帳（帳戶、日記帳 journal、分錄 entries、餘額）；主要透過消費 payment.events 自動記帳，
+//       本 gRPC 介面供查詢（api-gateway /ledger/*、reconciliation-service）與內部手動調整（PostJournal）。
+//
+// 不變量（docs/01-architecture.md §5.4）：
+//   - 每筆 journal 借貸總額相等（DB constraint + 應用層驗證）。
+//   - 帳本只能 INSERT；錯帳以反向分錄沖銷（reversal），不得 UPDATE / DELETE。
+//   - 金額一律 Money（int64 最小單位），同一 journal 內幣別必須一致。
+syntax = "proto3";
+
+package pg.ledger.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pg/common/v1/money.proto";
+import "pg/common/v1/pagination.proto";
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/ledger/v1;ledgerv1";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// LedgerService 提供帳本查詢與內部過帳。
+service LedgerService {
+  // 建立帳戶。商戶帳戶（merchant_payable 等）通常由 ledger-service 消費 merchant.events 自動建立；
+  // 本 RPC 供後台建立系統帳戶（fee_revenue、psp_receivable per provider）或補建。
+  // 冪等：以 (type, merchant_id, provider, currency) 唯一；重複建立回傳既有帳戶（不報錯）。
+  rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse);
+
+  // 依 ID 取得帳戶。錯誤：NOT_FOUND。
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+
+  // 列出帳戶，可依商戶 / 類型 / 幣別 / 供應商篩選。
+  rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
+
+  // 取得餘額。可指定 account_id，或以 (merchant_id, currency) 取得商戶應付餘額（merchant_payable）的
+  // available / pending / reserved 拆解。餘額由分錄即時彙總（附 materialized snapshot 加速）。
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+
+  // 內部過帳：寫入一筆 journal 與其 entries（同一交易）。
+  // 驗證：entries >= 2、借貸總額相等、幣別一致、帳戶存在且幣別相符、idempotency_key 未使用。
+  // 錯誤：INVALID_ARGUMENT（不平衡 → code=journal_unbalanced）、ALREADY_EXISTS（idempotency_key 重複，回傳既有 journal）、NOT_FOUND（帳戶）。
+  // **僅限內部呼叫**（reconciliation-service 的調整分錄、後台人工沖銷）；api-gateway 不得暴露。
+  rpc PostJournal(PostJournalRequest) returns (PostJournalResponse);
+
+  // 依 ID 取得 journal（含 entries）。
+  rpc GetJournal(GetJournalRequest) returns (GetJournalResponse);
+
+  // 列出 journal，可依商戶 / 帳戶 / 參照（payment_id 等）/ 時間篩選；依 posted_at DESC 排序。
+  rpc ListJournals(ListJournalsRequest) returns (ListJournalsResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// AccountType 為帳戶類型（§5.4）。
+enum AccountType {
+  ACCOUNT_TYPE_UNSPECIFIED = 0;
+  // 應付商戶款（負債）：平台欠商戶的錢；貸方增加。每商戶每幣別一個。
+  ACCOUNT_TYPE_MERCHANT_PAYABLE = 1;
+  // 應收 PSP 款（資產）：PSP 尚未結算給平台的錢；借方增加。每 provider 每幣別一個（系統帳戶）。
+  ACCOUNT_TYPE_PSP_RECEIVABLE = 2;
+  // 手續費收入（收入）：平台向商戶收取的手續費；貸方增加。每幣別一個（系統帳戶）。
+  ACCOUNT_TYPE_FEE_REVENUE = 3;
+  // 退款清算（過渡）：退款送出到 PSP 確認期間的暫記；借方增加。每商戶每幣別一個。
+  ACCOUNT_TYPE_REFUND_CLEARING = 4;
+  // 拒付準備金（負債的對沖）：爭議期間凍結的商戶款項；借方增加。每商戶每幣別一個。
+  ACCOUNT_TYPE_CHARGEBACK_RESERVE = 5;
+}
+
+// EntryDirection 為分錄方向。
+enum EntryDirection {
+  ENTRY_DIRECTION_UNSPECIFIED = 0;
+  // 借方。
+  ENTRY_DIRECTION_DEBIT = 1;
+  // 貸方。
+  ENTRY_DIRECTION_CREDIT = 2;
+}
+
+// AccountStatus 為帳戶狀態。
+enum AccountStatus {
+  ACCOUNT_STATUS_UNSPECIFIED = 0;
+  // 可過帳。
+  ACCOUNT_STATUS_ACTIVE = 1;
+  // 凍結：拒絕新分錄（商戶關閉 / 稽核中）。
+  ACCOUNT_STATUS_FROZEN = 2;
+}
+
+// JournalSourceType 為 journal 的來源類型。
+enum JournalSourceType {
+  JOURNAL_SOURCE_TYPE_UNSPECIFIED = 0;
+  // 由 payment.events 自動記帳。
+  JOURNAL_SOURCE_TYPE_PAYMENT_EVENT = 1;
+  // 對帳調整（reconciliation-service）。
+  JOURNAL_SOURCE_TYPE_RECONCILIATION_ADJUSTMENT = 2;
+  // 人工調整（後台）。
+  JOURNAL_SOURCE_TYPE_MANUAL_ADJUSTMENT = 3;
+  // 沖銷另一筆 journal。
+  JOURNAL_SOURCE_TYPE_REVERSAL = 4;
+  // 撥款 / 結算（Phase 3）。
+  JOURNAL_SOURCE_TYPE_PAYOUT = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Domain messages
+// ---------------------------------------------------------------------------
+
+// Account 為帳本帳戶。
+message Account {
+  // 帳戶 ID，格式 acct_ + ULID。
+  string id = 1;
+  // 帳戶類型。
+  AccountType type = 2;
+  // 所屬商戶；系統帳戶（psp_receivable、fee_revenue）為空。
+  string merchant_id = 3;
+  // 供應商識別碼；僅 psp_receivable 使用，其他為空。
+  string provider = 4;
+  // 幣別（ISO 4217）。一個帳戶只持有一種幣別。
+  string currency = 5;
+  // 顯示名稱（例：「merchant_payable/TWD/mch_xxx」）。
+  string name = 6;
+  // 狀態。
+  AccountStatus status = 7;
+  // 是否為正式帳本（test mode 事件記到 livemode=false 的帳戶）。
+  bool livemode = 8;
+  google.protobuf.Timestamp created_at = 9;
+}
+
+// Balance 為帳戶餘額快照。
+message Balance {
+  // 帳戶 ID。
+  string account_id = 1;
+  // 帳戶類型。
+  AccountType account_type = 2;
+  // 幣別。
+  string currency = 3;
+  // 帳面餘額（依帳戶正常方向計算的淨額：負債/收入類 = 貸 - 借；資產/過渡類 = 借 - 貸）。可為負。
+  int64 balance_minor = 4;
+  // 借方合計。
+  int64 total_debit_minor = 5;
+  // 貸方合計。
+  int64 total_credit_minor = 6;
+  // 截至此 journal 為止（最後一筆納入計算的 journal id）。
+  string as_of_journal_id = 7;
+  // 餘額計算時間。
+  google.protobuf.Timestamp as_of = 8;
+}
+
+// MerchantBalance 為商戶視角的餘額拆解（api-gateway /ledger/balance 回傳）。
+message MerchantBalance {
+  string merchant_id = 1;
+  string currency = 2;
+  // 可用餘額 = merchant_payable 餘額 - reserved - pending。
+  int64 available_minor = 3;
+  // 待確認：退款清算中（refund_clearing）的金額。
+  int64 pending_minor = 4;
+  // 凍結：爭議準備金（chargeback_reserve）的金額。
+  int64 reserved_minor = 5;
+  // 應付總額（merchant_payable 帳面餘額）。
+  int64 payable_minor = 6;
+  google.protobuf.Timestamp as_of = 7;
+}
+
+// Entry 為一筆分錄。
+message Entry {
+  // 分錄 ID，格式 ent_ + ULID。
+  string id = 1;
+  // 所屬 journal。
+  string journal_id = 2;
+  // 帳戶。
+  string account_id = 3;
+  // 帳戶類型（反正規化，方便顯示）。
+  AccountType account_type = 4;
+  // 方向。
+  EntryDirection direction = 5;
+  // 金額（> 0）。
+  pg.common.v1.Money amount = 6;
+  // 分錄說明。
+  string description = 7;
+}
+
+// Journal 為一筆日記帳（不可變）。
+message Journal {
+  // journal ID，格式 jrn_ + ULID。
+  string id = 1;
+  // 所屬商戶（跨商戶的系統 journal 為空）。
+  string merchant_id = 2;
+  // 來源類型。
+  JournalSourceType source_type = 3;
+  // 來源 ID：PAYMENT_EVENT 時為 event_id；REVERSAL 時為被沖銷的 journal id；調整時為 discrepancy id 或工單號。
+  string source_id = 4;
+  // 業務參照類型：payment | refund | dispute | payout；無則空。
+  string reference_type = 5;
+  // 業務參照 ID（pay_… / re_… / dp_…）。
+  string reference_id = 6;
+  // 說明。
+  string description = 7;
+  // 幣別（所有 entries 相同）。
+  string currency = 8;
+  // 分錄（>= 2，借貸相等）。
+  repeated Entry entries = 9;
+  // 冪等鍵（PAYMENT_EVENT 時 = event_id）。
+  string idempotency_key = 10;
+  // 若本 journal 已被沖銷，沖銷它的 journal id。
+  string reversed_by_journal_id = 11;
+  bool livemode = 12;
+  map<string, string> metadata = 13;
+  // 過帳時間（寫入帳本的時間，單調遞增）。
+  google.protobuf.Timestamp posted_at = 14;
+  // 業務發生時間（事件的 occurred_at），可早於 posted_at。
+  google.protobuf.Timestamp effective_at = 15;
+}
+
+// ---------------------------------------------------------------------------
+// RPC messages
+// ---------------------------------------------------------------------------
+
+// CreateAccountRequest 建立帳戶。
+message CreateAccountRequest {
+  // 類型。必填。
+  AccountType type = 1;
+  // 商戶 ID；商戶類帳戶必填，系統帳戶留空。
+  string merchant_id = 2;
+  // 供應商；psp_receivable 必填。
+  string provider = 3;
+  // 幣別。必填。
+  string currency = 4;
+  bool livemode = 5;
+}
+
+// CreateAccountResponse 回傳帳戶。
+message CreateAccountResponse {
+  Account account = 1;
+  // true 表示帳戶已存在，回傳既有帳戶。
+  bool already_existed = 2;
+}
+
+// GetAccountRequest 查詢帳戶。
+message GetAccountRequest {
+  string account_id = 1;
+}
+
+// GetAccountResponse 回傳帳戶。
+message GetAccountResponse {
+  Account account = 1;
+}
+
+// ListAccountsRequest 列出帳戶。
+message ListAccountsRequest {
+  pg.common.v1.PageRequest page = 1;
+  // 依商戶篩選。
+  string merchant_id = 2;
+  // 依類型篩選；UNSPECIFIED 表示全部。
+  AccountType type = 3;
+  string currency = 4;
+  string provider = 5;
+  optional bool livemode = 6;
+}
+
+// ListAccountsResponse 列表結果。
+message ListAccountsResponse {
+  repeated Account accounts = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// GetBalanceRequest 查詢餘額（二選一）。
+message GetBalanceRequest {
+  oneof target {
+    // 指定帳戶。
+    string account_id = 1;
+    // 商戶 + 幣別：回傳 MerchantBalance 拆解。
+    MerchantCurrency merchant = 2;
+  }
+}
+
+// MerchantCurrency 為 (merchant_id, currency) 組合。
+message MerchantCurrency {
+  string merchant_id = 1;
+  // 幣別；空表示回傳該商戶所有幣別。
+  string currency = 2;
+  bool livemode = 3;
+}
+
+// GetBalanceResponse 回傳餘額。
+message GetBalanceResponse {
+  // target=account_id 時填入。
+  Balance balance = 1;
+  // target=merchant 時填入（每幣別一筆）。
+  repeated MerchantBalance merchant_balances = 2;
+}
+
+// EntryInput 為過帳時的分錄輸入。
+message EntryInput {
+  // 帳戶 ID。必填。
+  string account_id = 1;
+  // 方向。必填。
+  EntryDirection direction = 2;
+  // 金額（> 0）。必填。
+  pg.common.v1.Money amount = 3;
+  string description = 4;
+}
+
+// PostJournalRequest 過帳。
+message PostJournalRequest {
+  // 冪等鍵。必填；重複回傳既有 journal。
+  string idempotency_key = 1;
+  string merchant_id = 2;
+  // 來源類型。必填（不可為 PAYMENT_EVENT，該類型僅由內部 consumer 寫入）。
+  JournalSourceType source_type = 3;
+  string source_id = 4;
+  string reference_type = 5;
+  string reference_id = 6;
+  // 說明。必填。
+  string description = 7;
+  // 分錄（>= 2，借貸相等，幣別一致）。必填。
+  repeated EntryInput entries = 8;
+  bool livemode = 9;
+  map<string, string> metadata = 10;
+  // 業務發生時間；未設定則等於過帳時間。
+  google.protobuf.Timestamp effective_at = 11;
+  // 若本筆為沖銷，指定被沖銷的 journal id（source_type 須為 REVERSAL，entries 須與原 journal 方向相反、金額相同）。
+  string reverses_journal_id = 12;
+}
+
+// PostJournalResponse 回傳 journal。
+message PostJournalResponse {
+  Journal journal = 1;
+  bool idempotent_replayed = 2;
+}
+
+// GetJournalRequest 查詢 journal。
+message GetJournalRequest {
+  string journal_id = 1;
+  // 商戶 ID；gateway 呼叫時必填以限制可見範圍。
+  string merchant_id = 2;
+}
+
+// GetJournalResponse 回傳 journal。
+message GetJournalResponse {
+  Journal journal = 1;
+}
+
+// ListJournalsRequest 列出 journal。
+message ListJournalsRequest {
+  pg.common.v1.PageRequest page = 1;
+  // 商戶 ID；gateway 呼叫時必填。
+  string merchant_id = 2;
+  // 依帳戶篩選。
+  string account_id = 3;
+  // 依業務參照篩選。
+  string reference_type = 4;
+  string reference_id = 5;
+  JournalSourceType source_type = 6;
+  string currency = 7;
+  // posted_at 下限（含）。
+  google.protobuf.Timestamp posted_after = 8;
+  // posted_at 上限（不含）。
+  google.protobuf.Timestamp posted_before = 9;
+  optional bool livemode = 10;
+}
+
+// ListJournalsResponse 列表結果。
+message ListJournalsResponse {
+  repeated Journal journals = 1;
+  pg.common.v1.PageResponse page = 2;
+}

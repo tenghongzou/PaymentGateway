@@ -1,0 +1,22 @@
+// 金額值物件（跨服務共用）。
+//
+// 規則（見 docs/01-architecture.md §5.1）：
+//   - 金額絕不使用浮點數，一律以「最小貨幣單位」的 int64 表示。
+//   - 服務端請透過 pkg/money 操作，禁止直接對 amount_minor 做加減。
+syntax = "proto3";
+
+package pg.common.v1;
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/common/v1;commonv1";
+
+// Money 代表某一幣別的一筆金額。
+message Money {
+  // 以最小貨幣單位表示的金額。
+  // 例：TWD 100 元 = 100；USD 1.00 = 100；JPY 500 円 = 500。
+  // 必須 >= 0；負數金額以「方向」（借/貸、退款/付款）表達，不以負號表達。
+  int64 amount_minor = 1;
+
+  // ISO 4217 幣別代碼，大寫 3 碼（例：TWD、USD、JPY）。必填。
+  // 同一筆 Payment 內所有 Money 的 currency 必須一致（v1 不做換匯）。
+  string currency = 2;
+}

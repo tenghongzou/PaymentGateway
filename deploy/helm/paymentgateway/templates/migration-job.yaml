@@ -1,0 +1,89 @@
+{{- if .Values.migrations.enabled }}
+{{- $m := .Values.migrations }}
+{{- range $name, $raw := .Values.services }}
+{{- $svc := include "pg.mergeSvc" (dict "root" $ "raw" $raw) | fromYaml }}
+{{- if and $svc.enabled $svc.database }}
+{{- $ctx := dict "root" $ "name" $name "svc" $svc }}
+---
+# Helm hook: runs `/app migrate up` for migrations/{{ include "pg.shortName" $ctx }} before the new
+# Deployment is rolled out. Migrations must be backward compatible (expand/contract) because old pods
+# keep serving traffic while the hook runs. See docs/07-deployment.md.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-migrate-%d" (include "pg.fullname" $ctx) (int $.Release.Revision) | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "pg.labels" $ctx | nindent 4 }}
+    app.kubernetes.io/role: migration
+  annotations:
+    helm.sh/hook: {{ $m.hooks | quote }}
+    helm.sh/hook-weight: {{ $m.hookWeight | quote }}
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ $m.backoffLimit }}
+  activeDeadlineSeconds: {{ $m.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ $m.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg.selectorLabels" $ctx | nindent 8 }}
+        app.kubernetes.io/part-of: paymentgateway
+        app.kubernetes.io/role: migration
+      annotations:
+        sidecar.istio.io/inject: "false"
+        linkerd.io/inject: disabled
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "pg.serviceAccountName" $ctx }}
+      automountServiceAccountToken: false
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $.Values.global.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "pg.image" $ctx | quote }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+          command:
+            {{- toYaml $m.command | nindent 12 }}
+          args:
+            {{- toYaml $m.args | nindent 12 }}
+          securityContext:
+            {{- toYaml $.Values.global.containerSecurityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "pg.fullname" $ctx }}
+            {{- if include "pg.hasSecret" $ctx }}
+            - secretRef:
+                name: {{ include "pg.secretName" $ctx }}
+            {{- end }}
+          env:
+            - name: PG_AUTO_MIGRATE
+              value: "false"
+            - name: PG_MIGRATIONS_DIR
+              value: {{ $.Values.global.migrationsDir | quote }}
+            {{- if include "pg.hasSecret" $ctx }}
+            # Migrations need DDL: if Vault provides PG_MIGRATE_DATABASE_URL (the <svc>_owner role) it overrides
+            # PG_DATABASE_URL (the <svc>_app role used by the running service). Optional: falls back otherwise.
+            - name: PG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" $ctx }}
+                  key: PG_MIGRATE_DATABASE_URL
+                  optional: true
+            {{- end }}
+          resources:
+            {{- toYaml $m.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+{{- end }}
+{{- end }}
+{{- end }}

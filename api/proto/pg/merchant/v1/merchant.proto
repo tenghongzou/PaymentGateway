@@ -1,0 +1,522 @@
+// merchant-service（gRPC :9001，DB pg_merchant）對內契約。
+//
+// 職責：商戶、API Key（僅存 Argon2id hash）、對商戶的 Webhook 端點、供應商路由偏好。
+// 呼叫者：api-gateway（VerifyApiKey 每個請求都會呼叫，需搭配 Redis 快取）、
+//         payment-service（GetRoutingPreferences）、webhook-service（ListWebhookEndpoints）。
+syntax = "proto3";
+
+package pg.merchant.v1;
+
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "pg/common/v1/pagination.proto";
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/merchant/v1;merchantv1";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// MerchantService 管理商戶主檔及其附屬設定。
+service MerchantService {
+  // 建立商戶。由內部後台 / 自助註冊流程呼叫；商戶建立後預設狀態為 ACTIVE。
+  // 錯誤：ALREADY_EXISTS（external_ref 重複）、INVALID_ARGUMENT。
+  rpc CreateMerchant(CreateMerchantRequest) returns (CreateMerchantResponse);
+
+  // 依 ID 取得商戶。錯誤：NOT_FOUND。
+  rpc GetMerchant(GetMerchantRequest) returns (GetMerchantResponse);
+
+  // 部分更新商戶；僅更新 update_mask 指定的欄位。
+  // 可更新欄位：name、legal_name、contact_email、status、default_currency、default_statement_descriptor、metadata。
+  // 錯誤：NOT_FOUND、INVALID_ARGUMENT（mask 含不可更新欄位，如 id、created_at）。
+  rpc UpdateMerchant(UpdateMerchantRequest) returns (UpdateMerchantResponse);
+
+  // 列出商戶（後台用），支援狀態與國別篩選，依 created_at DESC 排序。
+  rpc ListMerchants(ListMerchantsRequest) returns (ListMerchantsResponse);
+
+  // 建立 API Key。**明文 key 與配對的簽章 secret 只在本回應出現一次**，
+  // 服務端對 key 僅保存 Argon2id hash 與前綴；簽章 secret 以 Vault transit 加密保存（驗簽時需取回明文）。
+  // 每個商戶每種 mode 最多 10 把有效 key（超過回 RESOURCE_EXHAUSTED）。
+  rpc CreateApiKey(CreateApiKeyRequest) returns (CreateApiKeyResponse);
+
+  // 撤銷 API Key。撤銷後立即失效；因 api-gateway 會快取 VerifyApiKey 結果（TTL 60s），
+  // 服務端同時發佈 merchant.events 的 api_key.revoked 事件讓 gateway 主動清快取。冪等：重複撤銷回成功。
+  rpc RevokeApiKey(RevokeApiKeyRequest) returns (RevokeApiKeyResponse);
+
+  // 列出商戶的 API Key（不含明文、不含 hash、不含簽章 secret）。
+  rpc ListApiKeys(ListApiKeysRequest) returns (ListApiKeysResponse);
+
+  // 驗證 API Key（供 api-gateway 驗證 Authorization: Bearer 使用）。
+  // 以 key_prefix 定位候選 key（前綴有索引），再以 Argon2id 比對完整 key。
+  // 回傳 valid=false 時不回 gRPC error（避免被當成系統錯誤），並附 reason。
+  // 驗證成功會非同步更新 last_used_at（不阻塞回應），並回傳 signing_secret 供 gateway 驗證 X-Signature。
+  rpc VerifyApiKey(VerifyApiKeyRequest) returns (VerifyApiKeyResponse);
+
+  // 建立對商戶的 Webhook 端點。回應含 signing_secret 明文（**僅此一次**），商戶用來驗證 X-PG-Signature。
+  // 每個商戶最多 16 個端點。url 必須為 https（test mode 允許 http://localhost）。
+  rpc CreateWebhookEndpoint(CreateWebhookEndpointRequest) returns (CreateWebhookEndpointResponse);
+
+  // 部分更新 Webhook 端點（url、description、enabled_events、status、metadata）。
+  // rotate_secret=true 時會產生新 secret 並在 24h 內同時接受新舊兩把（webhook-service 以兩把各算一個 v1 簽章）。
+  rpc UpdateWebhookEndpoint(UpdateWebhookEndpointRequest) returns (UpdateWebhookEndpointResponse);
+
+  // 刪除 Webhook 端點（軟刪除，狀態改為 DELETED；尚未送達的 delivery 會被標記為取消）。冪等。
+  rpc DeleteWebhookEndpoint(DeleteWebhookEndpointRequest) returns (DeleteWebhookEndpointResponse);
+
+  // 列出商戶的 Webhook 端點（預設不含 DELETED）。webhook-service 以 include_secrets=true 取得簽章用 secret。
+  rpc ListWebhookEndpoints(ListWebhookEndpointsRequest) returns (ListWebhookEndpointsResponse);
+
+  // 取得商戶的供應商路由偏好。商戶未設定時回傳系統預設（rules 為空、failover_enabled=true、max_attempts=3）。
+  rpc GetRoutingPreferences(GetRoutingPreferencesRequest) returns (GetRoutingPreferencesResponse);
+
+  // 整份覆寫商戶的供應商路由偏好（非 merge）。rules 依 priority 由小到大評估。
+  // 錯誤：INVALID_ARGUMENT（未知 provider、幣別格式錯誤、priority 重複）。
+  rpc UpdateRoutingPreferences(UpdateRoutingPreferencesRequest) returns (UpdateRoutingPreferencesResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// MerchantStatus 為商戶狀態。
+enum MerchantStatus {
+  // 未指定（不應出現在已儲存資料）。
+  MERCHANT_STATUS_UNSPECIFIED = 0;
+  // 正常營運，可建立付款。
+  MERCHANT_STATUS_ACTIVE = 1;
+  // 暫停：拒絕新付款，但允許退款、查詢、爭議處理。
+  MERCHANT_STATUS_SUSPENDED = 2;
+  // 已關閉：所有寫入操作拒絕，僅允許查詢。
+  MERCHANT_STATUS_CLOSED = 3;
+}
+
+// ApiKeyMode 區分正式與測試環境；test mode 的付款一律路由到 provider-mock。
+enum ApiKeyMode {
+  API_KEY_MODE_UNSPECIFIED = 0;
+  // 正式：key 前綴 pk_live_。
+  API_KEY_MODE_LIVE = 1;
+  // 測試：key 前綴 pk_test_。
+  API_KEY_MODE_TEST = 2;
+}
+
+// ApiKeyStatus 為 API Key 狀態。
+enum ApiKeyStatus {
+  API_KEY_STATUS_UNSPECIFIED = 0;
+  // 可用。
+  API_KEY_STATUS_ACTIVE = 1;
+  // 已撤銷（不可逆）。
+  API_KEY_STATUS_REVOKED = 2;
+  // 已過期（expires_at 已過）。
+  API_KEY_STATUS_EXPIRED = 3;
+}
+
+// WebhookEndpointStatus 為 Webhook 端點狀態。
+enum WebhookEndpointStatus {
+  WEBHOOK_ENDPOINT_STATUS_UNSPECIFIED = 0;
+  // 啟用中，會收到通知。
+  WEBHOOK_ENDPOINT_STATUS_ENABLED = 1;
+  // 商戶手動停用；不產生 delivery。
+  WEBHOOK_ENDPOINT_STATUS_DISABLED = 2;
+  // 系統自動停用：連續失敗超過閾值（預設 7 天內所有重試皆失敗）。商戶可透過 Update 重新啟用。
+  WEBHOOK_ENDPOINT_STATUS_AUTO_DISABLED = 3;
+  // 已刪除（軟刪除）。
+  WEBHOOK_ENDPOINT_STATUS_DELETED = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Domain messages
+// ---------------------------------------------------------------------------
+
+// Merchant 為商戶主檔。
+message Merchant {
+  // 商戶 ID，格式 mch_ + ULID（26 碼）。系統產生，不可變。
+  string id = 1;
+  // 顯示名稱（1–100 字）。
+  string name = 2;
+  // 法定登記名稱（出現在對帳單與發票）。
+  string legal_name = 3;
+  // 登記國別，ISO 3166-1 alpha-2（例：TW、JP、US）。
+  string country = 4;
+  // 預設結算幣別，ISO 4217。付款一律明示幣別，此欄位供報表與餘額顯示。
+  string default_currency = 5;
+  // 商戶狀態。
+  MerchantStatus status = 6;
+  // 聯絡信箱；系統性通知（webhook 自動停用、爭議到期提醒）寄送對象。
+  string contact_email = 7;
+  // 預設的帳單描述（statement descriptor），付款未指定時使用；最長 22 字、ASCII 可列印字元。
+  string default_statement_descriptor = 8;
+  // 外部系統參照（例如 CRM 客戶編號），全系統唯一，可選。
+  string external_ref = 9;
+  // 自由格式鍵值對；key 最長 40、value 最長 500、最多 50 組。
+  map<string, string> metadata = 10;
+  // 建立時間（UTC）。
+  google.protobuf.Timestamp created_at = 11;
+  // 最後更新時間（UTC）。
+  google.protobuf.Timestamp updated_at = 12;
+}
+
+// ApiKey 為 API Key 的公開表示（永遠不含明文、hash 或簽章 secret）。
+message ApiKey {
+  // API Key ID，格式 key_ + ULID。
+  string id = 1;
+  // 所屬商戶。
+  string merchant_id = 2;
+  // live / test。
+  ApiKeyMode mode = 3;
+  // 顯示用前綴，固定 12 碼：pk_live_ab12 / pk_test_ab12（pk_ + mode + _ + 4 碼隨機）。用於索引查找與顯示。
+  string prefix = 4;
+  // 商戶自訂名稱（例：「後端伺服器」），最長 100 字。
+  string name = 5;
+  // 授權範圍。可用值：payments:read、payments:write、refunds:read、refunds:write、
+  // disputes:read、disputes:write、webhooks:manage、api_keys:manage、ledger:read、events:read。
+  // 空陣列表示全部範圍。
+  repeated string scopes = 6;
+  // 狀態。
+  ApiKeyStatus status = 7;
+  // 最後使用時間；從未使用時未設定。非同步更新，精度為分鐘級。
+  google.protobuf.Timestamp last_used_at = 8;
+  // 到期時間；未設定表示永不過期。
+  google.protobuf.Timestamp expires_at = 9;
+  // 建立時間。
+  google.protobuf.Timestamp created_at = 10;
+  // 撤銷時間；未撤銷時未設定。
+  google.protobuf.Timestamp revoked_at = 11;
+}
+
+// WebhookEndpoint 為商戶接收事件通知的端點。
+message WebhookEndpoint {
+  // 端點 ID，格式 we_ + ULID。
+  string id = 1;
+  // 所屬商戶。
+  string merchant_id = 2;
+  // 接收 URL。必須 https；test mode 允許 http://localhost 與 http://127.0.0.1。
+  string url = 3;
+  // 說明，最長 200 字。
+  string description = 4;
+  // 訂閱的事件類型（例：payment.captured）。空陣列或含 "*" 表示訂閱全部。
+  // 完整清單由 WebhookService.ListEventTypes 提供。
+  repeated string enabled_events = 5;
+  // 狀態。
+  WebhookEndpointStatus status = 6;
+  // 此端點接收 live 或 test 事件（建立時依所用 API Key 的 mode 決定，不可變）。
+  ApiKeyMode mode = 7;
+  // 自由格式鍵值對。
+  map<string, string> metadata = 8;
+  // 建立時間。
+  google.protobuf.Timestamp created_at = 9;
+  // 最後更新時間。
+  google.protobuf.Timestamp updated_at = 10;
+  // 簽章 secret（明文）。**僅在 CreateWebhookEndpoint 回應、rotate_secret 的 Update 回應，
+  // 以及 ListWebhookEndpoints(include_secrets=true) 出現**，其他情境一律為空。格式 whsec_ + 32 bytes base64url。
+  string signing_secret = 11;
+  // 輪替期間的上一把 secret；輪替後 24 小時內仍有效。僅 include_secrets=true 時出現。
+  string previous_signing_secret = 12;
+  // previous_signing_secret 的失效時間；無輪替中 secret 時未設定。
+  google.protobuf.Timestamp previous_secret_expires_at = 13;
+}
+
+// RoutingRule 為一條供應商路由規則；所有條件皆為 AND，空條件表示「任意」。
+message RoutingRule {
+  // 評估優先序，數字越小越先評估；同一商戶內不可重複。
+  int32 priority = 1;
+  // 適用幣別（ISO 4217）；空表示任意幣別。
+  repeated string currencies = 2;
+  // 適用付款方式類型：card、wallet、bank_transfer；空表示任意。
+  repeated string payment_method_types = 3;
+  // 適用卡組織：visa、mastercard、jcb、amex、unionpay；空表示任意。僅對 card 有意義。
+  repeated string card_brands = 4;
+  // 適用國別（客戶國別，ISO 3166-1 alpha-2）；空表示任意。
+  repeated string countries = 5;
+  // 命中時使用的供應商識別碼（例：stripe、adyen、mock）。必填，必須為系統已註冊的 adapter。
+  string provider = 6;
+  // 是否啟用此規則。
+  bool enabled = 7;
+}
+
+// RoutingPreferences 為商戶的供應商路由偏好。
+message RoutingPreferences {
+  // 所屬商戶。
+  string merchant_id = 1;
+  // 路由規則；payment-service 依 priority 由小到大取第一條命中的規則。
+  repeated RoutingRule rules = 2;
+  // 沒有規則命中、或主要供應商失敗時依序嘗試的供應商清單。
+  // 空表示使用系統預設順序（依健康度與成本）。
+  repeated string fallback_providers = 3;
+  // 是否允許自動 failover（僅對 retryable 的錯誤類別，如 PROVIDER_UNAVAILABLE、DECLINED_SOFT）。預設 true。
+  bool failover_enabled = 4;
+  // 允許的最大嘗試次數（含第一次），1–5，預設 3。
+  int32 max_attempts = 5;
+  // 最後更新時間；商戶從未設定時未設定。
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Merchant RPC messages
+// ---------------------------------------------------------------------------
+
+// CreateMerchantRequest 建立商戶。
+message CreateMerchantRequest {
+  // 顯示名稱，必填。
+  string name = 1;
+  // 法定登記名稱，必填。
+  string legal_name = 2;
+  // 登記國別，必填。
+  string country = 3;
+  // 預設幣別，必填。
+  string default_currency = 4;
+  // 聯絡信箱，必填，需為合法 email。
+  string contact_email = 5;
+  // 預設帳單描述，可選。
+  string default_statement_descriptor = 6;
+  // 外部參照，可選；重複回 ALREADY_EXISTS。
+  string external_ref = 7;
+  // metadata，可選。
+  map<string, string> metadata = 8;
+}
+
+// CreateMerchantResponse 回傳建立的商戶。
+message CreateMerchantResponse {
+  // 建立後的商戶。
+  Merchant merchant = 1;
+}
+
+// GetMerchantRequest 以 ID 查詢。
+message GetMerchantRequest {
+  // 商戶 ID，必填。
+  string merchant_id = 1;
+}
+
+// GetMerchantResponse 回傳商戶。
+message GetMerchantResponse {
+  Merchant merchant = 1;
+}
+
+// UpdateMerchantRequest 部分更新。
+message UpdateMerchantRequest {
+  // 要更新的商戶；merchant.id 必填，其餘欄位依 update_mask 取用。
+  Merchant merchant = 1;
+  // 要更新的欄位路徑（例："name", "status", "metadata"）。必填且不可為空。
+  google.protobuf.FieldMask update_mask = 2;
+}
+
+// UpdateMerchantResponse 回傳更新後的商戶。
+message UpdateMerchantResponse {
+  Merchant merchant = 1;
+}
+
+// ListMerchantsRequest 列表查詢。
+message ListMerchantsRequest {
+  // 分頁。
+  pg.common.v1.PageRequest page = 1;
+  // 依狀態篩選；UNSPECIFIED 表示不篩選。
+  MerchantStatus status = 2;
+  // 依國別篩選；空表示不篩選。
+  string country = 3;
+}
+
+// ListMerchantsResponse 列表結果。
+message ListMerchantsResponse {
+  repeated Merchant merchants = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// ---------------------------------------------------------------------------
+// API Key RPC messages
+// ---------------------------------------------------------------------------
+
+// CreateApiKeyRequest 建立 API Key。
+message CreateApiKeyRequest {
+  // 所屬商戶，必填。
+  string merchant_id = 1;
+  // live / test，必填。
+  ApiKeyMode mode = 2;
+  // 顯示名稱，必填。
+  string name = 3;
+  // 授權範圍；空表示全部。未知 scope 回 INVALID_ARGUMENT。
+  repeated string scopes = 4;
+  // 到期時間，可選；必須為未來時間。
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+// CreateApiKeyResponse 回傳 key 資訊、明文 key 與配對的簽章 secret。
+message CreateApiKeyResponse {
+  // Key 的公開資訊。
+  ApiKey api_key = 1;
+  // **明文 API key，只會在此回應出現一次**。格式：pk_live_ / pk_test_ + 40 碼 base62。
+  // 用於 Authorization: Bearer。呼叫端必須立即交付商戶，不得記錄於 log。
+  string secret = 2;
+  // **與此 key 配對的請求簽章 secret，只會在此回應出現一次**。格式：sk_live_ / sk_test_ + 32 bytes base64url。
+  // 商戶用來計算 X-Signature（canonical 定義見 docs/06-security-compliance.md §3.3）：
+  //   canonical   = X-Timestamp + "\n" + METHOD + "\n" + request_target + "\n" + hex(sha256(raw_body))
+  //   X-Signature = "v1=" + hex(HMAC-SHA256(signing_secret, canonical))
+  string signing_secret = 3;
+}
+
+// RevokeApiKeyRequest 撤銷 key。
+message RevokeApiKeyRequest {
+  // 所屬商戶，必填（用於防止跨商戶操作）。
+  string merchant_id = 1;
+  // 要撤銷的 key ID，必填。
+  string api_key_id = 2;
+  // 撤銷原因（稽核用），可選。
+  string reason = 3;
+}
+
+// RevokeApiKeyResponse 回傳撤銷後狀態。
+message RevokeApiKeyResponse {
+  ApiKey api_key = 1;
+}
+
+// ListApiKeysRequest 列出商戶的 key。
+message ListApiKeysRequest {
+  // 所屬商戶，必填。
+  string merchant_id = 1;
+  // 分頁。
+  pg.common.v1.PageRequest page = 2;
+  // 依 mode 篩選；UNSPECIFIED 表示全部。
+  ApiKeyMode mode = 3;
+  // 是否包含已撤銷/過期的 key；預設 false。
+  bool include_inactive = 4;
+}
+
+// ListApiKeysResponse 列表結果。
+message ListApiKeysResponse {
+  repeated ApiKey api_keys = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// VerifyApiKeyRequest 驗證 key（api-gateway 每請求呼叫，結果可快取 60s，以 api_key_id 為快取失效鍵）。
+message VerifyApiKeyRequest {
+  // 從完整 key 擷取的前 12 碼前綴（pk_live_ab12），用於索引查找。必填。
+  string key_prefix = 1;
+  // 完整明文 key（Authorization: Bearer 的值）。必填。服務端比對後即丟棄，不記錄。
+  string key = 2;
+}
+
+// VerifyApiKeyResponse 驗證結果。
+message VerifyApiKeyResponse {
+  // 是否有效。false 時其餘欄位除 reason 外皆為空。
+  bool valid = 1;
+  // 無效原因（valid=false 時）：not_found | revoked | expired | merchant_closed。
+  string reason = 2;
+  // 所屬商戶 ID。
+  string merchant_id = 3;
+  // key 的 ID（用於稽核 log、限流 key 與快取失效）。
+  string api_key_id = 4;
+  // live / test；api-gateway 據此將 livemode 傳遞給下游並在回應中標示。
+  ApiKeyMode mode = 5;
+  // 授權範圍；空表示全部。
+  repeated string scopes = 6;
+  // 商戶狀態。SUSPENDED 時 valid 仍為 true，由 gateway 依操作種類決定是否放行
+  //（查詢 / 退款 / 爭議放行；建立付款拒絕，回 authentication_error / merchant_suspended）。
+  MerchantStatus merchant_status = 7;
+  // 與此 key 配對的請求簽章 secret 明文（sk_...），供 gateway 驗證 X-Signature。
+  // gateway 只能放在行程內記憶體快取（TTL 300s），不得寫入 Redis 或 log。
+  string signing_secret = 8;
+  // 輪替中的上一把簽章 secret（若有）；gateway 在輪替期間同時接受兩把。
+  string previous_signing_secret = 9;
+}
+
+// ---------------------------------------------------------------------------
+// Webhook endpoint RPC messages
+// ---------------------------------------------------------------------------
+
+// CreateWebhookEndpointRequest 建立端點。
+message CreateWebhookEndpointRequest {
+  // 所屬商戶，必填。
+  string merchant_id = 1;
+  // 接收 URL，必填。
+  string url = 2;
+  // 說明，可選。
+  string description = 3;
+  // 訂閱事件；空表示全部。未知事件類型回 INVALID_ARGUMENT。
+  repeated string enabled_events = 4;
+  // live / test，必填（由 gateway 依 API key mode 帶入）。
+  ApiKeyMode mode = 5;
+  // metadata，可選。
+  map<string, string> metadata = 6;
+}
+
+// CreateWebhookEndpointResponse 回傳端點（含一次性 signing_secret）。
+message CreateWebhookEndpointResponse {
+  // 端點；signing_secret 已填入，**僅此一次**。
+  WebhookEndpoint endpoint = 1;
+}
+
+// UpdateWebhookEndpointRequest 部分更新端點。
+message UpdateWebhookEndpointRequest {
+  // 所屬商戶，必填。
+  string merchant_id = 1;
+  // 要更新的端點；endpoint.id 必填。
+  WebhookEndpoint endpoint = 2;
+  // 可更新欄位：url、description、enabled_events、status（僅允許 ENABLED/DISABLED）、metadata。
+  // rotate_secret=true 且不需改其他欄位時，update_mask 可為空。
+  google.protobuf.FieldMask update_mask = 3;
+  // 為 true 時輪替 signing secret：產生新 secret 並回傳於 endpoint.signing_secret（僅此一次），
+  // 舊 secret 保留 24 小時（previous_signing_secret）。
+  bool rotate_secret = 4;
+}
+
+// UpdateWebhookEndpointResponse 回傳更新後端點。
+message UpdateWebhookEndpointResponse {
+  // rotate_secret=true 時 endpoint.signing_secret 為新 secret 明文，否則為空。
+  WebhookEndpoint endpoint = 1;
+}
+
+// DeleteWebhookEndpointRequest 刪除端點。
+message DeleteWebhookEndpointRequest {
+  // 所屬商戶，必填。
+  string merchant_id = 1;
+  // 端點 ID，必填。
+  string endpoint_id = 2;
+}
+
+// DeleteWebhookEndpointResponse 空回應（保留以利未來擴充）。
+message DeleteWebhookEndpointResponse {}
+
+// ListWebhookEndpointsRequest 列出端點。
+message ListWebhookEndpointsRequest {
+  // 所屬商戶，必填。
+  string merchant_id = 1;
+  // 分頁。
+  pg.common.v1.PageRequest page = 2;
+  // 依 mode 篩選；UNSPECIFIED 表示全部。
+  ApiKeyMode mode = 3;
+  // 是否包含 signing_secret / previous_signing_secret。**僅 webhook-service 可設為 true**
+  //（由 mTLS 身分 + 服務層授權檢查；api-gateway 呼叫時強制為 false）。
+  bool include_secrets = 4;
+  // 是否包含 DELETED 端點；預設 false。
+  bool include_deleted = 5;
+}
+
+// ListWebhookEndpointsResponse 列表結果。
+message ListWebhookEndpointsResponse {
+  repeated WebhookEndpoint endpoints = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Routing preferences RPC messages
+// ---------------------------------------------------------------------------
+
+// GetRoutingPreferencesRequest 查詢路由偏好。
+message GetRoutingPreferencesRequest {
+  // 所屬商戶，必填。
+  string merchant_id = 1;
+}
+
+// GetRoutingPreferencesResponse 回傳路由偏好（未設定時為系統預設）。
+message GetRoutingPreferencesResponse {
+  RoutingPreferences preferences = 1;
+}
+
+// UpdateRoutingPreferencesRequest 整份覆寫路由偏好。
+message UpdateRoutingPreferencesRequest {
+  // 完整偏好設定；preferences.merchant_id 必填。
+  RoutingPreferences preferences = 1;
+}
+
+// UpdateRoutingPreferencesResponse 回傳更新後偏好。
+message UpdateRoutingPreferencesResponse {
+  RoutingPreferences preferences = 1;
+}

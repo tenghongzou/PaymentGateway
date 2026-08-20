@@ -1,0 +1,40 @@
+{{- range $name, $raw := .Values.services }}
+{{- $svc := include "pg.mergeSvc" (dict "root" $ "raw" $raw) | fromYaml }}
+{{- if $svc.enabled }}
+{{- $ctx := dict "root" $ "name" $name "svc" $svc }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "pg.labels" $ctx | nindent 4 }}
+data:
+  PG_SERVICE_NAME: {{ $name | quote }}
+  PG_ENV: {{ $.Values.global.env | quote }}
+  PG_LOG_LEVEL: {{ $.Values.global.logLevel | quote }}
+  PG_HTTP_ADDR: {{ printf ":%v" $svc.httpPort | quote }}
+  {{- if $svc.grpcPort }}
+  PG_GRPC_ADDR: {{ printf ":%v" $svc.grpcPort | quote }}
+  {{- end }}
+  {{- if $svc.database }}
+  PG_AUTO_MIGRATE: {{ $.Values.global.autoMigrate | quote }}
+  PG_MIGRATIONS_DIR: {{ $.Values.global.migrationsDir | quote }}
+  {{- else }}
+  PG_AUTO_MIGRATE: "false"
+  {{- end }}
+  PG_REDIS_ADDR: {{ $.Values.global.redis.addr | quote }}
+  PG_KAFKA_BROKERS: {{ $.Values.global.kafka.brokers | quote }}
+  PG_OTEL_EXPORTER_OTLP_ENDPOINT: {{ $.Values.global.otel.endpoint | quote }}
+  PG_OTEL_EXPORTER_OTLP_INSECURE: {{ $.Values.global.otel.insecure | quote }}
+  {{- include "pg.serviceAddrEnv" $ | trim | nindent 2 }}
+  PG_PROVIDER_ADDRS: {{ include "pg.providerAddrs" $ | quote }}
+  {{- range $k, $v := $.Values.global.extraEnv }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- range $k, $v := $svc.env }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}

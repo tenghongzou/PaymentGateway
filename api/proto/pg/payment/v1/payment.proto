@@ -1,0 +1,684 @@
+// payment-service（gRPC :9002，DB pg_payment）對內契約。
+//
+// 職責：Payment / Refund / Dispute 聚合根與狀態機、供應商路由與 failover、呼叫 ProviderAdapter、
+//       透過 outbox 發佈 pg.payment.v1.PaymentEvent（見 events.proto）。
+// 呼叫者：api-gateway（REST → gRPC 轉譯）、reconciliation-service（查詢付款）。
+//
+// 狀態機（docs/01-architecture.md §5.2；canonical 狀態集以 SQL CHECK 為準）：
+//   created ──▶ requires_action(3DS) ──▶ authorized ──▶ captured ──▶ (partially_)refunded
+//      │               │                    │              │
+//      ▼               ▼                    ▼              ▼
+//    failed          failed               voided       disputed ──▶ chargeback_won / chargeback_lost
+//
+// v1 僅允許單次 capture：capture 金額可小於授權金額（剩餘額度釋放），狀態仍為 captured、captured_amount < amount。
+syntax = "proto3";
+
+package pg.payment.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pg/common/v1/error.proto";
+import "pg/common/v1/money.proto";
+import "pg/common/v1/pagination.proto";
+import "pg/provider/v1/provider.proto";
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/payment/v1;paymentv1";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// PaymentService 管理付款、退款與爭議的完整生命週期。
+service PaymentService {
+  // 建立付款並同步執行授權（含路由與 failover）。
+  // 冪等：以 (merchant_id, idempotency_key) 唯一索引；重複呼叫回傳原 Payment（即使第一次已失敗）。
+  // 同 key 不同內容回 ABORTED（gateway 轉 409 idempotency_error）。
+  // 業務拒絕（decline）不回 gRPC error：回傳的 Payment.status=FAILED 且 last_error 填入。
+  // 錯誤：INVALID_ARGUMENT、FAILED_PRECONDITION（商戶非 ACTIVE）、ABORTED。
+  rpc CreatePayment(CreatePaymentRequest) returns (CreatePaymentResponse);
+
+  // 依 ID 取得付款（含 attempts）。跨商戶查詢回 NOT_FOUND（不回 PERMISSION_DENIED，避免洩漏存在性）。
+  rpc GetPayment(GetPaymentRequest) returns (GetPaymentResponse);
+
+  // 列出商戶付款，支援狀態 / 時間 / 客戶 / 供應商篩選；依 created_at DESC、id DESC 排序。
+  rpc ListPayments(ListPaymentsRequest) returns (ListPaymentsResponse);
+
+  // 請款（v1 每筆付款僅允許一次）。金額可小於授權金額，剩餘授權額度於請款後釋放；成功後狀態為 CAPTURED。
+  // 前置狀態：AUTHORIZED；其他狀態回 FAILED_PRECONDITION（invalid_state_transition）。金額上限：amount。
+  // PSP 拒絕時回 gRPC FAILED_PRECONDITION + ErrorDetail(type=provider_error)，Payment 狀態不變（gateway 轉 402）。
+  rpc CapturePayment(CapturePaymentRequest) returns (CapturePaymentResponse);
+
+  // 取消授權。前置狀態：AUTHORIZED → VOIDED。其他狀態回 FAILED_PRECONDITION（invalid_state_transition）；
+  // 已請款的付款應改用 CreateRefund。
+  rpc VoidPayment(VoidPaymentRequest) returns (VoidPaymentResponse);
+
+  // 確認付款：客戶完成 3DS / 導向後，商戶或 return_url 回呼帶回 PSP 參數，payment-service 向 PSP 完成授權。
+  // 前置狀態：REQUIRES_ACTION。成功 → AUTHORIZED（manual）或 CAPTURED（automatic）；失敗 → FAILED（回傳 Payment，不回 error）。
+  // 冪等：重複確認回傳當前 Payment。
+  rpc ConfirmPayment(ConfirmPaymentRequest) returns (ConfirmPaymentResponse);
+
+  // 建立退款（可部分、可多次）。前置狀態：CAPTURED、PARTIALLY_REFUNDED。
+  // 金額上限：captured_amount - refunded_amount（含 pending 中的退款）。
+  // 冪等：以 (merchant_id, idempotency_key)。PSP 同步拒絕 → Refund.status=FAILED（回傳 Refund，不回 error）。
+  rpc CreateRefund(CreateRefundRequest) returns (CreateRefundResponse);
+
+  // 依 ID 取得退款。
+  rpc GetRefund(GetRefundRequest) returns (GetRefundResponse);
+
+  // 列出退款，可依 payment_id / status / 時間篩選。
+  rpc ListRefunds(ListRefundsRequest) returns (ListRefundsResponse);
+
+  // 依 ID 取得爭議。
+  rpc GetDispute(GetDisputeRequest) returns (GetDisputeResponse);
+
+  // 列出爭議，可依 payment_id / status / 時間篩選。
+  rpc ListDisputes(ListDisputesRequest) returns (ListDisputesResponse);
+
+  // 提交爭議證據（整份覆寫；可在 evidence_due_by 前多次提交，以最後一次為準送交 PSP）。
+  // 前置狀態：NEEDS_RESPONSE。逾期回 FAILED_PRECONDITION（evidence_window_closed）。
+  rpc SubmitDisputeEvidence(SubmitDisputeEvidenceRequest) returns (SubmitDisputeEvidenceResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// PaymentStatus 對應 01 文件 §5.2 狀態機（canonical 全集 12 個，與 SQL CHECK 一致）。
+enum PaymentStatus {
+  // 編號 5 曾為 PARTIALLY_CAPTURED，v1 不支援多次 capture 已移除；永久保留，不得重用。
+  reserved 5;
+  reserved "PAYMENT_STATUS_PARTIALLY_CAPTURED";
+
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+  // 已建立，尚未送往 PSP（極短暫；同步流程中通常不會被外部觀察到）。
+  PAYMENT_STATUS_CREATED = 1;
+  // 需要客戶動作（3DS challenge、錢包導向、等待銀行轉帳）；見 next_action。
+  PAYMENT_STATUS_REQUIRES_ACTION = 2;
+  // 已授權，待請款（capture_method=manual）。
+  PAYMENT_STATUS_AUTHORIZED = 3;
+  // 已請款（captured_amount 可小於 amount；剩餘授權已釋放）。
+  PAYMENT_STATUS_CAPTURED = 4;
+  // 授權已取消（終態）。
+  PAYMENT_STATUS_VOIDED = 6;
+  // 已部分退款。
+  PAYMENT_STATUS_PARTIALLY_REFUNDED = 7;
+  // 已全額退款（終態）。
+  PAYMENT_STATUS_REFUNDED = 8;
+  // 有進行中的爭議（原始請款狀態保存在 captured_amount / refunded_amount）。
+  PAYMENT_STATUS_DISPUTED = 9;
+  // 爭議商戶勝訴（終態）。
+  PAYMENT_STATUS_CHARGEBACK_WON = 10;
+  // 爭議商戶敗訴，款項已扣回（終態）。
+  PAYMENT_STATUS_CHARGEBACK_LOST = 11;
+  // 授權失敗 / 3DS 失敗 / 所有 failover 皆失敗（終態）；見 last_error。
+  PAYMENT_STATUS_FAILED = 12;
+  // requires_action 逾時或授權逾期未請款（終態）。
+  PAYMENT_STATUS_EXPIRED = 13;
+}
+
+// RefundStatus 對應 §5.3：pending ──▶ succeeded | failed。
+enum RefundStatus {
+  REFUND_STATUS_UNSPECIFIED = 0;
+  // PSP 已受理，等待結果。
+  REFUND_STATUS_PENDING = 1;
+  // 退款成功（終態）。
+  REFUND_STATUS_SUCCEEDED = 2;
+  // 退款失敗（終態）；見 failure_code。
+  REFUND_STATUS_FAILED = 3;
+}
+
+// DisputeStatus 為爭議狀態。
+enum DisputeStatus {
+  DISPUTE_STATUS_UNSPECIFIED = 0;
+  // 等待商戶提交證據（可在 evidence_due_by 前提交）。
+  DISPUTE_STATUS_NEEDS_RESPONSE = 1;
+  // 證據已提交，PSP / 發卡行審查中。
+  DISPUTE_STATUS_UNDER_REVIEW = 2;
+  // 商戶勝訴（終態）。
+  DISPUTE_STATUS_WON = 3;
+  // 商戶敗訴（終態）。
+  DISPUTE_STATUS_LOST = 4;
+  // 爭議被撤回 / 取消，視同商戶勝訴（終態）。
+  DISPUTE_STATUS_WITHDRAWN = 5;
+}
+
+// CaptureMethod 為請款方式。
+enum CaptureMethod {
+  CAPTURE_METHOD_UNSPECIFIED = 0;
+  // 授權與請款一次完成（預設）。
+  CAPTURE_METHOD_AUTOMATIC = 1;
+  // 先授權，商戶另行呼叫 CapturePayment。
+  CAPTURE_METHOD_MANUAL = 2;
+}
+
+// AttemptStatus 為單次向 PSP 嘗試（authorize 或 capture）的結果。
+// 與 pg_payment 資料庫的 attempt status 定義一致（SQL 為 canonical）。
+enum AttemptStatus {
+  ATTEMPT_STATUS_UNSPECIFIED = 0;
+  // 已送出，等待 PSP 回應。
+  ATTEMPT_STATUS_PENDING = 1;
+  // PSP 要求額外驗證（3DS / 導向）；完成後結果由 ConfirmPayment 或 PSP webhook 收斂為 APPROVED / DECLINED。
+  ATTEMPT_STATUS_REQUIRES_ACTION = 2;
+  // PSP 核准（authorize 或 capture 成功）。
+  ATTEMPT_STATUS_APPROVED = 3;
+  // PSP 明確拒絕（error_category 為 DECLINED_HARD / DECLINED_SOFT / FRAUD_SUSPECTED / INVALID_REQUEST）。
+  // 依 error_category 決定是否允許 failover（DECLINED_SOFT 依商戶偏好；其餘不可）。
+  ATTEMPT_STATUS_DECLINED = 4;
+  // PSP 不可用（error_category=PROVIDER_UNAVAILABLE：5xx、維護中、限流），且已明確得知 PSP 未處理本請求；可 failover 到下一個 PSP。
+  ATTEMPT_STATUS_UNAVAILABLE = 5;
+  // 逾時或連線中斷、結果不明：PSP 可能已授權。**不得 failover**（避免重複扣款）。
+  // 由 attempt resolver 以 ProviderAdapter.GetPaymentStatus 輪詢收斂為 APPROVED / DECLINED / UNAVAILABLE，必須在 1 小時內完成；
+  // 逾時仍無法收斂 → Payment 轉 FAILED 並發出告警（人工處理）。
+  ATTEMPT_STATUS_UNKNOWN = 6;
+}
+
+// PaymentMethodType 為付款方式大類（對應 PaymentMethod 的 oneof）。
+enum PaymentMethodType {
+  PAYMENT_METHOD_TYPE_UNSPECIFIED = 0;
+  PAYMENT_METHOD_TYPE_CARD = 1;
+  PAYMENT_METHOD_TYPE_WALLET = 2;
+  PAYMENT_METHOD_TYPE_BANK_TRANSFER = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Domain messages
+// ---------------------------------------------------------------------------
+
+// CardToken 為商戶透過 PSP tokenization 取得的卡片 token（本系統不接觸 PAN）。
+message CardToken {
+  // PSP 發出的 token。必填。
+  string token = 1;
+  // 發出 token 的 PSP（例：stripe）。必填；payment-service 會把付款鎖定在此 PSP（不 failover）。
+  string token_provider = 2;
+  // 以下為前端 tokenization 回傳的非敏感資訊（可選），供路由與顯示。
+  string brand = 3;
+  string last4 = 4;
+  int32 exp_month = 5;
+  int32 exp_year = 6;
+  string holder_name = 7;
+}
+
+// Wallet 為錢包付款。
+message Wallet {
+  // 錢包類型：apple_pay | google_pay | line_pay。必填。
+  string type = 1;
+  // 錢包端加密 payload（不透明字串）。Apple Pay / Google Pay 必填；LINE Pay 為導向式，留空。
+  string encrypted_payload = 2;
+}
+
+// BankTransfer 為銀行轉帳（虛擬帳號），非同步完成。
+message BankTransfer {
+  // 客戶銀行國別 ISO 3166-1 alpha-2。必填。
+  string country = 1;
+  // 銀行代碼。可選。
+  string bank_code = 2;
+  // 付款人姓名。可選。
+  string payer_name = 3;
+}
+
+// PaymentMethod 為商戶指定的付款方式（三選一）。
+message PaymentMethod {
+  oneof method {
+    CardToken card_token = 1;
+    Wallet wallet = 2;
+    BankTransfer bank_transfer = 3;
+  }
+}
+
+// Customer 為客戶資訊（皆可選；3DS 需要 ip_address 與 user_agent）。
+message Customer {
+  // 商戶端客戶 ID。
+  string id = 1;
+  string email = 2;
+  string name = 3;
+  // E.164。
+  string phone = 4;
+  string ip_address = 5;
+  string user_agent = 6;
+  // 帳單地址國別。
+  string billing_country = 7;
+  string billing_postal_code = 8;
+}
+
+// PaymentMethodDetails 為付款完成後可揭露的付款工具非敏感資訊。
+message PaymentMethodDetails {
+  // 付款方式大類。
+  PaymentMethodType type = 1;
+  // 卡組織 / 錢包類型 / 銀行代碼。
+  string brand = 2;
+  // 卡號末四碼 / 帳號末四碼。
+  string last4 = 3;
+  // 發卡行。
+  string issuer = 4;
+  // 發卡國別。
+  string issuer_country = 5;
+  // credit | debit | prepaid。
+  string funding = 6;
+  // 3DS 結果：authenticated | attempted | not_authenticated | not_supported | unknown。
+  string three_ds_result = 7;
+}
+
+// NextAction 為 REQUIRES_ACTION 狀態下客戶端需完成的動作（直接沿用 provider 的定義）。
+message NextAction {
+  oneof action {
+    pg.provider.v1.RedirectAction redirect = 1;
+    pg.provider.v1.ThreeDsChallengeAction three_ds_challenge = 2;
+    pg.provider.v1.DisplayAction display = 3;
+  }
+  // 動作有效期限，逾時 payment 轉 EXPIRED。
+  google.protobuf.Timestamp expires_at = 10;
+}
+
+// PaymentAttempt 為一次向特定 PSP 的嘗試（failover 會產生多筆）。
+message PaymentAttempt {
+  // 嘗試 ID，格式 att_ + ULID。
+  string id = 1;
+  // 嘗試序號，從 1 開始。
+  int32 sequence = 2;
+  // 使用的供應商識別碼。
+  string provider = 3;
+  // PSP 端交易參照（成功或 PSP 有建立紀錄時）。
+  string provider_reference = 4;
+  // 嘗試結果（見 AttemptStatus）。
+  AttemptStatus status = 5;
+  // 正規化錯誤分類（DECLINED / UNAVAILABLE 時）。
+  pg.provider.v1.ProviderErrorCategory error_category = 6;
+  // PSP 原始錯誤碼（DECLINED / UNAVAILABLE 時）。
+  string error_code = 7;
+  // PSP 原始錯誤訊息（已遮罩）。
+  string error_message = 8;
+  // 路由決策原因：rule:<priority> | fallback | token_provider | default。稽核用。
+  string routing_reason = 9;
+  // 送往 PSP 的時間。
+  google.protobuf.Timestamp created_at = 10;
+  // PSP 回應時間（UNKNOWN 收斂完成時為收斂時間）。
+  google.protobuf.Timestamp completed_at = 11;
+}
+
+// Payment 為付款聚合根。
+message Payment {
+  // 付款 ID，格式 pay_ + ULID。
+  string id = 1;
+  // 所屬商戶。
+  string merchant_id = 2;
+  // 原始請求金額（授權金額）。
+  pg.common.v1.Money amount = 3;
+  // 已請款金額（幣別同 amount；單次 capture 可小於 amount）。
+  pg.common.v1.Money captured_amount = 4;
+  // 累計已成功退款金額（不含 pending）。
+  pg.common.v1.Money refunded_amount = 5;
+  // 狀態。
+  PaymentStatus status = 6;
+  // 請款方式。
+  CaptureMethod capture_method = 7;
+  // 付款方式大類。
+  PaymentMethodType payment_method_type = 8;
+  // 付款工具非敏感資訊（授權後填入）。
+  PaymentMethodDetails payment_method_details = 9;
+  // 客戶資訊（回傳時遮罩 ip_address / user_agent）。
+  Customer customer = 10;
+  // 商戶 metadata（原樣回傳；同時寫入 PSP metadata）。
+  map<string, string> metadata = 11;
+  // 付款描述。
+  string description = 12;
+  // 3DS / 導向完成後的回跳 URL。
+  string return_url = 13;
+  // 帳單描述。
+  string statement_descriptor = 14;
+  // 最終成功（或最後一次嘗試）使用的供應商。
+  string provider = 15;
+  // 對應的 PSP 交易參照。
+  string provider_reference = 16;
+  // REQUIRES_ACTION 時的後續動作；其他狀態為空。
+  NextAction next_action = 17;
+  // 最後一次失敗的錯誤（FAILED 狀態必填；其他狀態若曾 failover 也可能有值）。
+  pg.common.v1.ErrorDetail last_error = 18;
+  // 所有嘗試（依 sequence 排序）。
+  repeated PaymentAttempt attempts = 19;
+  // 商戶提供的冪等鍵。
+  string idempotency_key = 20;
+  // 是否為正式環境（由 API key mode 決定）。
+  bool livemode = 21;
+  // 建立時間。
+  google.protobuf.Timestamp created_at = 22;
+  // 最後更新時間。
+  google.protobuf.Timestamp updated_at = 23;
+  // 授權時間。
+  google.protobuf.Timestamp authorized_at = 24;
+  // 請款時間。
+  google.protobuf.Timestamp captured_at = 25;
+  // 授權到期時間（未請款則過期；manual capture 時有意義）。
+  google.protobuf.Timestamp expires_at = 26;
+  // 進行中 / 最近一筆爭議 ID（DISPUTED / CHARGEBACK_* 時）。
+  string latest_dispute_id = 27;
+}
+
+// Refund 為退款。
+message Refund {
+  // 退款 ID，格式 re_ + ULID。
+  string id = 1;
+  // 所屬付款。
+  string payment_id = 2;
+  // 所屬商戶。
+  string merchant_id = 3;
+  // 退款金額。
+  pg.common.v1.Money amount = 4;
+  // 狀態。
+  RefundStatus status = 5;
+  // 原因：requested_by_customer | duplicate | fraudulent | other。
+  string reason = 6;
+  // 執行退款的供應商（同付款）。
+  string provider = 7;
+  // PSP 端退款參照。
+  string provider_reference = 8;
+  // 失敗錯誤碼（FAILED 時）。
+  string failure_code = 9;
+  // 失敗訊息。
+  string failure_message = 10;
+  // 商戶 metadata。
+  map<string, string> metadata = 11;
+  // 冪等鍵。
+  string idempotency_key = 12;
+  bool livemode = 13;
+  google.protobuf.Timestamp created_at = 14;
+  google.protobuf.Timestamp updated_at = 15;
+  // 成功 / 失敗的時間。
+  google.protobuf.Timestamp completed_at = 16;
+}
+
+// DisputeEvidence 為商戶提交的爭議證據（欄位皆可選，愈完整勝率愈高）。
+message DisputeEvidence {
+  // 客戶姓名。
+  string customer_name = 1;
+  // 客戶 email。
+  string customer_email = 2;
+  // 客戶購買時 IP。
+  string customer_purchase_ip = 3;
+  // 帳單地址。
+  string billing_address = 4;
+  // 商品 / 服務描述。
+  string product_description = 5;
+  // 出貨地址。
+  string shipping_address = 6;
+  // 物流公司。
+  string shipping_carrier = 7;
+  // 物流追蹤碼。
+  string shipping_tracking_number = 8;
+  // 出貨日期。
+  google.protobuf.Timestamp shipping_date = 9;
+  // 服務提供日期（數位商品 / 服務）。
+  google.protobuf.Timestamp service_date = 10;
+  // 退款政策說明。
+  string refund_policy = 11;
+  // 退款政策揭露方式。
+  string refund_policy_disclosure = 12;
+  // 客戶溝通紀錄摘要。
+  string customer_communication = 13;
+  // 其他補充說明（最長 20,000 字）。
+  string uncategorized_text = 14;
+  // 附件檔案 ID（透過檔案上傳 API 取得，Phase 1），最多 10 個。
+  repeated string file_ids = 15;
+}
+
+// Dispute 為爭議 / 拒付。
+message Dispute {
+  // 爭議 ID，格式 dp_ + ULID。
+  string id = 1;
+  // 所屬付款。
+  string payment_id = 2;
+  // 所屬商戶。
+  string merchant_id = 3;
+  // 爭議金額（可能小於付款金額）。
+  pg.common.v1.Money amount = 4;
+  // PSP 收取的爭議處理費（若有）。
+  pg.common.v1.Money fee = 5;
+  // 狀態。
+  DisputeStatus status = 6;
+  // 正規化原因（見 provider.proto DisputeInfo.reason）。
+  string reason = 7;
+  // 供應商。
+  string provider = 8;
+  // PSP 端爭議參照。
+  string provider_reference = 9;
+  // 證據提交期限。
+  google.protobuf.Timestamp evidence_due_by = 10;
+  // 已提交的證據（未提交為空）。
+  DisputeEvidence evidence = 11;
+  // 證據提交時間。
+  google.protobuf.Timestamp evidence_submitted_at = 12;
+  bool livemode = 13;
+  // 爭議開啟時間（PSP 端）。
+  google.protobuf.Timestamp opened_at = 14;
+  // 結案時間。
+  google.protobuf.Timestamp closed_at = 15;
+  google.protobuf.Timestamp created_at = 16;
+  google.protobuf.Timestamp updated_at = 17;
+}
+
+// ---------------------------------------------------------------------------
+// Payment RPC messages
+// ---------------------------------------------------------------------------
+
+// CreatePaymentRequest 建立付款。
+message CreatePaymentRequest {
+  // 冪等鍵（UUID；商戶範圍內唯一，24h）。必填。
+  string idempotency_key = 1;
+  // 商戶 ID（由 gateway 依 API key 帶入，商戶不可自填）。必填。
+  string merchant_id = 2;
+  // 金額與幣別（Money 內含 currency）。必填；amount_minor >= 該幣別最小可收金額（例 TWD 1、USD 50）。
+  pg.common.v1.Money amount = 3;
+  // 請款方式；UNSPECIFIED 視為 AUTOMATIC。
+  CaptureMethod capture_method = 4;
+  // 付款方式。必填。
+  PaymentMethod payment_method = 5;
+  // 客戶資訊。可選。
+  Customer customer = 6;
+  // metadata（最多 50 組）。
+  map<string, string> metadata = 7;
+  // 描述（最長 1000 字）。
+  string description = 8;
+  // 回跳 URL（https；wallet / 3DS 必填）。
+  string return_url = 9;
+  // 帳單描述（最長 22 字 ASCII；未填用商戶預設）。
+  string statement_descriptor = 10;
+  // 是否為正式環境（由 gateway 依 API key mode 帶入）。
+  bool livemode = 11;
+  // 3DS 偏好。
+  pg.provider.v1.ThreeDsPreference three_ds = 12;
+  // 指定供應商（覆寫路由規則；僅供內部測試與後台使用，gateway 不開放給商戶）。
+  string preferred_provider = 13;
+}
+
+// CreatePaymentResponse 回傳付款（可能為 REQUIRES_ACTION / AUTHORIZED / CAPTURED / FAILED）。
+message CreatePaymentResponse {
+  Payment payment = 1;
+  // 是否為冪等重放（true 表示回傳的是先前建立的 Payment）。gateway 以 header Idempotent-Replayed: true 標示。
+  bool idempotent_replayed = 2;
+}
+
+// GetPaymentRequest 查詢付款。
+message GetPaymentRequest {
+  string merchant_id = 1;
+  string payment_id = 2;
+}
+
+// GetPaymentResponse 回傳付款。
+message GetPaymentResponse {
+  Payment payment = 1;
+}
+
+// ListPaymentsRequest 列出付款。
+message ListPaymentsRequest {
+  // 商戶 ID。必填。
+  string merchant_id = 1;
+  pg.common.v1.PageRequest page = 2;
+  // 狀態篩選（多選，OR）；空表示全部。
+  repeated PaymentStatus statuses = 3;
+  // 建立時間下限（含）。
+  google.protobuf.Timestamp created_after = 4;
+  // 建立時間上限（不含）。
+  google.protobuf.Timestamp created_before = 5;
+  // 客戶 ID 篩選。
+  string customer_id = 6;
+  // 供應商篩選。
+  string provider = 7;
+  // 幣別篩選。
+  string currency = 8;
+  // metadata 精確比對（AND）；最多 3 組。
+  map<string, string> metadata = 9;
+  // 是否只列 livemode / test；未設定（nil）時由 gateway 依 API key mode 帶入。
+  optional bool livemode = 10;
+}
+
+// ListPaymentsResponse 列表結果。
+message ListPaymentsResponse {
+  repeated Payment payments = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// CapturePaymentRequest 請款（v1 單次）。
+message CapturePaymentRequest {
+  string merchant_id = 1;
+  string payment_id = 2;
+  // 冪等鍵。必填。
+  string idempotency_key = 3;
+  // 請款金額；未設定表示請款全額。必須 <= amount，幣別須同付款。請款後剩餘授權額度釋放。
+  pg.common.v1.Money amount = 4;
+  // v1 固定視為 true（單次 capture 後一律釋放剩餘授權）；欄位保留給未來支援多次 capture 時使用，目前傳入值被忽略。
+  optional bool final = 5;
+}
+
+// CapturePaymentResponse 回傳更新後付款。
+message CapturePaymentResponse {
+  Payment payment = 1;
+  bool idempotent_replayed = 2;
+}
+
+// VoidPaymentRequest 取消授權。
+message VoidPaymentRequest {
+  string merchant_id = 1;
+  string payment_id = 2;
+  string idempotency_key = 3;
+  // 原因：requested_by_customer | duplicate | fraudulent | abandoned。可選。
+  string reason = 4;
+}
+
+// VoidPaymentResponse 回傳更新後付款。
+message VoidPaymentResponse {
+  Payment payment = 1;
+  bool idempotent_replayed = 2;
+}
+
+// ConfirmPaymentRequest 3DS / 導向完成後確認。
+message ConfirmPaymentRequest {
+  string merchant_id = 1;
+  string payment_id = 2;
+  string idempotency_key = 3;
+  // PSP 回跳帶回的參數（例：3DS 的 cres、PaRes、MD；錢包的 transactionId），原樣轉交 adapter。
+  map<string, string> provider_params = 4;
+}
+
+// ConfirmPaymentResponse 回傳更新後付款（AUTHORIZED / CAPTURED / FAILED）。
+message ConfirmPaymentResponse {
+  Payment payment = 1;
+  bool idempotent_replayed = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Refund RPC messages
+// ---------------------------------------------------------------------------
+
+// CreateRefundRequest 建立退款。
+message CreateRefundRequest {
+  string merchant_id = 1;
+  // 要退款的付款。必填。
+  string payment_id = 2;
+  string idempotency_key = 3;
+  // 退款金額；未設定表示退還全部可退金額。
+  pg.common.v1.Money amount = 4;
+  // 原因。可選。
+  string reason = 5;
+  map<string, string> metadata = 6;
+}
+
+// CreateRefundResponse 回傳退款（PENDING / SUCCEEDED / FAILED）。
+message CreateRefundResponse {
+  Refund refund = 1;
+  bool idempotent_replayed = 2;
+}
+
+// GetRefundRequest 查詢退款。
+message GetRefundRequest {
+  string merchant_id = 1;
+  string refund_id = 2;
+}
+
+// GetRefundResponse 回傳退款。
+message GetRefundResponse {
+  Refund refund = 1;
+}
+
+// ListRefundsRequest 列出退款。
+message ListRefundsRequest {
+  string merchant_id = 1;
+  pg.common.v1.PageRequest page = 2;
+  // 依付款篩選。
+  string payment_id = 3;
+  repeated RefundStatus statuses = 4;
+  google.protobuf.Timestamp created_after = 5;
+  google.protobuf.Timestamp created_before = 6;
+  optional bool livemode = 7;
+}
+
+// ListRefundsResponse 列表結果。
+message ListRefundsResponse {
+  repeated Refund refunds = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Dispute RPC messages
+// ---------------------------------------------------------------------------
+
+// GetDisputeRequest 查詢爭議。
+message GetDisputeRequest {
+  string merchant_id = 1;
+  string dispute_id = 2;
+}
+
+// GetDisputeResponse 回傳爭議。
+message GetDisputeResponse {
+  Dispute dispute = 1;
+}
+
+// ListDisputesRequest 列出爭議。
+message ListDisputesRequest {
+  string merchant_id = 1;
+  pg.common.v1.PageRequest page = 2;
+  string payment_id = 3;
+  repeated DisputeStatus statuses = 4;
+  google.protobuf.Timestamp created_after = 5;
+  google.protobuf.Timestamp created_before = 6;
+  optional bool livemode = 7;
+}
+
+// ListDisputesResponse 列表結果。
+message ListDisputesResponse {
+  repeated Dispute disputes = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// SubmitDisputeEvidenceRequest 提交證據。
+message SubmitDisputeEvidenceRequest {
+  string merchant_id = 1;
+  string dispute_id = 2;
+  string idempotency_key = 3;
+  // 證據內容（整份覆寫）。必填。
+  DisputeEvidence evidence = 4;
+  // true = 立即送交 PSP（狀態轉 UNDER_REVIEW）；false = 僅儲存草稿（狀態維持 NEEDS_RESPONSE）。預設 true。
+  optional bool submit = 5;
+}
+
+// SubmitDisputeEvidenceResponse 回傳更新後爭議。
+message SubmitDisputeEvidenceResponse {
+  Dispute dispute = 1;
+}

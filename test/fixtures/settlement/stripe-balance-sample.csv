@@ -1,0 +1,6 @@
+id,Type,Source,Amount,Fee,Net,Currency,Created (UTC),Description
+txn_3Pabc001,charge,ch_3Pabc001,12.34,0.66,11.68,usd,2026-08-19 01:02:03,Order #1001
+txn_3Pabc002,refund,re_3Pabc002,-5.00,0.00,-5.00,usd,2026-08-19 02:00:00,Refund #1001
+txn_3Pabc003,charge,ch_3Pabc003,1200,36,1164,jpy,2026-08-19T03:00:00Z,Order #1002
+txn_3Pabc004,adjustment,du_3Pabc004,-12.34,15.00,-27.34,usd,2026-08-19 04:00:00,Chargeback
+txn_3Pabc005,payout,po_3Pabc005,-100.00,0.00,-100.00,usd,2026-08-19 05:00:00,STRIPE PAYOUT

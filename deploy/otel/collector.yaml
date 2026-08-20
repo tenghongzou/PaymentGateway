@@ -1,0 +1,90 @@
+# OpenTelemetry Collector (contrib) configuration for local development.
+# Services export OTLP/gRPC to otel-collector:4317.
+#   traces  -> Jaeger (OTLP) + debug
+#   metrics -> Prometheus exporter (:8889, scraped by prometheus) + debug
+#   logs    -> debug (swap for loki/otlphttp in staging/prod)
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "http://localhost:*"
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+  batch:
+    send_batch_size: 1024
+    timeout: 2s
+  # Normalise resource attributes so every signal carries deployment.environment
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: dev
+        action: upsert
+  # Strip attributes that must never leave the process boundary (defence in depth; the SDK must not emit them).
+  attributes/redact:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: http.request.header.x-signature
+        action: delete
+      - key: pg.api_key
+        action: delete
+      - key: pg.card_number
+        action: delete
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    send_timestamps: true
+    metric_expiration: 5m
+    enable_open_metrics: true
+    resource_to_telemetry_conversion:
+      enabled: true
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: basic
+      address: 0.0.0.0:8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, resource, batch]
+      exporters: [otlp/jaeger, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, resource, batch]
+      exporters: [debug]

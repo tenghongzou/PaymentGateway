@@ -1,0 +1,28 @@
+// 分頁共用訊息（page_token / page_size 風格，cursor-based）。
+//
+// 所有 List* RPC 的 request 內嵌 PageRequest，response 內嵌 PageResponse。
+// page_token 為不透明字串（服務端以 base64 編碼游標），客戶端不得解析或自行組裝。
+syntax = "proto3";
+
+package pg.common.v1;
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/common/v1;commonv1";
+
+// PageRequest 為分頁查詢參數。
+message PageRequest {
+  // 每頁筆數。0 表示使用服務預設值（20）；上限 100，超過時服務端自動截為 100。
+  int32 page_size = 1;
+
+  // 上一頁 response 回傳的 next_page_token；第一頁留空。
+  // 不透明字串，token 內含排序鍵與篩選條件的雜湊，若與本次篩選條件不符回 INVALID_ARGUMENT。
+  string page_token = 2;
+}
+
+// PageResponse 為分頁查詢結果的中繼資料。
+message PageResponse {
+  // 下一頁的 token；沒有下一頁時為空字串。
+  string next_page_token = 1;
+
+  // 是否還有下一頁（與 next_page_token 非空等價，提供給客戶端方便判斷）。
+  bool has_more = 2;
+}

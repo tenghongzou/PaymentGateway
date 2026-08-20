@@ -1,0 +1,163 @@
+{{- range $name, $raw := .Values.services }}
+{{- $svc := include "pg.mergeSvc" (dict "root" $ "raw" $raw) | fromYaml }}
+{{- if $svc.enabled }}
+{{- $ctx := dict "root" $ "name" $name "svc" $svc }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pg.fullname" $ctx }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "pg.labels" $ctx | nindent 4 }}
+spec:
+  {{- if not $svc.hpa.enabled }}
+  replicas: {{ $svc.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ $svc.strategy.maxSurge }}
+      maxUnavailable: {{ $svc.strategy.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "pg.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg.labels" $ctx | nindent 8 }}
+        {{- with $svc.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include "pg.configChecksum" $ctx }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $svc.httpPort | quote }}
+        prometheus.io/path: /metrics
+        {{- with $svc.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "pg.serviceAccountName" $ctx }}
+      automountServiceAccountToken: false
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $.Values.global.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $svc.terminationGracePeriodSeconds }}
+      {{- if $.Values.global.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ $.Values.global.topologySpread.maxSkew }}
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: {{ $.Values.global.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" $ctx | nindent 14 }}
+        - maxSkew: {{ $.Values.global.topologySpread.maxSkew }}
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" $ctx | nindent 14 }}
+      {{- end }}
+      {{- with $svc.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $svc.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $svc.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "pg.image" $ctx | quote }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+          {{- with $svc.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml $.Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.httpPort }}
+              protocol: TCP
+            {{- if $svc.grpcPort }}
+            - name: grpc
+              containerPort: {{ $svc.grpcPort }}
+              protocol: TCP
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "pg.fullname" $ctx }}
+            {{- if include "pg.hasSecret" $ctx }}
+            - secretRef:
+                name: {{ include "pg.secretName" $ctx }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: OTEL_SERVICE_NAME
+              value: {{ $name | quote }}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.namespace=paymentgateway,service.version={{ include "pg.imageTag" $ctx }},deployment.environment={{ $.Values.global.env }},k8s.pod.name=$(POD_NAME),k8s.namespace.name=$(POD_NAMESPACE),k8s.node.name=$(NODE_NAME)"
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+                  divisor: "1"
+          startupProbe:
+            httpGet:
+              path: {{ $svc.probes.startup.path }}
+              port: http
+            periodSeconds: {{ $svc.probes.startup.periodSeconds }}
+            failureThreshold: {{ $svc.probes.startup.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ $svc.probes.liveness.path }}
+              port: http
+            periodSeconds: {{ $svc.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $svc.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $svc.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ $svc.probes.readiness.path }}
+              port: http
+            periodSeconds: {{ $svc.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $svc.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $svc.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- with $svc.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- with $svc.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,354 @@
+# golangci-lint v2 configuration (install: make tools -> ./bin/golangci-lint; run: make lint)
+version: "2"
+
+run:
+  timeout: 10m
+  tests: true
+  build-tags:
+    - integration
+    - e2e
+  modules-download-mode: readonly
+
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/tenghongzou/paymentgateway
+  exclusions:
+    generated: lax
+    paths:
+      - api/gen
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck        # includes former gosimple + stylecheck in v2
+    - unused
+    - ineffassign
+    - gosec
+    - revive
+    - gocritic
+    - errorlint
+    - exhaustive
+    - depguard
+    - forbidigo
+    - bodyclose
+    - noctx
+    - contextcheck
+    - nilerr
+    - rowserrcheck
+    - sqlclosecheck
+    - unparam
+    - misspell
+    - testifylint
+    - copyloopvar
+    - durationcheck
+    - makezero
+    - prealloc
+    - predeclared
+    - unconvert
+    - wastedassign
+    - whitespace
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+      exclude-functions:
+        - (io.Closer).Close
+        - (*database/sql.Rows).Close
+
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment   # too noisy for domain structs; enable ad hoc when optimising hot paths
+      settings:
+        shadow:
+          strict: false
+
+    staticcheck:
+      checks: ["all", "-ST1000", "-ST1003"]
+
+    gosec:
+      excludes:
+        - G104   # duplicated by errcheck
+      config:
+        G306: "0600"
+
+    revive:
+      severity: warning
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+          arguments: ["checkPrivateReceivers", "disableStutteringCheck"]
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+          disabled: true
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unused-parameter
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: defer
+        - name: unhandled-error
+          arguments: ["fmt.Fprintf", "fmt.Fprintln", "fmt.Fprint", "strings.Builder.WriteString", "bytes.Buffer.WriteString"]
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - hugeParam        # protobuf messages are passed by pointer anyway; noisy on value objects
+        - unnamedResult
+        - paramTypeCombine
+        - commentedOutCode
+      settings:
+        rangeValCopy:
+          sizeThreshold: 256
+
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+
+    exhaustive:
+      # Every switch over an enum (payment status, refund status, provider result, protobuf enums ...)
+      # must list all members or have an explicit default.
+      default-signifies-exhaustive: false
+      check:
+        - switch
+        - map
+      check-generated: false
+      explicit-exhaustive-switch: false
+      ignore-enum-types: ""
+
+    depguard:
+      # Enforces docs/01-architecture.md "Import 規則":
+      #   1. internal/<a> must not import internal/<b>  (shared code goes to pkg/)
+      #   2. domain must not import app/adapter; app must not import adapter (dependency inversion)
+      #   3. nobody imports deprecated / forbidden packages (e.g. ioutil, pkg/errors)
+      rules:
+        main:
+          list-mode: lax
+          files:
+            - "$all"
+          deny:
+            - pkg: "io/ioutil"
+              desc: "deprecated: use io / os"
+            - pkg: "github.com/pkg/errors"
+              desc: "use stdlib errors + fmt.Errorf(%w)"
+            - pkg: "github.com/golang/protobuf"
+              desc: "use google.golang.org/protobuf"
+            - pkg: "math/rand$"
+              desc: "use math/rand/v2 or crypto/rand"
+        # ---- rule 1: service isolation (one block per service) ----
+        internal-api-gateway:
+          list-mode: lax
+          files: ["**/internal/gateway/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/merchant", desc: "internal/<a> must not import internal/<b>; use api/gen/go clients or pkg/" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/payment", desc: "internal/<a> must not import internal/<b>; use api/gen/go clients or pkg/" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/ledger", desc: "internal/<a> must not import internal/<b>; use api/gen/go clients or pkg/" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/webhook", desc: "internal/<a> must not import internal/<b>; use api/gen/go clients or pkg/" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/reconciliation", desc: "internal/<a> must not import internal/<b>; use api/gen/go clients or pkg/" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providermock", desc: "internal/<a> must not import internal/<b>; use api/gen/go clients or pkg/" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providerstripe", desc: "internal/<a> must not import internal/<b>; use api/gen/go clients or pkg/" }
+        internal-merchant-service:
+          list-mode: lax
+          files: ["**/internal/merchant/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/gateway", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/payment", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/ledger", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/webhook", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/reconciliation", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providermock", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providerstripe", desc: "internal/<a> must not import internal/<b>" }
+        internal-payment-service:
+          list-mode: lax
+          files: ["**/internal/payment/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/gateway", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/merchant", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/ledger", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/webhook", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/reconciliation", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providermock", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providerstripe", desc: "internal/<a> must not import internal/<b>" }
+        internal-ledger-service:
+          list-mode: lax
+          files: ["**/internal/ledger/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/gateway", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/merchant", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/payment", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/webhook", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/reconciliation", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providermock", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providerstripe", desc: "internal/<a> must not import internal/<b>" }
+        internal-webhook-service:
+          list-mode: lax
+          files: ["**/internal/webhook/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/gateway", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/merchant", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/payment", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/ledger", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/reconciliation", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providermock", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providerstripe", desc: "internal/<a> must not import internal/<b>" }
+        internal-reconciliation-service:
+          list-mode: lax
+          files: ["**/internal/reconciliation/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/gateway", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/merchant", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/payment", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/ledger", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/webhook", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providermock", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providerstripe", desc: "internal/<a> must not import internal/<b>" }
+        internal-provider-mock:
+          list-mode: lax
+          files: ["**/internal/providermock/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/gateway", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/merchant", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/payment", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/ledger", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/webhook", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/reconciliation", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providerstripe", desc: "internal/<a> must not import internal/<b>" }
+        internal-provider-stripe:
+          list-mode: lax
+          files: ["**/internal/providerstripe/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/gateway", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/merchant", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/payment", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/ledger", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/webhook", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/reconciliation", desc: "internal/<a> must not import internal/<b>" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/providermock", desc: "internal/<a> must not import internal/<b>" }
+        # ---- rule 2: hexagonal layering inside each service (glob patterns) ----
+        layer-domain:
+          list-mode: lax
+          files: ["**/internal/*/domain/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/*/app", desc: "domain must not import app" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/*/app/**", desc: "domain must not import app" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/*/adapter", desc: "domain must not import adapter" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/*/adapter/**", desc: "domain must not import adapter" }
+            - { pkg: "github.com/jackc/pgx", desc: "domain has no infrastructure dependencies" }
+            - { pkg: "google.golang.org/grpc", desc: "domain has no infrastructure dependencies" }
+            - { pkg: "github.com/segmentio/kafka-go", desc: "domain has no infrastructure dependencies" }
+            - { pkg: "github.com/twmb/franz-go", desc: "domain has no infrastructure dependencies" }
+            - { pkg: "github.com/redis/go-redis", desc: "domain has no infrastructure dependencies" }
+        layer-app:
+          list-mode: lax
+          files: ["**/internal/*/app/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/*/adapter", desc: "app must not import adapter (depend on ports/interfaces instead)" }
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal/*/adapter/**", desc: "app must not import adapter (depend on ports/interfaces instead)" }
+        # ---- rule 3: pkg/ must stay service-agnostic ----
+        pkg-no-internal:
+          list-mode: lax
+          files: ["**/pkg/**"]
+          deny:
+            - { pkg: "github.com/tenghongzou/paymentgateway/internal", desc: "pkg/ must not depend on internal/" }
+
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^fmt\.Print(f|ln)?$'
+          msg: "use log/slog instead of fmt.Print*"
+        - pattern: '^print(ln)?$'
+          msg: "use log/slog instead of builtin print"
+        - pattern: '^log\.(Print|Fatal|Panic)(f|ln)?$'
+          msg: "use log/slog; never os.Exit via log.Fatal inside services"
+        - pattern: '^time\.Sleep$'
+          msg: "avoid time.Sleep in production code; use timers/contexts (allowed in tests via exclusions)"
+        # Money must never be float: amount is int64 minor units (docs/01-architecture.md 5.1).
+        # Scoped to money/domain packages through exclusions.rules below.
+        - pattern: '^float(32|64)$'
+          msg: "monetary values must be int64 minor units (pkg/money), never float"
+        - pattern: '^strconv\.(ParseFloat|FormatFloat)$'
+          msg: "monetary values must be int64 minor units (pkg/money), never float"
+
+    misspell:
+      locale: US
+
+    testifylint:
+      enable-all: true
+
+    unparam:
+      check-exported: false
+
+  exclusions:
+    generated: lax
+    warn-unused: false
+    presets:
+      - common-false-positives
+      - std-error-handling
+    paths:
+      - api/gen
+      - third_party$
+      - bin$
+    rules:
+      # float ban only applies to money-handling code paths
+      - linters: [forbidigo]
+        text: "never float"
+        path-except: '(^|/)(pkg/money|internal/[^/]+/domain|internal/[^/]+/app)/'
+      # tests may sleep / print
+      - linters: [forbidigo]
+        path: '_test\.go$'
+        text: "time.Sleep|fmt.Print"
+      # CLI entrypoints may print and exit
+      - linters: [forbidigo]
+        path: '^cmd/'
+        text: "fmt.Print|log\\.(Fatal|Print)"
+      - linters: [gosec]
+        path: '_test\.go$'
+        text: "G404|G101|G306"
+      - linters: [noctx, bodyclose]
+        path: '_test\.go$'
+      - linters: [revive]
+        path: '_test\.go$'
+        text: "unused-parameter"
+      - linters: [errcheck]
+        path: '_test\.go$'
+        text: "Close"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: true

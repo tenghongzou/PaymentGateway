@@ -1,0 +1,206 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $root := . }}
+{{- $g := .Values.global }}
+{{/* Build the merged service map once */}}
+{{- $all := dict }}
+{{- range $n, $raw := .Values.services }}
+{{- $s := include "pg.mergeSvc" (dict "root" $root "raw" $raw) | fromYaml }}
+{{- if $s.enabled }}{{- $_ := set $all $n $s }}{{- end }}
+{{- end }}
+---
+# 1. Default deny: every paymentgateway pod in this release starts with no ingress/egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pg.prefix" $root }}-default-deny
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: paymentgateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pg.partOfSelector" $root | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+---
+# 2. Baseline egress for every pod: DNS, OTel collector, Redis, Kafka.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pg.prefix" $root }}-allow-baseline-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: paymentgateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pg.partOfSelector" $root | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # OpenTelemetry collector
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $g.otel.namespace }}
+      ports:
+        {{- range $g.otel.ports }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
+    # Redis (managed, outside the cluster)
+    - {{ if $g.redis.cidrs }}to:
+        {{- range $g.redis.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      {{ end }}ports:
+        - { protocol: TCP, port: {{ $g.redis.port }} }
+    # Kafka (managed, outside the cluster)
+    - {{ if $g.kafka.cidrs }}to:
+        {{- range $g.kafka.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      {{ end }}ports:
+        {{- range $g.kafka.ports }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
+    {{- with .Values.networkPolicy.extraEgressCidrs443 }}
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: 443 }
+    {{- end }}
+---
+# 3. Allow Prometheus (monitoring namespace) to scrape the HTTP/metrics port of every pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pg.prefix" $root }}-allow-metrics-scrape
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: paymentgateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pg.partOfSelector" $root | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $g.monitoring.namespace }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8081 }
+{{- range $name, $svc := $all }}
+{{- $ctx := dict "root" $root "name" $name "svc" $svc }}
+---
+# 4. Per-service ingress: {{ $name }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pg.fullname" $ctx }}-ingress
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "pg.labels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pg.selectorLabels" $ctx | nindent 6 }}
+  policyTypes: ["Ingress"]
+  {{- if or $svc.ingress.enabled (and $svc.grpcPort $svc.networkPolicy.ingressFrom) }}
+  ingress:
+    {{- if $svc.ingress.enabled }}
+    # ingress-nginx controller -> HTTP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $g.ingressController.namespace }}
+      ports:
+        - { protocol: TCP, port: {{ $svc.httpPort }} }
+    {{- end }}
+    {{- if and $svc.grpcPort $svc.networkPolicy.ingressFrom }}
+    # allowed gRPC callers
+    - from:
+        {{- range $caller := $svc.networkPolicy.ingressFrom }}
+        {{- if hasKey $all $caller }}
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" (dict "root" $root "name" $caller "svc" (index $all $caller)) | nindent 14 }}
+        {{- end }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: {{ $svc.grpcPort }} }
+    {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+{{- $callees := list }}
+{{- range $callee, $cs := $all }}
+{{- if and $cs.grpcPort (has $name $cs.networkPolicy.ingressFrom) }}{{ $callees = append $callees $callee }}{{ end }}
+{{- end }}
+{{- if or $callees $svc.database $svc.networkPolicy.internetEgress }}
+---
+# 5. Per-service egress: {{ $name }} -> callees / postgres / internet
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pg.fullname" $ctx }}-egress
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "pg.labels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pg.selectorLabels" $ctx | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    {{- range $callee := $callees }}
+    {{- $cs := index $all $callee }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" (dict "root" $root "name" $callee "svc" $cs) | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ $cs.grpcPort }} }
+    {{- end }}
+    {{- if $svc.database }}
+    - {{ if $g.postgres.cidrs }}to:
+        {{- range $g.postgres.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      {{ end }}ports:
+        - { protocol: TCP, port: {{ $g.postgres.port }} }
+    {{- end }}
+    {{- if $svc.networkPolicy.internetEgress }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.169.254/32
+      ports:
+        - { protocol: TCP, port: 443 }
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

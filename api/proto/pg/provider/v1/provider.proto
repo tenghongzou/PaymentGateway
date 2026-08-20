@@ -1,0 +1,649 @@
+// ProviderAdapter — 所有 PSP adapter（provider-mock :9101、provider-stripe :9102、…）必須實作的同一份 gRPC 介面。
+//
+// 設計原則（docs/01-architecture.md §4.2）：
+//   - payment-service 只認識這個介面，不認識任何 PSP 細節。
+//   - adapter 無狀態、無 DB；PSP 憑證由 Vault 注入。
+//   - 本系統不接觸 PAN：所有卡片資料皆為 PSP 端 token（tokenization / hosted fields）。
+//   - 所有變更型 RPC 都帶 idempotency_key，adapter 必須把它對應到 PSP 的冪等機制（例如 Stripe Idempotency-Key header）。
+//   - 本檔不得 import pg.payment.v1（避免循環依賴）；payment-service 負責把商戶層模型對應到此處的 PaymentInstrument。
+syntax = "proto3";
+
+package pg.provider.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pg/common/v1/money.proto";
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/provider/v1;providerv1";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// ProviderAdapter 為 PSP 的統一抽象。
+service ProviderAdapter {
+  // 授權（預授權或授權+請款一次完成，取決於 capture_immediately）。
+  // 可能結果：AUTHORIZED / CAPTURED / REQUIRES_ACTION（需 3DS 或導向）/ PENDING（非同步付款方式）/ FAILED。
+  // adapter 不得丟 gRPC error 來表達業務拒絕（decline）；業務拒絕一律以 result.success=false + error_category 表達。
+  // gRPC error 僅用於 adapter 自身故障（INTERNAL）、PSP 逾時（DEADLINE_EXCEEDED）、PSP 不可達（UNAVAILABLE）。
+  rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
+
+  // 請款（可部分）。同一授權可多次部分請款（若 PSP 支援，見 HealthCheckResponse.capabilities）。
+  rpc Capture(CaptureRequest) returns (CaptureResponse);
+
+  // 取消授權（尚未請款的授權）。已部分請款時，取消剩餘未請款額度（若 PSP 支援）。
+  rpc Void(VoidRequest) returns (VoidResponse);
+
+  // 退款（可部分）。針對已請款金額。PSP 可能非同步完成（status=PENDING），最終結果經 ParseWebhook 回報。
+  rpc Refund(RefundRequest) returns (RefundResponse);
+
+  // 向 PSP 查詢付款目前狀態；用於逾時後的狀態補償（reconcile in-flight）與對帳。
+  rpc GetPaymentStatus(GetPaymentStatusRequest) returns (GetPaymentStatusResponse);
+
+  // 解析並驗證 PSP 原生 webhook（api-gateway 收到 /psp/{provider}/webhook 後轉交 payment-service，再由 payment-service 呼叫）。
+  // adapter 負責驗簽（PSP 各自的簽章機制）並正規化成 ProviderWebhookEvent。
+  // 驗簽失敗：verified=false（不丟 gRPC error）；不認識的事件類型：event.event_type=UNKNOWN 且 ignored=true。
+  rpc ParseWebhook(ParseWebhookRequest) returns (ParseWebhookResponse);
+
+  // 健康檢查：回報 adapter 與 PSP 連線狀態、延遲與能力；payment-service 的路由引擎據此排除不健康的供應商。
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// ProviderErrorCategory 為 PSP 錯誤的正規化分類；payment-service 的 failover 與商戶錯誤碼對應皆以此為準。
+enum ProviderErrorCategory {
+  // 未指定（成功時使用）。
+  PROVIDER_ERROR_CATEGORY_UNSPECIFIED = 0;
+  // 硬拒絕：換 PSP 也不會成功（卡片遺失/被盜、帳戶關閉、卡號無效）。不 failover。
+  PROVIDER_ERROR_CATEGORY_DECLINED_HARD = 1;
+  // 軟拒絕：發卡行暫時拒絕（餘額不足、do_not_honor、超過限額）。可依商戶偏好 failover 或提示客戶改卡。
+  PROVIDER_ERROR_CATEGORY_DECLINED_SOFT = 2;
+  // PSP 不可用：逾時、5xx、維護中。可 failover 到其他 PSP。
+  PROVIDER_ERROR_CATEGORY_PROVIDER_UNAVAILABLE = 3;
+  // 請求無效：我方送出的參數 PSP 不接受（幣別不支援、金額超限、token 過期）。不 failover，回商戶 invalid_request_error。
+  PROVIDER_ERROR_CATEGORY_INVALID_REQUEST = 4;
+  // 疑似詐欺：PSP 風控攔截。不 failover（避免 fraud shopping）。
+  PROVIDER_ERROR_CATEGORY_FRAUD_SUSPECTED = 5;
+  // 需要額外驗證：發卡行要求 3DS。不是失敗；Authorize 會回 REQUIRES_ACTION 與 next_action。
+  PROVIDER_ERROR_CATEGORY_AUTHENTICATION_REQUIRED = 6;
+  // 無法分類的錯誤。保守處理：不 failover，標記 retryable=false。
+  PROVIDER_ERROR_CATEGORY_UNKNOWN = 7;
+}
+
+// AuthorizationStatus 為 Authorize 的結果狀態。
+enum AuthorizationStatus {
+  AUTHORIZATION_STATUS_UNSPECIFIED = 0;
+  // 已授權，待請款。
+  AUTHORIZATION_STATUS_AUTHORIZED = 1;
+  // 已授權且已請款（capture_immediately=true）。
+  AUTHORIZATION_STATUS_CAPTURED = 2;
+  // 需要客戶端動作（3DS / 導向錢包）；見 next_action。
+  AUTHORIZATION_STATUS_REQUIRES_ACTION = 3;
+  // 非同步付款方式（銀行轉帳、超商代碼）等待客戶完成；最終結果經 webhook 回報。
+  AUTHORIZATION_STATUS_PENDING = 4;
+  // 失敗；見 result。
+  AUTHORIZATION_STATUS_FAILED = 5;
+}
+
+// ProviderPaymentStatus 為 GetPaymentStatus 回報的 PSP 端付款狀態（正規化）。
+enum ProviderPaymentStatus {
+  PROVIDER_PAYMENT_STATUS_UNSPECIFIED = 0;
+  PROVIDER_PAYMENT_STATUS_PENDING = 1;
+  PROVIDER_PAYMENT_STATUS_REQUIRES_ACTION = 2;
+  PROVIDER_PAYMENT_STATUS_AUTHORIZED = 3;
+  PROVIDER_PAYMENT_STATUS_CAPTURED = 4;
+  PROVIDER_PAYMENT_STATUS_PARTIALLY_CAPTURED = 5;
+  PROVIDER_PAYMENT_STATUS_VOIDED = 6;
+  PROVIDER_PAYMENT_STATUS_REFUNDED = 7;
+  PROVIDER_PAYMENT_STATUS_PARTIALLY_REFUNDED = 8;
+  PROVIDER_PAYMENT_STATUS_FAILED = 9;
+  PROVIDER_PAYMENT_STATUS_EXPIRED = 10;
+  // PSP 端查無此交易。
+  PROVIDER_PAYMENT_STATUS_NOT_FOUND = 11;
+}
+
+// RefundState 為 Refund 的同步結果。
+enum RefundState {
+  REFUND_STATE_UNSPECIFIED = 0;
+  // PSP 已受理，最終結果經 webhook 回報。
+  REFUND_STATE_PENDING = 1;
+  // 同步成功。
+  REFUND_STATE_SUCCEEDED = 2;
+  // 同步失敗；見 result。
+  REFUND_STATE_FAILED = 3;
+}
+
+// WalletType 為支援的錢包類型。
+enum WalletType {
+  WALLET_TYPE_UNSPECIFIED = 0;
+  WALLET_TYPE_APPLE_PAY = 1;
+  WALLET_TYPE_GOOGLE_PAY = 2;
+  WALLET_TYPE_LINE_PAY = 3;
+}
+
+// ThreeDsPreference 為商戶對 3DS 的偏好。
+enum ThreeDsPreference {
+  // 由 PSP / 發卡行決定（預設）。
+  THREE_DS_PREFERENCE_UNSPECIFIED = 0;
+  // 強制要求 3DS（高風險交易、法規要求）。
+  THREE_DS_PREFERENCE_REQUIRED = 1;
+  // 盡量避免 3DS（商戶自行承擔風險；PSP 仍可能強制）。
+  THREE_DS_PREFERENCE_AVOID = 2;
+}
+
+// ProviderWebhookEventType 為 PSP webhook 的正規化事件類型。
+enum ProviderWebhookEventType {
+  PROVIDER_WEBHOOK_EVENT_TYPE_UNSPECIFIED = 0;
+  // 授權成功（常見於 3DS 完成後或非同步付款）。
+  PROVIDER_WEBHOOK_EVENT_TYPE_AUTHORIZATION_SUCCEEDED = 1;
+  // 授權失敗。
+  PROVIDER_WEBHOOK_EVENT_TYPE_AUTHORIZATION_FAILED = 2;
+  // 請款成功（含非同步請款）。
+  PROVIDER_WEBHOOK_EVENT_TYPE_CAPTURE_SUCCEEDED = 3;
+  // 請款失敗。
+  PROVIDER_WEBHOOK_EVENT_TYPE_CAPTURE_FAILED = 4;
+  // 授權已取消。
+  PROVIDER_WEBHOOK_EVENT_TYPE_VOIDED = 5;
+  // 退款成功。
+  PROVIDER_WEBHOOK_EVENT_TYPE_REFUND_SUCCEEDED = 6;
+  // 退款失敗。
+  PROVIDER_WEBHOOK_EVENT_TYPE_REFUND_FAILED = 7;
+  // 爭議/拒付開啟。
+  PROVIDER_WEBHOOK_EVENT_TYPE_DISPUTE_OPENED = 8;
+  // 爭議更新（例：進入審查、證據已收到）。
+  PROVIDER_WEBHOOK_EVENT_TYPE_DISPUTE_UPDATED = 9;
+  // 爭議結案；見 dispute.outcome。
+  PROVIDER_WEBHOOK_EVENT_TYPE_DISPUTE_CLOSED = 10;
+  // 授權過期（未在期限內請款）。
+  PROVIDER_WEBHOOK_EVENT_TYPE_PAYMENT_EXPIRED = 11;
+  // 不認識 / 不關心的 PSP 事件；payment-service 應忽略並回 PSP 2xx。
+  PROVIDER_WEBHOOK_EVENT_TYPE_UNKNOWN = 12;
+}
+
+// DisputeOutcome 為爭議結果。
+enum DisputeOutcome {
+  DISPUTE_OUTCOME_UNSPECIFIED = 0;
+  // 商戶勝訴，款項歸還。
+  DISPUTE_OUTCOME_WON = 1;
+  // 商戶敗訴，款項扣除。
+  DISPUTE_OUTCOME_LOST = 2;
+}
+
+// HealthStatus 為 adapter 健康狀態。
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  // 正常。
+  HEALTH_STATUS_SERVING = 1;
+  // 可用但延遲高或錯誤率上升；路由引擎降低權重。
+  HEALTH_STATUS_DEGRADED = 2;
+  // 不可用；路由引擎排除。
+  HEALTH_STATUS_NOT_SERVING = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Shared messages
+// ---------------------------------------------------------------------------
+
+// ProviderResult 為所有變更型 RPC 的統一結果；success=true 時錯誤欄位皆為空。
+message ProviderResult {
+  // 操作是否成功（PSP 接受並完成 / 受理）。
+  bool success = 1;
+  // PSP 端的交易參照（例：Stripe payment_intent id、Adyen pspReference）。成功時必填；失敗時若 PSP 有建立紀錄也應回傳。
+  string provider_reference = 2;
+  // 正規化錯誤分類；success=true 時為 UNSPECIFIED。
+  ProviderErrorCategory error_category = 3;
+  // PSP 原始錯誤碼（例：Stripe 的 decline_code "insufficient_funds"）。供稽核與商戶顯示；payment-service 不得依此做邏輯。
+  string provider_error_code = 4;
+  // PSP 原始錯誤訊息（已去除敏感資訊）。
+  string provider_error_message = 5;
+  // 同一 PSP 重試是否可能成功（例：逾時、限流）。payment-service 的重試策略：retryable 且 category=PROVIDER_UNAVAILABLE → 最多重試 2 次後 failover。
+  bool retryable = 6;
+}
+
+// CardToken 為 PSP 端的卡片 token（本系統不接觸 PAN）。
+message CardToken {
+  // PSP 發出的 token / payment method id（例：Stripe pm_xxx、tok_xxx）。必填。
+  string token = 1;
+  // 發出此 token 的 PSP 識別碼；token 無法跨 PSP 使用，路由引擎必須尊重此欄位（非空時不可 failover 到其他 PSP）。
+  string token_provider = 2;
+  // 以下為前端 tokenization 時回傳的非敏感資訊，供路由（卡組織）與顯示使用；可為空。
+  // 卡組織：visa、mastercard、jcb、amex、unionpay。
+  string brand = 3;
+  // 卡號末四碼。
+  string last4 = 4;
+  // 到期月份 1–12。
+  int32 exp_month = 5;
+  // 到期年份（四位數）。
+  int32 exp_year = 6;
+  // 發卡國別 ISO 3166-1 alpha-2。
+  string issuer_country = 7;
+  // 持卡人姓名（若前端有收集）。
+  string holder_name = 8;
+}
+
+// WalletPayment 為錢包付款資料。
+message WalletPayment {
+  // 錢包類型。必填。
+  WalletType type = 1;
+  // 錢包端加密 payload（Apple Pay payment token JSON、Google Pay token 等），不透明字串，直接轉交 PSP。
+  string encrypted_payload = 2;
+}
+
+// BankTransfer 為銀行轉帳（虛擬帳號）付款。非同步：Authorize 回 PENDING，客戶轉帳後 PSP webhook 回報。
+message BankTransfer {
+  // 客戶銀行所在國別 ISO 3166-1 alpha-2。必填。
+  string country = 1;
+  // 銀行代碼（各國格式不同，例：台灣 3 碼）。可選。
+  string bank_code = 2;
+  // 付款人姓名（用於對帳）。可選。
+  string payer_name = 3;
+  // 虛擬帳號有效期限；未設定由 PSP 決定。
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+// PaymentInstrument 為送往 PSP 的付款工具（三選一）。
+message PaymentInstrument {
+  oneof instrument {
+    CardToken card_token = 1;
+    WalletPayment wallet = 2;
+    BankTransfer bank_transfer = 3;
+  }
+}
+
+// CustomerInfo 為 PSP 風控與 3DS 所需的客戶資訊（皆為可選，但愈完整 3DS frictionless 機率愈高）。
+message CustomerInfo {
+  // 商戶端客戶識別碼。
+  string id = 1;
+  // 電子郵件。
+  string email = 2;
+  // 姓名。
+  string name = 3;
+  // 電話（E.164）。
+  string phone = 4;
+  // 客戶端 IP（3DS 必要）。
+  string ip_address = 5;
+  // 客戶端 User-Agent（3DS 必要）。
+  string user_agent = 6;
+  // 帳單地址國別。
+  string billing_country = 7;
+  // 帳單郵遞區號。
+  string billing_postal_code = 8;
+}
+
+// RedirectAction 為需將客戶導向外部頁面（3DS challenge 頁、錢包付款頁）的動作。
+message RedirectAction {
+  // 導向 URL。
+  string url = 1;
+  // HTTP 方法：GET 或 POST。
+  string method = 2;
+  // method=POST 時要以表單提交的欄位。
+  map<string, string> form_fields = 3;
+}
+
+// ThreeDsChallengeAction 為需在商戶頁面內嵌 3DS 2.x challenge 的動作。
+message ThreeDsChallengeAction {
+  // ACS URL。
+  string acs_url = 1;
+  // 3DS 2.x 的 creq（base64url）。
+  string creq = 2;
+  // 3DS 交易 ID（threeDSServerTransID）。
+  string transaction_id = 3;
+  // 3DS 版本（例：2.2.0）。
+  string version = 4;
+}
+
+// DisplayAction 為需向客戶顯示資訊的動作（銀行虛擬帳號、超商代碼、QR code）。
+message DisplayAction {
+  // 顯示類型：bank_account | convenience_store_code | qr_code。
+  string type = 1;
+  // 顯示內容的鍵值（例：bank_code、account_number、expires_at、qr_code_data）。
+  map<string, string> details = 2;
+}
+
+// NextAction 為授權後需要客戶端完成的後續動作（三選一）。
+message NextAction {
+  oneof action {
+    RedirectAction redirect = 1;
+    ThreeDsChallengeAction three_ds_challenge = 2;
+    DisplayAction display = 3;
+  }
+  // 動作的有效期限；逾時 payment-service 將 payment 標為 EXPIRED。
+  google.protobuf.Timestamp expires_at = 10;
+}
+
+// InstrumentDetails 為 PSP 回傳的付款工具非敏感資訊（供 Payment 顯示與對帳）。
+message InstrumentDetails {
+  // card | wallet | bank_transfer。
+  string type = 1;
+  // 卡組織。
+  string brand = 2;
+  // 末四碼。
+  string last4 = 3;
+  // 發卡行名稱。
+  string issuer = 4;
+  // 發卡國別。
+  string issuer_country = 5;
+  // 卡片類型：credit | debit | prepaid。
+  string funding = 6;
+  // 錢包類型（type=wallet 時）。
+  WalletType wallet_type = 7;
+  // 3DS 結果：authenticated | attempted | not_authenticated | not_supported | unknown。
+  string three_ds_result = 8;
+  // 發卡行授權碼（對帳用）。
+  string authorization_code = 9;
+}
+
+// ---------------------------------------------------------------------------
+// Authorize
+// ---------------------------------------------------------------------------
+
+// AuthorizeRequest 授權請求。
+message AuthorizeRequest {
+  // 我方付款 ID（pay_...）。adapter 必須把它放進 PSP 的 metadata / reference，以便 webhook 與對帳反查。必填。
+  string payment_id = 1;
+  // 商戶 ID。必填。
+  string merchant_id = 2;
+  // 冪等鍵；每次 attempt 唯一（payment_id + attempt 序號），adapter 對應到 PSP 冪等機制。必填。
+  string idempotency_key = 3;
+  // 授權金額。必填。
+  pg.common.v1.Money amount = 4;
+  // true = 授權並立即請款（capture_method=automatic）；false = 僅授權。
+  bool capture_immediately = 5;
+  // 付款工具。必填。
+  PaymentInstrument instrument = 6;
+  // 客戶資訊。
+  CustomerInfo customer = 7;
+  // 3DS / 導向完成後 PSP 要把客戶帶回的 URL（api-gateway 的 /v1/payments/{id}/return 或商戶自訂）。
+  string return_url = 8;
+  // 帳單描述（最長 22 字 ASCII）。
+  string statement_descriptor = 9;
+  // 付款描述（顯示於 PSP 後台）。
+  string description = 10;
+  // 3DS 偏好。
+  ThreeDsPreference three_ds = 11;
+  // 要傳給 PSP 的 metadata（會與 payment_id、merchant_id 合併）。
+  map<string, string> metadata = 12;
+  // PSP 子帳戶 / connected account 識別（多商戶各自 PSP 帳號時）；空表示平台主帳戶。
+  string provider_account_id = 13;
+  // 是否為測試交易（mode=test）；adapter 據此選用 PSP 的測試憑證。
+  bool test_mode = 14;
+}
+
+// AuthorizeResponse 授權結果。
+message AuthorizeResponse {
+  // 統一結果；status=FAILED 時 success=false。REQUIRES_ACTION / PENDING 視為 success=true。
+  ProviderResult result = 1;
+  // 授權狀態。
+  AuthorizationStatus status = 2;
+  // 實際授權金額（通常等於請求金額；部分 PSP 可能因四捨五入不同）。
+  pg.common.v1.Money authorized_amount = 3;
+  // 已請款金額（capture_immediately=true 且成功時等於 authorized_amount）。
+  pg.common.v1.Money captured_amount = 4;
+  // status=REQUIRES_ACTION 時必填。
+  NextAction next_action = 5;
+  // 付款工具的非敏感資訊。
+  InstrumentDetails instrument_details = 6;
+  // 授權有效期限（需在此之前請款），PSP 有提供時填入。
+  google.protobuf.Timestamp authorization_expires_at = 7;
+  // PSP 手續費（若 PSP 同步回傳；多數 PSP 於結算檔才提供，此時留空）。
+  pg.common.v1.Money fee = 8;
+  // PSP 原始回應的摘要（已遮罩），僅供除錯；最長 4KB。
+  string raw_response = 9;
+}
+
+// ---------------------------------------------------------------------------
+// Capture
+// ---------------------------------------------------------------------------
+
+// CaptureRequest 請款請求。
+message CaptureRequest {
+  // 我方付款 ID。必填。
+  string payment_id = 1;
+  // Authorize 回傳的 provider_reference。必填。
+  string provider_reference = 2;
+  // 冪等鍵（每次 capture 唯一）。必填。
+  string idempotency_key = 3;
+  // 請款金額；必須 <= 授權金額 - 已請款金額。必填。
+  pg.common.v1.Money amount = 4;
+  // 是否為最終請款（true 時 PSP 應釋放剩餘授權額度）。
+  bool final = 5;
+  // 是否為測試交易。
+  bool test_mode = 6;
+  // PSP 子帳戶識別。
+  string provider_account_id = 7;
+}
+
+// CaptureResponse 請款結果。
+message CaptureResponse {
+  ProviderResult result = 1;
+  // 本次實際請款金額。
+  pg.common.v1.Money captured_amount = 2;
+  // PSP 手續費（若同步提供）。
+  pg.common.v1.Money fee = 3;
+  // 請款是否為非同步（true 時最終結果經 webhook CAPTURE_SUCCEEDED / CAPTURE_FAILED 回報）。
+  bool pending = 4;
+  string raw_response = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Void
+// ---------------------------------------------------------------------------
+
+// VoidRequest 取消授權請求。
+message VoidRequest {
+  string payment_id = 1;
+  string provider_reference = 2;
+  string idempotency_key = 3;
+  // 取消原因：requested_by_customer | duplicate | fraudulent | abandoned。可選。
+  string reason = 4;
+  bool test_mode = 5;
+  string provider_account_id = 6;
+}
+
+// VoidResponse 取消結果。
+message VoidResponse {
+  ProviderResult result = 1;
+  // 被釋放的授權金額。
+  pg.common.v1.Money voided_amount = 2;
+  string raw_response = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Refund
+// ---------------------------------------------------------------------------
+
+// RefundRequest 退款請求。
+message RefundRequest {
+  string payment_id = 1;
+  // 我方退款 ID（re_...）；adapter 放進 PSP metadata 以便 webhook 反查。必填。
+  string refund_id = 2;
+  string provider_reference = 3;
+  string idempotency_key = 4;
+  // 退款金額；必須 <= 已請款 - 已退款。必填。
+  pg.common.v1.Money amount = 5;
+  // 退款原因：requested_by_customer | duplicate | fraudulent | other。可選。
+  string reason = 6;
+  map<string, string> metadata = 7;
+  bool test_mode = 8;
+  string provider_account_id = 9;
+}
+
+// RefundResponse 退款結果。
+message RefundResponse {
+  ProviderResult result = 1;
+  // PENDING / SUCCEEDED / FAILED。
+  RefundState status = 2;
+  // PSP 端退款參照（與 result.provider_reference 相同，為語意清楚另列）。
+  string provider_refund_reference = 3;
+  // 實際退款金額。
+  pg.common.v1.Money refunded_amount = 4;
+  // 退還 / 額外收取的手續費（正值表示 PSP 另收退款手續費）。
+  pg.common.v1.Money fee = 5;
+  string raw_response = 6;
+}
+
+// ---------------------------------------------------------------------------
+// GetPaymentStatus
+// ---------------------------------------------------------------------------
+
+// GetPaymentStatusRequest 查詢 PSP 端狀態。
+message GetPaymentStatusRequest {
+  string payment_id = 1;
+  // PSP 交易參照。必填。
+  string provider_reference = 2;
+  bool test_mode = 3;
+  string provider_account_id = 4;
+}
+
+// GetPaymentStatusResponse 查詢結果。
+message GetPaymentStatusResponse {
+  // success=false 表示查詢本身失敗（非交易失敗）。
+  ProviderResult result = 1;
+  // PSP 端正規化狀態。
+  ProviderPaymentStatus status = 2;
+  pg.common.v1.Money authorized_amount = 3;
+  pg.common.v1.Money captured_amount = 4;
+  pg.common.v1.Money refunded_amount = 5;
+  // 若狀態為 FAILED，失敗原因。
+  ProviderErrorCategory failure_category = 6;
+  string failure_code = 7;
+  // PSP 端最後更新時間。
+  google.protobuf.Timestamp updated_at = 8;
+  string raw_response = 9;
+}
+
+// ---------------------------------------------------------------------------
+// ParseWebhook
+// ---------------------------------------------------------------------------
+
+// HeaderValues 為同名 HTTP header 的多個值。
+message HeaderValues {
+  repeated string values = 1;
+}
+
+// ParseWebhookRequest 為 PSP 原生 webhook 的原始內容。
+message ParseWebhookRequest {
+  // 供應商識別碼（來自 URL 路徑 /psp/{provider}/webhook）。必填。
+  string provider = 1;
+  // 原始 HTTP headers（key 為小寫）。驗簽通常需要特定 header（例：Stripe-Signature）。
+  map<string, HeaderValues> headers = 2;
+  // 原始 HTTP body（未經任何解析或重新序列化，驗簽必須用原始 bytes）。
+  bytes body = 3;
+  // api-gateway 收到的時間。
+  google.protobuf.Timestamp received_at = 4;
+  // 客戶端 IP（部分 PSP 提供 IP allowlist）。
+  string remote_ip = 5;
+}
+
+// DisputeInfo 為爭議相關事件的附加資訊。
+message DisputeInfo {
+  // PSP 端爭議參照。
+  string provider_dispute_reference = 1;
+  // 正規化原因：fraudulent | product_not_received | product_unacceptable | duplicate |
+  // subscription_canceled | credit_not_processed | unrecognized | general。
+  string reason = 2;
+  // PSP 原始原因碼。
+  string provider_reason_code = 3;
+  // 證據提交期限。
+  google.protobuf.Timestamp evidence_due_by = 4;
+  // 結案結果（DISPUTE_CLOSED 時必填）。
+  DisputeOutcome outcome = 5;
+  // 爭議處理費（PSP 收取，不論勝負多半不退）。
+  pg.common.v1.Money dispute_fee = 6;
+}
+
+// ProviderWebhookEvent 為正規化後的 PSP 事件。
+message ProviderWebhookEvent {
+  // PSP 端事件 ID（用於去重；payment-service 以 (provider, provider_event_id) 唯一索引）。必填。
+  string provider_event_id = 1;
+  // 正規化事件類型。
+  ProviderWebhookEventType event_type = 2;
+  // PSP 原始事件類型字串（例：payment_intent.succeeded），稽核用。
+  string provider_event_type = 3;
+  // PSP 交易參照。
+  string provider_reference = 4;
+  // 我方付款 ID（從 PSP metadata 取回）；取不到時為空，payment-service 以 provider_reference 反查。
+  string payment_id = 5;
+  // 我方退款 ID（退款事件時，從 metadata 取回）。
+  string refund_id = 6;
+  // 事件涉及的金額（請款金額、退款金額、爭議金額）。
+  pg.common.v1.Money amount = 7;
+  // PSP 手續費（若事件含有）。
+  pg.common.v1.Money fee = 8;
+  // 事件在 PSP 端發生的時間。
+  google.protobuf.Timestamp occurred_at = 9;
+  // 失敗類事件的錯誤資訊。
+  ProviderErrorCategory error_category = 10;
+  string provider_error_code = 11;
+  string provider_error_message = 12;
+  // 爭議事件的附加資訊。
+  DisputeInfo dispute = 13;
+  // 付款工具非敏感資訊（授權成功事件常附帶）。
+  InstrumentDetails instrument_details = 14;
+  // 是否為 PSP 測試模式事件。
+  bool test_mode = 15;
+}
+
+// ParseWebhookResponse 解析結果。
+message ParseWebhookResponse {
+  // 簽章是否有效。false 時 api-gateway 應回 PSP 400，且不處理 event。
+  bool verified = 1;
+  // 驗簽失敗原因（verified=false 時）：signature_missing | signature_invalid | timestamp_expired | payload_malformed。
+  string rejection_reason = 2;
+  // 是否為我方不關心的事件（verified=true 但不需處理）；此時 event 可能只填 provider_event_id 與 provider_event_type。
+  bool ignored = 3;
+  // 正規化事件（verified=true 且 ignored=false 時必填）。
+  ProviderWebhookEvent event = 4;
+}
+
+// ---------------------------------------------------------------------------
+// HealthCheck
+// ---------------------------------------------------------------------------
+
+// HealthCheckRequest 健康檢查請求。
+message HealthCheckRequest {
+  // 是否實際向 PSP 發送探測請求（true）或只回報 adapter 內部快取的健康狀態（false，預設；供高頻輪詢）。
+  bool probe_provider = 1;
+}
+
+// ProviderCapabilities 為 PSP 能力宣告；路由引擎用於排除不支援的操作。
+message ProviderCapabilities {
+  // 支援部分請款。
+  bool partial_capture = 1;
+  // 支援多次部分請款。
+  bool multi_capture = 2;
+  // 支援部分退款。
+  bool partial_refund = 3;
+  // 支援 3DS 2.x。
+  bool three_ds = 4;
+  // 支援的付款工具類型：card、wallet、bank_transfer。
+  repeated string instrument_types = 5;
+  // 支援的幣別（ISO 4217）；空表示不限制。
+  repeated string currencies = 6;
+  // 支援的錢包類型。
+  repeated WalletType wallet_types = 7;
+  // 授權有效天數（超過未請款會過期）；0 表示未知。
+  int32 authorization_validity_days = 8;
+}
+
+// HealthCheckResponse 健康狀態。
+message HealthCheckResponse {
+  // 健康狀態。
+  HealthStatus status = 1;
+  // 供應商識別碼（例：stripe、mock）。
+  string provider = 2;
+  // adapter 版本（git sha 或 semver）。
+  string adapter_version = 3;
+  // 最近一次 PSP 探測的往返延遲（毫秒）；未探測為 0。
+  int64 provider_latency_ms = 4;
+  // 最近 1 分鐘內 PSP 回應的錯誤率（0–1）。
+  double error_rate_1m = 5;
+  // 說明（例：PSP 維護公告）。
+  string message = 6;
+  // 檢查時間。
+  google.protobuf.Timestamp checked_at = 7;
+  // 能力宣告。
+  ProviderCapabilities capabilities = 8;
+}

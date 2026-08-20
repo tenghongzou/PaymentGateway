@@ -1,0 +1,351 @@
+// reconciliation-service（gRPC :9005，DB pg_recon）對內契約。
+//
+// 職責：匯入 PSP 結算檔（settlement / payout report），逐筆與 payment-service 的付款 / 退款 / 爭議紀錄
+//       及 ledger-service 的分錄比對，產生差異（discrepancy）報表；確認後的手續費差異透過
+//       LedgerService.PostJournal 寫入調整分錄。
+// 呼叫者：後台、排程（每日拉取 PSP 結算檔）、api-gateway（Phase 2 開放商戶查看對帳結果）。
+syntax = "proto3";
+
+package pg.reconciliation.v1;
+
+import "google/protobuf/timestamp.proto";
+import "pg/common/v1/money.proto";
+import "pg/common/v1/pagination.proto";
+
+option go_package = "github.com/tenghongzou/paymentgateway/api/gen/go/pg/reconciliation/v1;reconciliationv1";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// ReconciliationService 管理對帳執行與差異處理。
+service ReconciliationService {
+  // 匯入結算檔並啟動一次對帳執行（非同步；回傳 run 後以 GetReconciliationRun 輪詢）。
+  // Client streaming：第一則訊息必須是 metadata；之後為 chunk（每則 <= 1MB）。
+  // 若 metadata.source_url 有值，則不需後續 chunk（服務端自行下載，支援 https:// 與 s3://）。
+  // 冪等：以 (provider, file_checksum) 唯一；同一檔案重複匯入回傳既有 run（already_imported=true）。
+  // 錯誤：INVALID_ARGUMENT（未知 provider / 格式）、RESOURCE_EXHAUSTED（檔案 > 512MB）。
+  rpc ImportSettlementFile(stream ImportSettlementFileRequest) returns (ImportSettlementFileResponse);
+
+  // 取得對帳執行（含摘要）。
+  rpc GetReconciliationRun(GetReconciliationRunRequest) returns (GetReconciliationRunResponse);
+
+  // 列出對帳執行，可依供應商 / 狀態 / 結算日篩選；依 started_at DESC 排序。
+  rpc ListReconciliationRuns(ListReconciliationRunsRequest) returns (ListReconciliationRunsResponse);
+
+  // 列出差異，可依 run / 商戶 / 類型 / 狀態篩選。
+  rpc ListDiscrepancies(ListDiscrepanciesRequest) returns (ListDiscrepanciesResponse);
+
+  // 處理差異：標記為已解決 / 忽略，並可選擇產生調整分錄（透過 LedgerService.PostJournal）。
+  // 前置狀態：OPEN 或 INVESTIGATING。冪等：以 idempotency_key。
+  rpc ResolveDiscrepancy(ResolveDiscrepancyRequest) returns (ResolveDiscrepancyResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// RunStatus 為對帳執行狀態。
+enum RunStatus {
+  RUN_STATUS_UNSPECIFIED = 0;
+  // 已建立，等待處理。
+  RUN_STATUS_PENDING = 1;
+  // 解析與比對中。
+  RUN_STATUS_RUNNING = 2;
+  // 完成（可能有差異）。
+  RUN_STATUS_COMPLETED = 3;
+  // 執行失敗（檔案格式錯誤、下載失敗）；見 error_message。
+  RUN_STATUS_FAILED = 4;
+}
+
+// SettlementFileFormat 為結算檔格式。
+enum SettlementFileFormat {
+  SETTLEMENT_FILE_FORMAT_UNSPECIFIED = 0;
+  // CSV（各 PSP 欄位不同，由 provider 專屬 parser 處理）。
+  SETTLEMENT_FILE_FORMAT_CSV = 1;
+  // JSON Lines。
+  SETTLEMENT_FILE_FORMAT_JSONL = 2;
+  // Stripe Balance Transactions 報表（CSV 變體）。
+  SETTLEMENT_FILE_FORMAT_STRIPE_BALANCE_REPORT = 3;
+  // Adyen Settlement Detail Report（CSV 變體）。
+  SETTLEMENT_FILE_FORMAT_ADYEN_SETTLEMENT_DETAIL = 4;
+}
+
+// DiscrepancyType 為差異類型。
+enum DiscrepancyType {
+  DISCREPANCY_TYPE_UNSPECIFIED = 0;
+  // 結算檔有、我方無此交易（可能漏收 webhook 或 PSP 重複結算）。
+  DISCREPANCY_TYPE_MISSING_IN_LEDGER = 1;
+  // 我方有已請款 / 已退款紀錄，結算檔無（可能 PSP 延遲結算或我方狀態錯誤）。
+  DISCREPANCY_TYPE_MISSING_IN_SETTLEMENT = 2;
+  // 交易金額不符。
+  DISCREPANCY_TYPE_AMOUNT_MISMATCH = 3;
+  // 手續費不符（最常見：PSP 未同步提供 fee，記帳時以 0 暫記）。
+  DISCREPANCY_TYPE_FEE_MISMATCH = 4;
+  // 狀態不符（例：我方 captured、PSP 顯示 refunded）。
+  DISCREPANCY_TYPE_STATUS_MISMATCH = 5;
+  // 幣別不符。
+  DISCREPANCY_TYPE_CURRENCY_MISMATCH = 6;
+  // 結算檔內同一參照重複出現。
+  DISCREPANCY_TYPE_DUPLICATE_IN_SETTLEMENT = 7;
+}
+
+// DiscrepancyStatus 為差異處理狀態。
+enum DiscrepancyStatus {
+  DISCREPANCY_STATUS_UNSPECIFIED = 0;
+  // 待處理。
+  DISCREPANCY_STATUS_OPEN = 1;
+  // 調查中（已指派）。
+  DISCREPANCY_STATUS_INVESTIGATING = 2;
+  // 已解決（含調整分錄）。
+  DISCREPANCY_STATUS_RESOLVED = 3;
+  // 忽略（確認為非問題，例：PSP 延遲一天結算，下次 run 自動關閉）。
+  DISCREPANCY_STATUS_IGNORED = 4;
+  // 自動關閉（後續 run 中已對上）。
+  DISCREPANCY_STATUS_AUTO_CLOSED = 5;
+}
+
+// ResolutionAction 為處理差異的動作。
+enum ResolutionAction {
+  RESOLUTION_ACTION_UNSPECIFIED = 0;
+  // 標記解決，不產生分錄（例：已人工在 PSP 後台修正）。
+  RESOLUTION_ACTION_MARK_RESOLVED = 1;
+  // 以結算檔為準，產生調整分錄（fee 差異最常用）。
+  RESOLUTION_ACTION_ADJUST_LEDGER = 2;
+  // 忽略。
+  RESOLUTION_ACTION_IGNORE = 3;
+  // 觸發 payment-service 向 PSP 重新查詢狀態（GetPaymentStatus）後再比對。
+  RESOLUTION_ACTION_RESYNC_PAYMENT = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Domain messages
+// ---------------------------------------------------------------------------
+
+// RunSummary 為對帳執行摘要。
+message RunSummary {
+  // 結算檔總筆數。
+  int64 total_records = 1;
+  // 完全對上的筆數。
+  int64 matched = 2;
+  // 產生差異的筆數。
+  int64 discrepancies = 3;
+  // 各類型差異數量（key 為 DiscrepancyType 名稱）。
+  map<string, int64> discrepancies_by_type = 4;
+  // 結算檔總結算金額（扣除手續費後，可能多幣別，故為 repeated）。
+  repeated pg.common.v1.Money total_settled = 5;
+  // 結算檔總手續費。
+  repeated pg.common.v1.Money total_fees = 6;
+  // 結算檔總退款金額。
+  repeated pg.common.v1.Money total_refunds = 7;
+  // 結算檔總拒付金額。
+  repeated pg.common.v1.Money total_chargebacks = 8;
+  // 自動產生的調整分錄數（fee 差異在閾值內自動調整）。
+  int64 auto_adjustments = 9;
+}
+
+// ReconciliationRun 為一次對帳執行。
+message ReconciliationRun {
+  // run ID，格式 rcn_ + ULID。
+  string id = 1;
+  // 供應商。
+  string provider = 2;
+  // 結算日（PSP 報表涵蓋日期，YYYY-MM-DD）。
+  string settlement_date = 3;
+  // 原始檔名。
+  string file_name = 4;
+  // 檔案格式。
+  SettlementFileFormat file_format = 5;
+  // 檔案 SHA-256（hex），冪等依據。
+  string file_checksum = 6;
+  // 檔案大小（bytes）。
+  int64 file_size_bytes = 7;
+  // 狀態。
+  RunStatus status = 8;
+  // 摘要（COMPLETED 時完整；RUNNING 時為進度）。
+  RunSummary summary = 9;
+  // 失敗原因（FAILED 時）。
+  string error_message = 10;
+  // 觸發者：scheduler | user:<id> | api。
+  string triggered_by = 11;
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp started_at = 13;
+  google.protobuf.Timestamp finished_at = 14;
+}
+
+// SettlementRecord 為結算檔中一筆紀錄的正規化表示（差異附帶，方便檢視）。
+message SettlementRecord {
+  // 結算檔中的列號。
+  int64 line_number = 1;
+  // PSP 交易參照。
+  string provider_reference = 2;
+  // PSP 紀錄類型：charge | refund | chargeback | chargeback_reversal | fee | adjustment | payout。
+  string record_type = 3;
+  // 毛額。
+  pg.common.v1.Money gross_amount = 4;
+  // 手續費。
+  pg.common.v1.Money fee = 5;
+  // 淨額。
+  pg.common.v1.Money net_amount = 6;
+  // PSP 端交易時間。
+  google.protobuf.Timestamp transaction_at = 7;
+  // PSP 端結算時間。
+  google.protobuf.Timestamp settled_at = 8;
+  // 原始欄位（key=欄名），供人工檢視。
+  map<string, string> raw_fields = 9;
+}
+
+// Discrepancy 為一筆差異。
+message Discrepancy {
+  // 差異 ID，格式 dsc_ + ULID。
+  string id = 1;
+  // 所屬 run。
+  string run_id = 2;
+  // 供應商。
+  string provider = 3;
+  // 類型。
+  DiscrepancyType type = 4;
+  // 狀態。
+  DiscrepancyStatus status = 5;
+  // 商戶（可反查時）。
+  string merchant_id = 6;
+  // PSP 交易參照。
+  string provider_reference = 7;
+  // 我方付款 ID（可反查時）。
+  string payment_id = 8;
+  // 我方退款 ID（退款差異時）。
+  string refund_id = 9;
+  // 我方爭議 ID（拒付差異時）。
+  string dispute_id = 10;
+  // 我方預期值（來自 ledger / payment）。
+  pg.common.v1.Money expected_amount = 11;
+  // 結算檔實際值。
+  pg.common.v1.Money actual_amount = 12;
+  // 差額 = actual - expected（可為負；以 expected 幣別表示）。
+  pg.common.v1.Money difference = 13;
+  // 我方紀錄狀態（STATUS_MISMATCH 時）。
+  string expected_status = 14;
+  // 結算檔狀態（STATUS_MISMATCH 時）。
+  string actual_status = 15;
+  // 結算檔原始紀錄。
+  SettlementRecord settlement_record = 16;
+  // 系統說明。
+  string description = 17;
+  // 處理動作。
+  ResolutionAction resolution_action = 18;
+  // 處理備註。
+  string resolution_note = 19;
+  // 處理者。
+  string resolved_by = 20;
+  // 產生的調整 journal id（ADJUST_LEDGER 時）。
+  string adjustment_journal_id = 21;
+  google.protobuf.Timestamp created_at = 22;
+  google.protobuf.Timestamp resolved_at = 23;
+}
+
+// ---------------------------------------------------------------------------
+// RPC messages
+// ---------------------------------------------------------------------------
+
+// ImportMetadata 為匯入的中繼資料（stream 第一則訊息）。
+message ImportMetadata {
+  // 供應商。必填。
+  string provider = 1;
+  // 檔案格式。必填。
+  SettlementFileFormat file_format = 2;
+  // 原始檔名。必填。
+  string file_name = 3;
+  // 結算日 YYYY-MM-DD。必填。
+  string settlement_date = 4;
+  // 若提供，服務端自行下載，不需後續 chunk。支援 https:// 與 s3://。
+  string source_url = 5;
+  // 預期 SHA-256（hex），可選；提供時服務端會驗證。
+  string expected_checksum = 6;
+  // 觸發者。
+  string triggered_by = 7;
+  // 冪等鍵（可選；未提供則以 file_checksum 判斷）。
+  string idempotency_key = 8;
+}
+
+// ImportSettlementFileRequest 為 stream 中的一則訊息（二選一）。
+message ImportSettlementFileRequest {
+  oneof payload {
+    // 第一則訊息。
+    ImportMetadata metadata = 1;
+    // 檔案內容片段（<= 1MB）。
+    bytes chunk = 2;
+  }
+}
+
+// ImportSettlementFileResponse 回傳建立的 run。
+message ImportSettlementFileResponse {
+  ReconciliationRun run = 1;
+  // true 表示同一檔案先前已匯入，回傳既有 run。
+  bool already_imported = 2;
+}
+
+// GetReconciliationRunRequest 查詢 run。
+message GetReconciliationRunRequest {
+  string run_id = 1;
+}
+
+// GetReconciliationRunResponse 回傳 run。
+message GetReconciliationRunResponse {
+  ReconciliationRun run = 1;
+}
+
+// ListReconciliationRunsRequest 列出 run。
+message ListReconciliationRunsRequest {
+  pg.common.v1.PageRequest page = 1;
+  string provider = 2;
+  repeated RunStatus statuses = 3;
+  // 結算日下限（含），YYYY-MM-DD。
+  string settlement_date_from = 4;
+  // 結算日上限（含）。
+  string settlement_date_to = 5;
+}
+
+// ListReconciliationRunsResponse 列表結果。
+message ListReconciliationRunsResponse {
+  repeated ReconciliationRun runs = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// ListDiscrepanciesRequest 列出差異。
+message ListDiscrepanciesRequest {
+  pg.common.v1.PageRequest page = 1;
+  string run_id = 2;
+  string merchant_id = 3;
+  string provider = 4;
+  repeated DiscrepancyType types = 5;
+  repeated DiscrepancyStatus statuses = 6;
+  string payment_id = 7;
+  google.protobuf.Timestamp created_after = 8;
+  google.protobuf.Timestamp created_before = 9;
+}
+
+// ListDiscrepanciesResponse 列表結果。
+message ListDiscrepanciesResponse {
+  repeated Discrepancy discrepancies = 1;
+  pg.common.v1.PageResponse page = 2;
+}
+
+// ResolveDiscrepancyRequest 處理差異。
+message ResolveDiscrepancyRequest {
+  string discrepancy_id = 1;
+  // 冪等鍵。必填。
+  string idempotency_key = 2;
+  // 動作。必填。
+  ResolutionAction action = 3;
+  // 備註（稽核用）。ADJUST_LEDGER 與 IGNORE 必填。
+  string note = 4;
+  // 處理者識別（user id / service）。必填。
+  string resolved_by = 5;
+  // ADJUST_LEDGER 時可覆寫調整金額（預設使用 difference）。
+  pg.common.v1.Money adjustment_amount = 6;
+}
+
+// ResolveDiscrepancyResponse 回傳更新後差異。
+message ResolveDiscrepancyResponse {
+  Discrepancy discrepancy = 1;
+}

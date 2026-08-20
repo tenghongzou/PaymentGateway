@@ -1,0 +1,323 @@
+# Default values for the paymentgateway chart.
+# Per-environment overrides: values-staging.yaml / values-production.yaml.
+#
+# Architecture reference: docs/01-architecture.md. Every service is rendered from `.Values.services`
+# merged on top of `.Values.serviceDefaults` (mergeOverwrite), so you only specify deltas per service.
+
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  env: production                 # PG_ENV
+  logLevel: info                  # PG_LOG_LEVEL
+  imageRegistry: ghcr.io/tenghongzou
+  imagePullPolicy: IfNotPresent
+  imageTag: ""                    # defaults to .Chart.AppVersion; release.yaml sets this to the git tag
+  imagePullSecrets: []
+  #  - name: ghcr-pull-secret
+
+  # PG_AUTO_MIGRATE: run migrations at service start-up. Keep false in production and rely on the
+  # pre-upgrade migration Job (templates/migration-job.yaml) instead.
+  autoMigrate: false
+  migrationsDir: /migrations
+
+  # Managed infrastructure (RDS / ElastiCache / MSK / Aiven ...). Credentials never live here:
+  # PG_DATABASE_URL and friends are delivered by ExternalSecrets (see externalSecrets below).
+  postgres:
+    host: ""                      # informational / used by NOTES.txt
+    port: 5432
+    cidrs: []                     # NetworkPolicy egress targets, e.g. ["10.20.0.0/16"]; empty => any destination on the port
+  redis:
+    addr: ""                      # PG_REDIS_ADDR, e.g. master.pg-redis.xxxx.apne1.cache.amazonaws.com:6379
+    port: 6379
+    cidrs: []
+  kafka:
+    brokers: ""                   # PG_KAFKA_BROKERS, comma separated
+    ports: [9092, 9094, 9096]     # plaintext / TLS / SASL listeners
+    cidrs: []
+  otel:
+    endpoint: otel-collector.observability.svc.cluster.local:4317   # PG_OTEL_EXPORTER_OTLP_ENDPOINT
+    insecure: true
+    namespace: observability      # NetworkPolicy: egress to collector pods in this namespace
+    ports: [4317, 4318]
+  monitoring:
+    namespace: monitoring         # NetworkPolicy: allow Prometheus scrapes from this namespace
+  ingressController:
+    namespace: ingress-nginx      # NetworkPolicy: allow controller -> api-gateway
+
+  # Extra PG_* env applied to every service (plain values, rendered into the ConfigMap)
+  extraEnv: {}
+
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    privileged: false
+    capabilities:
+      drop: ["ALL"]
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Spread replicas across zones/nodes. Set whenUnsatisfiable: DoNotSchedule in production.
+  topologySpread:
+    enabled: true
+    whenUnsatisfiable: ScheduleAnyway
+    maxSkew: 1
+
+externalSecrets:
+  enabled: true
+  apiVersion: external-secrets.io/v1
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  # Vault KV-v2 layout (keys inside each path are the exact env var names, e.g. PG_DATABASE_URL):
+  #   <pathPrefix>/<env>/common             -> shared (PG_REDIS_PASSWORD, PG_KAFKA_SASL_*)
+  #   <pathPrefix>/<env>/<service-name>     -> service specific:
+  #        PG_DATABASE_URL          (<svc>_app role, DML only - used by the running service)
+  #        PG_MIGRATE_DATABASE_URL  (<svc>_owner role, DDL - used by the migration Job; optional)
+  #        PG_STRIPE_API_KEY ...
+  pathPrefix: paymentgateway
+  commonKey: common
+
+networkPolicy:
+  enabled: true
+  # Extra CIDRs every pod may reach on 443 (e.g. Vault, object storage VPC endpoints)
+  extraEgressCidrs443: []
+
+migrations:
+  enabled: true
+  # pre-upgrade only by default: on a fresh install the ExternalSecret-backed Secret does not exist
+  # before hooks run. For first install use global.autoMigrate=true or deploy/k8s/migrations-job.yaml.
+  hooks: pre-upgrade
+  hookWeight: "-5"
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  # Contract with the service binary: `/app migrate up` applies /migrations/<short-name> using PG_DATABASE_URL.
+  command: ["/app"]
+  args: ["migrate", "up"]
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+
+# ---------------------------------------------------------------------------
+# Defaults applied to every entry of .Values.services
+# ---------------------------------------------------------------------------
+serviceDefaults:
+  enabled: true
+  replicas: 2
+  httpPort: 8081                  # PG_HTTP_ADDR  (/healthz, /readyz, /metrics)
+  grpcPort: null                  # PG_GRPC_ADDR  (null => HTTP-only service)
+  database: null                  # database name => service owns a DB (migration job, postgres egress)
+  providerKey: null               # e.g. "stripe" => included in PG_PROVIDER_ADDRS, excluded from PG_<SVC>_ADDR
+  migrationsName: null            # override of the migrations/<short-name> directory (default: name minus "-service")
+  image:
+    repository: ""                # default: paymentgateway/<service-name>
+    tag: ""                       # default: global.imageTag or Chart.appVersion
+  args: []
+  env: {}                         # extra PG_* for this service (plain values)
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { memory: 512Mi }
+  strategy:
+    maxSurge: 25%
+    maxUnavailable: 0
+  terminationGracePeriodSeconds: 30
+  probes:
+    startup:
+      path: /healthz
+      periodSeconds: 5
+      failureThreshold: 24        # 2 minutes (covers PG_AUTO_MIGRATE on staging)
+    liveness:
+      path: /healthz
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    readiness:
+      path: /readyz
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 3
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: null
+    customMetrics: []             # raw autoscaling/v2 metric specs (e.g. Kafka lag via KEDA/prometheus-adapter)
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 30
+  pdb:
+    enabled: true
+    minAvailable: 1
+    maxUnavailable: null
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}               # e.g. eks.amazonaws.com/role-arn for IRSA
+  service:
+    type: ClusterIP
+    annotations: {}
+  ingress:
+    enabled: false
+  externalSecret:
+    enabled: true
+    extraData: []                 # additional ESO `data` entries
+  networkPolicy:
+    ingressFrom: ["api-gateway"]  # services allowed to call this service's gRPC port
+    internetEgress: false         # allow egress 443 to public internet (PSP APIs, merchant webhooks)
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraVolumes: []
+  extraVolumeMounts: []
+
+# ---------------------------------------------------------------------------
+# Services (ports from docs/01-architecture.md section 4.1)
+# ---------------------------------------------------------------------------
+services:
+  api-gateway:
+    httpPort: 8080
+    replicas: 3
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { memory: 1Gi }
+    hpa:
+      minReplicas: 3
+      maxReplicas: 30
+      targetCPUUtilizationPercentage: 60
+    pdb:
+      minAvailable: 2
+    env:
+      PG_RATE_LIMIT_RPS: "100"
+      PG_IDEMPOTENCY_TTL: "24h"
+    networkPolicy:
+      ingressFrom: []
+    ingress:
+      enabled: true
+      className: nginx
+      hosts:
+        - api.paymentgateway.example.com
+      paths:
+        - /
+      tls:
+        enabled: true
+        secretName: api-paymentgateway-tls
+      rateLimit:
+        rps: 200                  # per client IP, enforced at the edge (merchant-level limiting lives in the gateway)
+        connections: 100
+        burstMultiplier: 3
+      annotations:
+        cert-manager.io/cluster-issuer: letsencrypt-prod
+        nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        nginx.ingress.kubernetes.io/proxy-body-size: 1m
+        nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+        nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+        nginx.ingress.kubernetes.io/enable-cors: "false"
+        nginx.ingress.kubernetes.io/server-snippet: |
+          more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains";
+          more_set_headers "X-Content-Type-Options: nosniff";
+
+  merchant-service:
+    grpcPort: 9001
+    database: pg_merchant
+    networkPolicy:
+      ingressFrom: ["api-gateway", "payment-service", "webhook-service"]
+
+  payment-service:
+    grpcPort: 9002
+    database: pg_payment
+    replicas: 3
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { memory: 1Gi }
+    hpa:
+      minReplicas: 3
+      maxReplicas: 30
+    pdb:
+      minAvailable: 2
+    env:
+      PG_PROVIDER_TIMEOUT: "10s"
+      PG_PROVIDER_FAILOVER_MAX_ATTEMPTS: "2"
+    networkPolicy:
+      ingressFrom: ["api-gateway", "reconciliation-service"]
+
+  ledger-service:
+    grpcPort: 9003
+    database: pg_ledger
+    env:
+      PG_KAFKA_CONSUMER_GROUP: ledger-service
+    hpa:
+      maxReplicas: 12             # bounded by Kafka partition count of payment.events
+    networkPolicy:
+      ingressFrom: ["api-gateway", "reconciliation-service"]
+
+  webhook-service:
+    grpcPort: 9004
+    database: pg_webhook
+    env:
+      PG_KAFKA_CONSUMER_GROUP: webhook-service
+      PG_WEBHOOK_MAX_ATTEMPTS: "10"
+      PG_WEBHOOK_TIMEOUT: "10s"
+    networkPolicy:
+      ingressFrom: ["api-gateway"]
+      internetEgress: true        # merchant webhook endpoints
+
+  reconciliation-service:
+    grpcPort: 9005
+    database: pg_recon
+    replicas: 1
+    hpa:
+      enabled: false              # batch importer; single active instance with DB advisory lock
+    pdb:
+      enabled: false
+    env:
+      PG_KAFKA_CONSUMER_GROUP: reconciliation-service
+    networkPolicy:
+      ingressFrom: ["api-gateway"]
+      internetEgress: true        # PSP settlement file download (SFTP/HTTPS), object storage
+
+  provider-mock:
+    grpcPort: 9101
+    providerKey: mock
+    replicas: 1
+    hpa:
+      enabled: false
+    pdb:
+      enabled: false
+    externalSecret:
+      enabled: false
+    env:
+      PG_MOCK_DEFAULT_LATENCY: "50ms"
+      PG_MOCK_FAILURE_RATE: "0"
+    networkPolicy:
+      ingressFrom: ["payment-service"]
+
+  provider-stripe:
+    grpcPort: 9102
+    providerKey: stripe
+    env:
+      PG_STRIPE_API_BASE_URL: https://api.stripe.com
+    networkPolicy:
+      ingressFrom: ["payment-service"]
+      internetEgress: true        # api.stripe.com
