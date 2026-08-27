@@ -177,7 +177,8 @@ func TestCreateAndVerifyApiKey(t *testing.T) {
 	assert.Equal(t, []string{app.EventAPIKeyCreated}, f.mem.OutboxTypes())
 	var env app.EventEnvelope
 	require.NoError(t, json.Unmarshal(f.mem.Outbox()[0].Payload, &env))
-	raw, _ := json.Marshal(env.Data)
+	raw, err := json.Marshal(env.Data)
+	require.NoError(t, err)
 	assert.NotContains(t, string(raw), out.Plaintext[16:], "事件不含明文")
 	assert.NotContains(t, string(raw), "sk_test_", "事件不含 secret")
 
@@ -269,7 +270,8 @@ func TestVerifyApiKeyRevokedExpiredAndMerchantStatus(t *testing.T) {
 	assert.Equal(t, []string{app.EventAPIKeyRevoked}, f.mem.OutboxTypes())
 	var env app.EventEnvelope
 	require.NoError(t, json.Unmarshal(f.mem.Outbox()[0].Payload, &env))
-	data, _ := json.Marshal(env.Data)
+	data, err := json.Marshal(env.Data)
+	require.NoError(t, err)
 	assert.Contains(t, string(data), `"reason":"leaked"`)
 	assert.Contains(t, string(data), `"status":"revoked"`)
 	k2, err := f.svc.RevokeApiKey(ctx, m.PublicID(), stable.Key.PublicID(), "again")

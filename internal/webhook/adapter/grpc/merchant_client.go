@@ -117,6 +117,9 @@ func (m *MerchantEndpointSource) toDomain(pe *merchantv1.WebhookEndpoint, mercha
 
 func endpointStatus(s merchantv1.WebhookEndpointStatus) domain.EndpointStatus {
 	switch s {
+	case merchantv1.WebhookEndpointStatus_WEBHOOK_ENDPOINT_STATUS_UNSPECIFIED:
+		// 未指定視同停用（不投遞），與 default 一致。
+		return domain.EndpointDisabled
 	case merchantv1.WebhookEndpointStatus_WEBHOOK_ENDPOINT_STATUS_ENABLED:
 		return domain.EndpointEnabled
 	case merchantv1.WebhookEndpointStatus_WEBHOOK_ENDPOINT_STATUS_DISABLED:

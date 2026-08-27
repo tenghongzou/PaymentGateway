@@ -127,9 +127,9 @@ func setup(ctx context.Context, rt *pkgapp.Runtime, cfg Config) (*pkgapp.Hooks, 
 	)
 	switch {
 	case cfg.MerchantServiceAddr != "":
-		conn, err := grpcx.Dial(ctx, cfg.MerchantServiceAddr)
-		if err != nil {
-			return nil, err
+		conn, dialErr := grpcx.Dial(ctx, cfg.MerchantServiceAddr)
+		if dialErr != nil {
+			return nil, dialErr
 		}
 		hooks.Closers = append(hooks.Closers, pkgapp.Closer{Name: "merchant-service conn", Close: func(context.Context) error { return conn.Close() }})
 		ms := grpcadapter.NewMerchantEndpointSource(conn, nil)

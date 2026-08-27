@@ -20,7 +20,7 @@ func TestChartOfAccounts_TenKinds(t *testing.T) {
 		switch s.Type {
 		case AccountTypeAsset, AccountTypeExpense:
 			assert.Equal(t, NormalDebit, s.Type.NormalBalance(), s.Kind)
-		default:
+		case AccountTypeLiability, AccountTypeRevenue:
 			assert.Equal(t, NormalCredit, s.Type.NormalBalance(), s.Kind)
 		}
 	}

@@ -42,9 +42,7 @@ func (r *LineRepo) InsertBatch(ctx context.Context, lines []domain.SettlementLin
 			l.ID, l.FileID, l.LineNo, l.Provider, l.ProviderReference, l.MerchantReference,
 			string(l.Type), l.Amount.AmountMinor, l.Amount.Currency, l.SettledAt, raw, l.CreatedAt)
 	}
-	res := q(ctx, r.pool).(interface {
-		SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
-	}).SendBatch(ctx, batch)
+	res := q(ctx, r.pool).SendBatch(ctx, batch)
 	defer res.Close()
 	for range lines {
 		if _, err := res.Exec(); err != nil {
@@ -81,7 +79,9 @@ func (r *LineRepo) ListByFile(ctx context.Context, fileID uuid.UUID) ([]domain.S
 		l.Amount = money.Money{AmountMinor: amount, Currency: currency}
 		var env rawEnvelope
 		if len(raw) > 0 {
-			_ = json.Unmarshal(raw, &env)
+			if err := json.Unmarshal(raw, &env); err != nil {
+				return nil, fmt.Errorf("postgres: unmarshal settlement_line raw: %w", err)
+			}
 		}
 		l.Fee = money.Money{AmountMinor: env.FeeMinor, Currency: currency}
 		l.Raw = env.Fields

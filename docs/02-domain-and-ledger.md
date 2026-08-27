@@ -22,14 +22,14 @@
 | `mch_` | Merchant | `mch_01J5X1Y2Z3A4B5C6D7E8F9G0H1` |
 | `pay_` | Payment | |
 | `att_` | PaymentAttempt | |
-| `ref_` | Refund | |
-| `dsp_` | Dispute | |
+| `re_` | Refund | |
+| `dp_` | Dispute | |
 | `acct_` | Ledger Account | |
 | `jrn_` | Journal | |
 | `ent_` | Entry | |
 | `stl_` | SettlementBatch | |
 | `evt_` | 領域事件 / outbox event | |
-| `whe_` | WebhookEndpoint | |
+| `we_` | WebhookEndpoint | |
 | `whd_` | WebhookDelivery | |
 | `key_` | ApiKey（內部 id，非 key 本身） | |
 
@@ -835,4 +835,4 @@ adapter 映射表（以 `provider-stripe` 為例，位於 `internal/provider-str
 
 ## 附錄 B：對商戶的 Webhook 事件型別
 
-`payment.requires_action`、`payment.authorized`、`payment.captured`、`payment.failed`、`payment.voided`、`payment.expired`、`refund.succeeded`、`refund.failed`、`dispute.opened`、`dispute.evidence_due_soon`、`dispute.won`、`dispute.lost`、`balance.updated`（每日彙總）。`payment.created` 與 `refund.pending` 不推送（商戶自己發起，已從 API 回應得知）。
+共 14 種（與 OpenAPI `EventType` 及 `docs/03-api.md` §5.1 一致，全部推送給商戶）：`payment.created`、`payment.requires_action`、`payment.authorized`、`payment.captured`、`payment.voided`、`payment.failed`、`payment.expired`、`refund.created`、`refund.succeeded`、`refund.failed`、`dispute.opened`、`dispute.evidence_submitted`、`dispute.won`、`dispute.lost`。

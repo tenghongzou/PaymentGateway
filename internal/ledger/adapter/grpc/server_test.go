@@ -138,7 +138,10 @@ func (r memBalances) ListByMerchant(ctx context.Context, merchantID uuid.UUID, c
 	var out []*domain.Balance
 	for key, a := range r.m.accounts {
 		if key.MerchantID == merchantID && key.Livemode == livemode && (currency == "" || key.Currency == currency) {
-			b, _ := r.GetByAccount(ctx, a.ID)
+			b, err := r.GetByAccount(ctx, a.ID)
+			if err != nil {
+				return nil, err
+			}
 			out = append(out, b)
 		}
 	}
@@ -167,7 +170,12 @@ func startServer(t *testing.T) (ledgerv1.LedgerServiceClient, *memStore) {
 	srv, _ := grpcx.NewServer(grpcx.ServerOptions{Logger: slog.New(slog.DiscardHandler)})
 	NewServer(svc).Register(srv)
 	lis := bufconn.Listen(1 << 20)
-	go func() { _ = srv.Serve(lis) }()
+	go func() {
+		// Stop() 後 Serve 回 nil；非 nil 代表 server 起不來，直接讓測試炸掉。
+		if err := srv.Serve(lis); err != nil {
+			panic("ledger grpc test server: " + err.Error())
+		}
+	}()
 	t.Cleanup(srv.Stop)
 	conn, err := grpc.NewClient("passthrough:///bufconn",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),

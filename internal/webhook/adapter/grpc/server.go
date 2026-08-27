@@ -46,16 +46,16 @@ func (s *Server) ListDeliveries(ctx context.Context, req *webhookv1.ListDeliveri
 		PageToken:  req.GetPage().GetPageToken(),
 	}
 	if v := req.GetEndpointId(); v != "" {
-		id, err := parseRequired(v, "endpoint_id", domain.ParseEndpointID)
-		if err != nil {
-			return nil, err
+		id, perr := parseRequired(v, "endpoint_id", domain.ParseEndpointID)
+		if perr != nil {
+			return nil, perr
 		}
 		f.EndpointID = &id
 	}
 	if v := req.GetEventId(); v != "" {
-		id, err := parseRequired(v, "event_id", domain.ParseEventID)
-		if err != nil {
-			return nil, err
+		id, perr := parseRequired(v, "event_id", domain.ParseEventID)
+		if perr != nil {
+			return nil, perr
 		}
 		f.EventID = &id
 	}
@@ -181,6 +181,8 @@ func parseMerchantAndDelivery(merchant, delivery string) (uuid.UUID, uuid.UUID, 
 
 func statusFromProto(s webhookv1.DeliveryStatus) (domain.DeliveryStatus, bool) {
 	switch s {
+	case webhookv1.DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED:
+		return "", false
 	case webhookv1.DeliveryStatus_DELIVERY_STATUS_PENDING:
 		return domain.StatusPending, true
 	case webhookv1.DeliveryStatus_DELIVERY_STATUS_IN_FLIGHT:
@@ -234,7 +236,7 @@ func toProto(d *domain.Delivery, endpointURL string, atts []*domain.Attempt, inc
 		EventId:         domain.EventPublicID(d.EventID),
 		EventType:       d.EventType,
 		Status:          statusToProto(d.Status),
-		AttemptCount:    int32(d.AttemptNo),
+		AttemptCount:    int32(d.AttemptNo), //nolint:gosec // attempt_no ≤ MaxAttempts (10)
 		MaxAttempts:     domain.MaxAttempts,
 		LastAttemptedAt: tsPtr(d.LastAttemptAt),
 		Livemode:        d.Livemode,
@@ -249,7 +251,7 @@ func toProto(d *domain.Delivery, endpointURL string, atts []*domain.Attempt, inc
 		out.DeadLetteredAt = timestamppb.New(d.UpdatedAt)
 	}
 	if d.LastResponseStatus != nil {
-		out.LastResponseStatus = int32(*d.LastResponseStatus)
+		out.LastResponseStatus = int32(*d.LastResponseStatus) //nolint:gosec // HTTP 狀態碼 ≤ 599
 	}
 	if d.LastError != nil {
 		out.LastError = *d.LastError
@@ -259,13 +261,13 @@ func toProto(d *domain.Delivery, endpointURL string, atts []*domain.Attempt, inc
 	}
 	for _, a := range atts {
 		pa := &webhookv1.DeliveryAttempt{
-			AttemptNumber: int32(a.AttemptNo),
+			AttemptNumber: int32(a.AttemptNo), //nolint:gosec // attempt_no ≤ MaxAttempts (10)
 			AttemptedAt:   timestamppb.New(a.AttemptedAt),
 			DurationMs:    int64(a.DurationMS),
 			Succeeded:     a.Succeeded(),
 		}
 		if a.ResponseStatus != nil {
-			pa.ResponseStatus = int32(*a.ResponseStatus)
+			pa.ResponseStatus = int32(*a.ResponseStatus) //nolint:gosec // HTTP 狀態碼 ≤ 599
 		}
 		if a.ResponseBody != nil {
 			// proto 註解：回應 body 前 1KB。

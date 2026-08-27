@@ -56,10 +56,10 @@ func startPostgres(t *testing.T) *pgxpool.Pool {
 
 func twd(n int64) money.Money { return money.Money{AmountMinor: n, Currency: "TWD"} }
 
-func newService(pool *pgxpool.Pool, pol domain.Policy) *app.Service {
+func newService(pool *pgxpool.Pool) *app.Service {
 	return app.NewService(app.Deps{
 		Tx: NewTxRunner(pool), Accounts: NewAccountRepo(pool), Journals: NewJournalRepo(pool), Balances: NewBalanceRepo(pool),
-		Inbox: NewInbox(), Outbox: NewOutboxStore(), Logger: slog.New(slog.DiscardHandler), Policy: pol,
+		Inbox: NewInbox(), Outbox: NewOutboxStore(), Logger: slog.New(slog.DiscardHandler), Policy: domain.Policy{},
 	})
 }
 
@@ -70,10 +70,10 @@ func captureEvent(m uuid.UUID, amount, fee int64) domain.PaymentEvent {
 	}
 }
 
-func count(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int64 {
+func count(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int64 {
 	t.Helper()
 	var n int64
-	require.NoError(t, pool.QueryRow(context.Background(), sql, args...).Scan(&n))
+	require.NoError(t, pool.QueryRow(ctx, sql, args...).Scan(&n))
 	return n
 }
 
@@ -82,7 +82,7 @@ func TestIntegration(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("PostJournal creates accounts, entries, balances and outbox", func(t *testing.T) {
-		svc := newService(pool, domain.Policy{})
+		svc := newService(pool)
 		m := uuid.New()
 		j, err := domain.TemplateFor(captureEvent(m, 1000, 33), domain.Policy{})
 		require.NoError(t, err)
@@ -120,14 +120,14 @@ func TestIntegration(t *testing.T) {
 		assert.Equal(t, int64(967), mbs[0].Available)
 
 		// outbox
-		assert.Equal(t, int64(1), count(t, pool, `SELECT count(*) FROM outbox WHERE event_type = $1 AND aggregate_id = $2`, app.EventJournalPosted, app.MerchantPublicID(m)))
+		assert.Equal(t, int64(1), count(ctx, t, pool, `SELECT count(*) FROM outbox WHERE event_type = $1 AND aggregate_id = $2`, app.EventJournalPosted, app.MerchantPublicID(m)))
 
 		// P6：同一 event_id 重放
 		again, replayed, err := svc.PostJournal(ctx, captureJournalWithEvent(t, m, j.EventID))
 		require.NoError(t, err)
 		assert.True(t, replayed)
 		assert.Equal(t, posted.ID, again.ID)
-		assert.Equal(t, int64(1), count(t, pool, `SELECT count(*) FROM journals WHERE event_id = $1`, j.EventID))
+		assert.Equal(t, int64(1), count(ctx, t, pool, `SELECT count(*) FROM journals WHERE event_id = $1`, j.EventID))
 		b, err = svc.GetBalance(ctx, mp.ID)
 		require.NoError(t, err)
 		assert.Equal(t, int64(967), b.Balance)
@@ -156,10 +156,10 @@ func TestIntegration(t *testing.T) {
 			return journals.Insert(ctx, j)
 		})
 		require.Error(t, err)
-		assert.ErrorIs(t, err, domain.ErrJournalUnbalanced)
-		assert.Equal(t, int64(0), count(t, pool, `SELECT count(*) FROM journals WHERE merchant_id = $1`, m))
+		require.ErrorIs(t, err, domain.ErrJournalUnbalanced)
+		assert.Equal(t, int64(0), count(ctx, t, pool, `SELECT count(*) FROM journals WHERE merchant_id = $1`, m))
 		// 餘額未被污染（交易整體 rollback）
-		assert.Equal(t, int64(0), count(t, pool, `SELECT count(*) FROM accounts WHERE merchant_id = $1`, m))
+		assert.Equal(t, int64(0), count(ctx, t, pool, `SELECT count(*) FROM accounts WHERE merchant_id = $1`, m))
 	})
 
 	t.Run("journal without entries is rejected", func(t *testing.T) {
@@ -176,7 +176,7 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("append-only: UPDATE / DELETE on journals and entries fail", func(t *testing.T) {
-		svc := newService(pool, domain.Policy{})
+		svc := newService(pool)
 		m := uuid.New()
 		j, err := domain.TemplateFor(captureEvent(m, 500, 0), domain.Policy{})
 		require.NoError(t, err)
@@ -184,17 +184,17 @@ func TestIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		_, err = pool.Exec(ctx, `UPDATE journals SET description = 'x' WHERE id = $1`, posted.ID)
-		assert.ErrorIs(t, translateError(err), ErrAppendOnly)
+		require.ErrorIs(t, translateError(err), ErrAppendOnly)
 		_, err = pool.Exec(ctx, `DELETE FROM journals WHERE id = $1`, posted.ID)
-		assert.ErrorIs(t, translateError(err), ErrAppendOnly)
+		require.ErrorIs(t, translateError(err), ErrAppendOnly)
 		_, err = pool.Exec(ctx, `UPDATE entries SET amount = 1 WHERE journal_id = $1`, posted.ID)
-		assert.ErrorIs(t, translateError(err), ErrAppendOnly)
+		require.ErrorIs(t, translateError(err), ErrAppendOnly)
 		_, err = pool.Exec(ctx, `DELETE FROM entries WHERE journal_id = $1`, posted.ID)
 		assert.ErrorIs(t, translateError(err), ErrAppendOnly)
 	})
 
 	t.Run("frozen account rejected by trigger", func(t *testing.T) {
-		svc := newService(pool, domain.Policy{})
+		svc := newService(pool)
 		m := uuid.New()
 		_, _, err := svc.PostJournal(ctx, mustTemplate(t, captureEvent(m, 100, 0)))
 		require.NoError(t, err)
@@ -207,7 +207,7 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("reversal links and is single-use", func(t *testing.T) {
-		svc := newService(pool, domain.Policy{})
+		svc := newService(pool)
 		m := uuid.New()
 		orig, _, err := svc.PostJournal(ctx, mustTemplate(t, captureEvent(m, 1000, 30)))
 		require.NoError(t, err)
@@ -218,7 +218,7 @@ func TestIntegration(t *testing.T) {
 		require.NotNil(t, got.ReversedBy)
 		assert.Equal(t, rev.ID, *got.ReversedBy)
 		_, _, err = svc.ReverseJournal(ctx, orig.ID, "ops-"+uuid.NewString(), "again")
-		assert.ErrorIs(t, err, domain.ErrJournalAlreadyReversed)
+		require.ErrorIs(t, err, domain.ErrJournalAlreadyReversed)
 
 		mp, err := NewAccountRepo(pool).GetByKey(ctx, domain.MerchantPayable(m, "TWD", true))
 		require.NoError(t, err)
@@ -229,11 +229,11 @@ func TestIntegration(t *testing.T) {
 		assert.Equal(t, int64(970), b.TotalCredit)
 
 		// 試算平衡（v_balance_drift 應為 0 列）
-		assert.Equal(t, int64(0), count(t, pool, `SELECT count(*) FROM v_balance_drift`))
+		assert.Equal(t, int64(0), count(ctx, t, pool, `SELECT count(*) FROM v_balance_drift`))
 	})
 
 	t.Run("HandlePaymentEvent end-to-end with protobuf and dedupe", func(t *testing.T) {
-		svc := newService(pool, domain.Policy{})
+		svc := newService(pool)
 		m := uuid.New()
 		eventID := ids.New(ids.PrefixEvent)
 		ev := &paymentv1.PaymentEvent{
@@ -252,11 +252,11 @@ func TestIntegration(t *testing.T) {
 
 		evUUID, err := ids.ParseWithPrefix(eventID, ids.PrefixEvent)
 		require.NoError(t, err)
-		assert.Equal(t, int64(1), count(t, pool, `SELECT count(*) FROM processed_events WHERE event_id = $1 AND consumer = $2`, evUUID, app.ConsumerPaymentEvents))
-		assert.Equal(t, int64(1), count(t, pool, `SELECT count(*) FROM journals WHERE event_id = $1`, evUUID))
+		assert.Equal(t, int64(1), count(ctx, t, pool, `SELECT count(*) FROM processed_events WHERE event_id = $1 AND consumer = $2`, evUUID, app.ConsumerPaymentEvents))
+		assert.Equal(t, int64(1), count(ctx, t, pool, `SELECT count(*) FROM journals WHERE event_id = $1`, evUUID))
 
 		// test-mode 帳戶以 test: 前綴隔離
-		assert.Equal(t, int64(1), count(t, pool, `SELECT count(*) FROM accounts WHERE merchant_id = $1 AND code = 'test:merchant_payable'`, m))
+		assert.Equal(t, int64(1), count(ctx, t, pool, `SELECT count(*) FROM accounts WHERE merchant_id = $1 AND code = 'test:merchant_payable'`, m))
 		mbs, err := svc.GetMerchantBalances(ctx, m, "TWD", false)
 		require.NoError(t, err)
 		require.Len(t, mbs, 1)
@@ -272,26 +272,31 @@ func TestIntegration(t *testing.T) {
 			OccurredAt: timestamppb.Now(), MerchantId: ids.Format(ids.PrefixMerchant, m), PaymentId: "pay_e2e", Livemode: false,
 			Payload: &paymentv1.PaymentEvent_PaymentAuthorized{PaymentAuthorized: &paymentv1.PaymentAuthorized{Provider: "mock"}},
 		}
-		raw2, _ := proto.Marshal(ev2)
+		raw2, err := proto.Marshal(ev2)
+		require.NoError(t, err)
 		require.NoError(t, svc.HandlePaymentEvent(ctx, eventbus.Record{Value: raw2, Headers: map[string]string{eventbus.HeaderEventID: authID}}))
-		authUUID, _ := ids.ParseWithPrefix(authID, ids.PrefixEvent)
-		assert.Equal(t, int64(1), count(t, pool, `SELECT count(*) FROM processed_events WHERE event_id = $1`, authUUID))
-		assert.Equal(t, int64(0), count(t, pool, `SELECT count(*) FROM journals WHERE event_id = $1`, authUUID))
+		authUUID, err := ids.ParseWithPrefix(authID, ids.PrefixEvent)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), count(ctx, t, pool, `SELECT count(*) FROM processed_events WHERE event_id = $1`, authUUID))
+		assert.Equal(t, int64(0), count(ctx, t, pool, `SELECT count(*) FROM journals WHERE event_id = $1`, authUUID))
 
 		// poison（缺 provider）→ 錯誤且 processed_events 未留下紀錄
 		badID := ids.New(ids.PrefixEvent)
-		ev3 := proto.Clone(ev).(*paymentv1.PaymentEvent)
+		ev3, ok := proto.Clone(ev).(*paymentv1.PaymentEvent)
+		require.True(t, ok)
 		ev3.EventId = badID
 		ev3.GetPaymentCaptured().Provider = ""
-		raw3, _ := proto.Marshal(ev3)
+		raw3, err := proto.Marshal(ev3)
+		require.NoError(t, err)
 		err = svc.HandlePaymentEvent(ctx, eventbus.Record{Value: raw3, Headers: map[string]string{eventbus.HeaderEventID: badID}})
-		assert.ErrorIs(t, err, app.ErrPoisonMessage)
-		badUUID, _ := ids.ParseWithPrefix(badID, ids.PrefixEvent)
-		assert.Equal(t, int64(0), count(t, pool, `SELECT count(*) FROM processed_events WHERE event_id = $1`, badUUID))
+		require.ErrorIs(t, err, app.ErrPoisonMessage)
+		badUUID, err := ids.ParseWithPrefix(badID, ids.PrefixEvent)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), count(ctx, t, pool, `SELECT count(*) FROM processed_events WHERE event_id = $1`, badUUID))
 	})
 
 	t.Run("ListJournals / ListAccounts pagination and filters", func(t *testing.T) {
-		svc := newService(pool, domain.Policy{})
+		svc := newService(pool)
 		m := uuid.New()
 		var paymentIDs []string
 		for i := 0; i < 5; i++ {
@@ -300,7 +305,8 @@ func TestIntegration(t *testing.T) {
 			_, _, err := svc.PostJournal(ctx, mustTemplate(t, ev))
 			require.NoError(t, err)
 		}
-		page, _ := app.NewPage(2, "")
+		page, perr := app.NewPage(2, "")
+		require.NoError(t, perr)
 		var seen []uuid.UUID
 		for {
 			js, next, err := svc.ListJournals(ctx, app.JournalFilter{MerchantID: &m}, page)
@@ -348,7 +354,7 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("CreateAccount is idempotent", func(t *testing.T) {
-		svc := newService(pool, domain.Policy{})
+		svc := newService(pool)
 		key := domain.BankCash("ctbc_001", "TWD", true)
 		a, existed, err := svc.CreateAccount(ctx, key)
 		require.NoError(t, err)
@@ -357,7 +363,7 @@ func TestIntegration(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, existed)
 		assert.Equal(t, a.ID, b.ID)
-		assert.Equal(t, int64(1), count(t, pool, `SELECT count(*) FROM balances WHERE account_id = $1`, a.ID))
+		assert.Equal(t, int64(1), count(ctx, t, pool, `SELECT count(*) FROM balances WHERE account_id = $1`, a.ID))
 	})
 }
 

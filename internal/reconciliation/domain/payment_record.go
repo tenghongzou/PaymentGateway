@@ -40,6 +40,8 @@ func RecordKindForLine(t LineType) (RecordKind, bool) {
 		return RecordRefund, true
 	case LineChargeback:
 		return RecordDispute, true
+	case LineFee, LineAdjustment:
+		return "", false
 	}
 	return "", false
 }

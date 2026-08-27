@@ -64,6 +64,8 @@ func runStatusFromProto(s reconciliationv1.RunStatus) (domain.RunStatus, bool) {
 		return domain.RunCompleted, true
 	case reconciliationv1.RunStatus_RUN_STATUS_FAILED:
 		return domain.RunFailed, true
+	case reconciliationv1.RunStatus_RUN_STATUS_UNSPECIFIED:
+		return "", false
 	}
 	return "", false
 }
@@ -104,6 +106,8 @@ func kindFromProto(t reconciliationv1.DiscrepancyType) ([]domain.DiscrepancyKind
 		return []domain.DiscrepancyKind{domain.KindFeeMismatch}, nil
 	case reconciliationv1.DiscrepancyType_DISCREPANCY_TYPE_STATUS_MISMATCH:
 		return []domain.DiscrepancyKind{domain.KindStatusMismatch}, nil
+	case reconciliationv1.DiscrepancyType_DISCREPANCY_TYPE_UNSPECIFIED:
+		// 未指定：與未知值同樣視為無效參數。
 	}
 	return nil, apperr.ErrParameterInvalid.WithMessage("unsupported discrepancy type %s.", t.String()).WithParam("types")
 }
@@ -128,6 +132,8 @@ func discrepancyStatusFromProto(s reconciliationv1.DiscrepancyStatus) (domain.Di
 		return domain.DiscrepancyResolved, true
 	case reconciliationv1.DiscrepancyStatus_DISCREPANCY_STATUS_IGNORED, reconciliationv1.DiscrepancyStatus_DISCREPANCY_STATUS_AUTO_CLOSED:
 		return domain.DiscrepancyIgnored, true
+	case reconciliationv1.DiscrepancyStatus_DISCREPANCY_STATUS_UNSPECIFIED:
+		return "", false
 	}
 	return "", false
 }
@@ -232,6 +238,8 @@ func discrepancyToProto(d *domain.Discrepancy) *reconciliationv1.Discrepancy {
 		out.ResolutionAction = reconciliationv1.ResolutionAction_RESOLUTION_ACTION_MARK_RESOLVED
 	case domain.DiscrepancyIgnored:
 		out.ResolutionAction = reconciliationv1.ResolutionAction_RESOLUTION_ACTION_IGNORE
+	case domain.DiscrepancyOpen:
+		// open 尚未處理：resolution_action 維持 UNSPECIFIED。
 	}
 	if line, ok := d.LineSnapshot(); ok {
 		out.SettlementRecord = &reconciliationv1.SettlementRecord{

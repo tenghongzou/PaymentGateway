@@ -86,12 +86,19 @@ var idempotencyNamespace = uuid.MustParse("6f1c9d2e-4b7a-5c3d-9e8f-1a2b3c4d5e6f"
 
 // --- enum 轉換 ---
 
+// kindToProto 涵蓋 Chart of Accounts 全部 10 個科目（docs/02 §7.1）；
+// pg.ledger.v1.AccountType 尚未定義的配套科目對映 UNSPECIFIED（name 仍帶完整 code）。
 var kindToProto = map[domain.Kind]ledgerv1.AccountType{
-	domain.KindMerchantPayable:   ledgerv1.AccountType_ACCOUNT_TYPE_MERCHANT_PAYABLE,
-	domain.KindPSPReceivable:     ledgerv1.AccountType_ACCOUNT_TYPE_PSP_RECEIVABLE,
-	domain.KindFeeRevenue:        ledgerv1.AccountType_ACCOUNT_TYPE_FEE_REVENUE,
-	domain.KindRefundClearing:    ledgerv1.AccountType_ACCOUNT_TYPE_REFUND_CLEARING,
-	domain.KindChargebackReserve: ledgerv1.AccountType_ACCOUNT_TYPE_CHARGEBACK_RESERVE,
+	domain.KindPSPReceivable:        ledgerv1.AccountType_ACCOUNT_TYPE_PSP_RECEIVABLE,
+	domain.KindBankCash:             ledgerv1.AccountType_ACCOUNT_TYPE_UNSPECIFIED,
+	domain.KindSettlementSuspense:   ledgerv1.AccountType_ACCOUNT_TYPE_UNSPECIFIED,
+	domain.KindMerchantPayable:      ledgerv1.AccountType_ACCOUNT_TYPE_MERCHANT_PAYABLE,
+	domain.KindRefundClearing:       ledgerv1.AccountType_ACCOUNT_TYPE_REFUND_CLEARING,
+	domain.KindChargebackReserve:    ledgerv1.AccountType_ACCOUNT_TYPE_CHARGEBACK_RESERVE,
+	domain.KindFeeRevenue:           ledgerv1.AccountType_ACCOUNT_TYPE_FEE_REVENUE,
+	domain.KindChargebackFeeRevenue: ledgerv1.AccountType_ACCOUNT_TYPE_UNSPECIFIED,
+	domain.KindPSPFeeExpense:        ledgerv1.AccountType_ACCOUNT_TYPE_UNSPECIFIED,
+	domain.KindChargebackFeeExpense: ledgerv1.AccountType_ACCOUNT_TYPE_UNSPECIFIED,
 }
 
 // KindToProto 把科目種類轉成 proto AccountType；proto 未列出的配套科目回 UNSPECIFIED（name 仍帶完整 code）。
@@ -102,11 +109,13 @@ func KindToProto(k domain.Kind) ledgerv1.AccountType {
 	return ledgerv1.AccountType_ACCOUNT_TYPE_UNSPECIFIED
 }
 
-// KindFromProto 把 proto AccountType 轉成科目種類。
+// KindFromProto 把 proto AccountType 轉成科目種類；UNSPECIFIED（含未映射科目）回錯誤。
 func KindFromProto(t ledgerv1.AccountType) (domain.Kind, error) {
-	for k, v := range kindToProto {
-		if v == t {
-			return k, nil
+	if t != ledgerv1.AccountType_ACCOUNT_TYPE_UNSPECIFIED {
+		for k, v := range kindToProto {
+			if v == t {
+				return k, nil
+			}
 		}
 	}
 	return "", apperr.ErrParameterInvalid.WithParam("type").WithMessage("account type %s is not supported", t)
@@ -119,6 +128,8 @@ func DirectionFromProto(d ledgerv1.EntryDirection) (domain.Direction, error) {
 		return domain.Debit, nil
 	case ledgerv1.EntryDirection_ENTRY_DIRECTION_CREDIT:
 		return domain.Credit, nil
+	case ledgerv1.EntryDirection_ENTRY_DIRECTION_UNSPECIFIED:
+		return "", domain.ErrEntryDirectionInvalid
 	default:
 		return "", domain.ErrEntryDirectionInvalid
 	}

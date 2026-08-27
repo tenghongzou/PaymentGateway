@@ -251,7 +251,7 @@ func TestSettlementTemplate(t *testing.T) {
 	bad := s
 	bad.NetPaid = twd(900)
 	_, err = SettlementTemplate(bad)
-	assert.ErrorIs(t, err, ErrJournalUnbalanced)
+	require.ErrorIs(t, err, ErrJournalUnbalanced)
 
 	// 缺欄位
 	bad = s

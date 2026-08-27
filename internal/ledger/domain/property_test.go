@@ -2,7 +2,7 @@ package domain
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"testing"
@@ -42,7 +42,7 @@ func propRand(t *testing.T) *rand.Rand {
 		seed = n
 	}
 	t.Logf("property seed: %d (reproduce with LEDGER_PROP_SEED=%d)", seed, seed)
-	return rand.New(rand.NewSource(seed)) //nolint:gosec // 測試用、可重現
+	return rand.New(rand.NewPCG(uint64(seed), 0)) //nolint:gosec // 測試用、可重現
 }
 
 var propCurrencies = []string{"TWD", "USD", "JPY", "KWD"}
@@ -54,7 +54,7 @@ func genMoney(r *rand.Rand, currency string, maxMinor int64) money.Money {
 		maxMinor = 1
 	}
 	var amt int64
-	switch r.Intn(6) {
+	switch r.IntN(6) {
 	case 0:
 		amt = 1
 	case 1:
@@ -64,9 +64,9 @@ func genMoney(r *rand.Rand, currency string, maxMinor int64) money.Money {
 		for range money.Exponent(currency) {
 			unit *= 10
 		}
-		amt = unit * (1 + r.Int63n(max(maxMinor/unit, 1)))
+		amt = unit * (1 + r.Int64N(max(maxMinor/unit, 1)))
 	default:
-		amt = 1 + r.Int63n(maxMinor)
+		amt = 1 + r.Int64N(maxMinor)
 	}
 	if amt > maxMinor {
 		amt = maxMinor
@@ -96,19 +96,21 @@ type lifecycle struct {
 }
 
 // genPaymentLifecycle：captured → 0..n 個 partial refund（pending → succeeded | failed | 留在 pending）→ 可選 dispute → won | lost | open。
-func genPaymentLifecycle(r *rand.Rand, merchant uuid.UUID, currency string, livemode bool, pol Policy) lifecycle {
+func genPaymentLifecycle(t *testing.T, r *rand.Rand, merchant uuid.UUID, currency string, livemode bool, pol Policy) lifecycle {
+	t.Helper()
 	lc := lifecycle{paymentID: "pay_" + uuid.NewString()[:8], merchant: merchant, currency: currency, livemode: livemode, policyRefund: pol.RefundChargebackFeeOnWin}
 	maxAmt := int64(1_000_000)
-	if r.Intn(10) == 0 {
+	if r.IntN(10) == 0 {
 		maxAmt = 1_000_000_000_000 // 10^12 邊界
 	}
 	amount := genMoney(r, currency, maxAmt)
 	fee := money.Zero(currency)
-	if r.Intn(4) != 0 {
-		fc, _ := FeePolicy{FixedMinor: r.Int63n(50), PercentageBps: r.Int63n(500)}.Calculate(amount)
+	if r.IntN(4) != 0 {
+		fc, err := FeePolicy{FixedMinor: r.Int64N(50), PercentageBps: r.Int64N(500)}.Calculate(amount)
+		require.NoError(t, err)
 		fee = fc.Total
 	}
-	provider := propProviders[r.Intn(len(propProviders))]
+	provider := propProviders[r.IntN(len(propProviders))]
 	mk := func(typ EventType) PaymentEvent {
 		return PaymentEvent{
 			EventID: uuid.New(), EventPublicID: "evt_" + uuid.NewString()[:8], Type: typ, OccurredAt: testNow,
@@ -116,31 +118,31 @@ func genPaymentLifecycle(r *rand.Rand, merchant uuid.UUID, currency string, live
 		}
 	}
 	// 不記帳的前置事件也混進序列
-	if r.Intn(2) == 0 {
+	if r.IntN(2) == 0 {
 		e := mk(EventPaymentCreated)
 		e.Amount = amount
 		lc.events = append(lc.events, e)
 	}
-	cap := mk(EventPaymentCaptured)
-	cap.Amount, cap.Fee = amount, fee
-	lc.events = append(lc.events, cap)
+	capEv := mk(EventPaymentCaptured)
+	capEv.Amount, capEv.Fee = amount, fee
+	lc.events = append(lc.events, capEv)
 	lc.captured, lc.fee = amount.AmountMinor, fee.AmountMinor
 
 	// 退款：總和 ≤ captured
 	remaining := amount.AmountMinor
-	for i := 0; i < r.Intn(4) && remaining > 0; i++ {
+	for i := 0; i < r.IntN(4) && remaining > 0; i++ {
 		ra := genMoney(r, currency, remaining)
 		remaining -= ra.AmountMinor
 		refundID := fmt.Sprintf("re_%s_%d", lc.paymentID, i)
 		pend := mk(EventRefundCreated)
 		pend.RefundID, pend.Amount = refundID, ra
 		lc.events = append(lc.events, pend)
-		switch r.Intn(3) {
+		switch r.IntN(3) {
 		case 0: // 成功
 			ok := mk(EventRefundSucceeded)
 			ok.RefundID, ok.Amount = refundID, ra
-			if r.Intn(3) == 0 {
-				ok.Fee = money.Money{AmountMinor: 1 + r.Int63n(10), Currency: currency}
+			if r.IntN(3) == 0 {
+				ok.Fee = money.Money{AmountMinor: 1 + r.Int64N(10), Currency: currency}
 				lc.refundFees += ok.Fee.AmountMinor
 			}
 			lc.events = append(lc.events, ok)
@@ -155,18 +157,18 @@ func genPaymentLifecycle(r *rand.Rand, merchant uuid.UUID, currency string, live
 	}
 
 	// 爭議
-	if r.Intn(3) == 0 {
+	if r.IntN(3) == 0 {
 		da := genMoney(r, currency, amount.AmountMinor)
 		dfee := money.Zero(currency)
-		if r.Intn(2) == 0 {
-			dfee = money.Money{AmountMinor: 1 + r.Int63n(500), Currency: currency}
+		if r.IntN(2) == 0 {
+			dfee = money.Money{AmountMinor: 1 + r.Int64N(500), Currency: currency}
 		}
 		disputeID := "dp_" + lc.paymentID
 		open := mk(EventDisputeOpened)
 		open.DisputeID, open.Amount, open.Fee = disputeID, da, dfee
 		lc.events = append(lc.events, open)
 		lc.cbOpened, lc.cbFee = da.AmountMinor, dfee.AmountMinor
-		switch r.Intn(3) {
+		switch r.IntN(3) {
 		case 0:
 			won := mk(EventDisputeWon)
 			won.DisputeID, won.Amount, won.Fee = disputeID, da, dfee
@@ -213,17 +215,18 @@ func TestProperty_LifecycleInvariants(t *testing.T) {
 	r := propRand(t)
 	iters := propIterations(t)
 	for i := 0; i < iters; i++ {
-		pol := Policy{RefundChargebackFeeOnWin: r.Intn(2) == 0}
-		currency := propCurrencies[r.Intn(len(propCurrencies))]
-		livemode := r.Intn(5) != 0
+		pol := Policy{RefundChargebackFeeOnWin: r.IntN(2) == 0}
+		currency := propCurrencies[r.IntN(len(propCurrencies))]
+		livemode := r.IntN(5) != 0
 		merchant := uuid.New()
 		bal := Balances{}
 
 		// 同一商戶 1..3 個 payment
-		var lcs []lifecycle
+		nPayments := 1 + r.IntN(3)
+		lcs := make([]lifecycle, 0, nPayments)
 		var totalFee, totalRefundFee, totalCBFee, totalCBFeeRefund int64
-		for range 1 + r.Intn(3) {
-			lc := genPaymentLifecycle(r, merchant, currency, livemode, pol)
+		for range nPayments {
+			lc := genPaymentLifecycle(t, r, merchant, currency, livemode, pol)
 			lcs = append(lcs, lc)
 			applyAll(t, bal, lc.events, pol)
 			totalFee += lc.fee
@@ -256,10 +259,10 @@ func TestProperty_LifecycleInvariants(t *testing.T) {
 func TestProperty_CaptureNetPlusFeeEqualsGross(t *testing.T) {
 	r := propRand(t)
 	for i := 0; i < propIterations(t); i++ {
-		currency := propCurrencies[r.Intn(len(propCurrencies))]
+		currency := propCurrencies[r.IntN(len(propCurrencies))]
 		ev := baseEvent(EventPaymentCaptured)
 		ev.Amount = genMoney(r, currency, 1_000_000_000)
-		fc, err := FeePolicy{FixedMinor: r.Int63n(100), PercentageBps: r.Int63n(1000), MaxFeeMinor: r.Int63n(100000)}.Calculate(ev.Amount)
+		fc, err := FeePolicy{FixedMinor: r.Int64N(100), PercentageBps: r.Int64N(1000), MaxFeeMinor: r.Int64N(100000)}.Calculate(ev.Amount)
 		require.NoError(t, err)
 		ev.Fee = fc.Total
 		j, err := TemplateFor(ev, Policy{})
@@ -273,6 +276,9 @@ func TestProperty_CaptureNetPlusFeeEqualsGross(t *testing.T) {
 				net += e.Amount.AmountMinor
 			case KindFeeRevenue:
 				fee += e.Amount.AmountMinor
+			case KindBankCash, KindSettlementSuspense, KindRefundClearing, KindChargebackReserve,
+				KindChargebackFeeRevenue, KindPSPFeeExpense, KindChargebackFeeExpense:
+				t.Fatalf("J-CAP must not touch account kind %s", e.Account.Kind())
 			}
 		}
 		require.Equal(t, gross, net+fee, "iteration %d", i)
@@ -284,13 +290,13 @@ func TestProperty_CaptureNetPlusFeeEqualsGross(t *testing.T) {
 func TestProperty_ReversalRestoresBalances(t *testing.T) {
 	r := propRand(t)
 	for i := 0; i < propIterations(t); i++ {
-		currency := propCurrencies[r.Intn(len(propCurrencies))]
-		lc := genPaymentLifecycle(r, uuid.New(), currency, true, Policy{})
+		currency := propCurrencies[r.IntN(len(propCurrencies))]
+		lc := genPaymentLifecycle(t, r, uuid.New(), currency, true, Policy{})
 		bal := Balances{}
 		journals := applyAll(t, bal, lc.events, Policy{})
 		require.NotEmpty(t, journals)
 
-		victim := journals[r.Intn(len(journals))]
+		victim := journals[r.IntN(len(journals))]
 		victim.ID = uuid.New()
 		victim.PublicID = "jrn_" + victim.ID.String()[:8]
 		before := bal.Clone()
@@ -317,13 +323,13 @@ func TestProperty_ReversalRestoresBalances(t *testing.T) {
 func TestProperty_InterleavingIndependence(t *testing.T) {
 	r := propRand(t)
 	for i := 0; i < propIterations(t)/2; i++ {
-		currency := propCurrencies[r.Intn(len(propCurrencies))]
+		currency := propCurrencies[r.IntN(len(propCurrencies))]
 		merchant := uuid.New()
-		pol := Policy{RefundChargebackFeeOnWin: r.Intn(2) == 0}
-		n := 2 + r.Intn(3)
+		pol := Policy{RefundChargebackFeeOnWin: r.IntN(2) == 0}
+		n := 2 + r.IntN(3)
 		lcs := make([]lifecycle, n)
 		for k := range lcs {
-			lcs[k] = genPaymentLifecycle(r, merchant, currency, true, pol)
+			lcs[k] = genPaymentLifecycle(t, r, merchant, currency, true, pol)
 		}
 		// 順序 1：逐 payment
 		seq := Balances{}
@@ -343,7 +349,7 @@ func TestProperty_InterleavingIndependence(t *testing.T) {
 			if len(candidates) == 0 {
 				break
 			}
-			k := candidates[r.Intn(len(candidates))]
+			k := candidates[r.IntN(len(candidates))]
 			mixed = append(mixed, lcs[k].events[idx[k]])
 			idx[k]++
 		}
@@ -362,26 +368,26 @@ func TestProperty_RandomJournalsAcceptedIffBalanced(t *testing.T) {
 		RefundClearing(merchant, "TWD", true), FeeRevenue("TWD", true), PSPFeeExpense("stripe", "TWD", true),
 	}
 	for i := 0; i < propIterations(t); i++ {
-		n := 2 + r.Intn(7)
+		n := 2 + r.IntN(7)
 		j := &Journal{EventID: uuid.New(), MerchantID: merchant, Livemode: true, ReferenceType: RefAdjustment, ReferenceID: "x"}
 		var debits, credits int64
 		for k := 0; k < n-1; k++ {
 			dir := Debit
-			if r.Intn(2) == 0 {
+			if r.IntN(2) == 0 {
 				dir = Credit
 			}
-			amt := 1 + r.Int63n(10000)
+			amt := 1 + r.Int64N(10000)
 			if dir == Debit {
 				debits += amt
 			} else {
 				credits += amt
 			}
-			j.Entries = append(j.Entries, Entry{Account: accounts[r.Intn(len(accounts))], Direction: dir, Amount: twd(amt)})
+			j.Entries = append(j.Entries, Entry{Account: accounts[r.IntN(len(accounts))], Direction: dir, Amount: twd(amt)})
 		}
 		// 最後一筆決定平衡與否
-		balanced := r.Intn(2) == 0
+		balanced := r.IntN(2) == 0
 		diff := debits - credits
-		last := Entry{Account: accounts[r.Intn(len(accounts))], Amount: twd(1)}
+		last := Entry{Account: accounts[r.IntN(len(accounts))], Amount: twd(1)}
 		switch {
 		case balanced && diff > 0:
 			last.Direction, last.Amount = Credit, twd(diff)
@@ -392,7 +398,7 @@ func TestProperty_RandomJournalsAcceptedIffBalanced(t *testing.T) {
 			last.Direction = Debit
 		default:
 			last.Direction = Debit
-			last.Amount = twd(1 + r.Int63n(10000))
+			last.Amount = twd(1 + r.Int64N(10000))
 			if debits+last.Amount.AmountMinor == credits {
 				last.Amount.AmountMinor++
 			}

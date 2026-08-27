@@ -98,7 +98,7 @@ func (f *defaultFetcher) fetchFile(u *url.URL) ([]byte, error) {
 }
 
 func (f *defaultFetcher) fetchHTTP(ctx context.Context, rawURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, http.NoBody)
 	if err != nil {
 		return nil, apperr.ErrParameterInvalid.WithMessage("source_url is invalid: %v", err).WithParam("source_url")
 	}

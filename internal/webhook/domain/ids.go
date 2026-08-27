@@ -23,7 +23,7 @@ func ParseID(s, prefix string) (uuid.UUID, error) {
 	}
 	u, err := ids.ParseWithPrefix(s, prefix)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("%w: %v", ErrInvalidID, err)
+		return uuid.Nil, fmt.Errorf("%w: %w", ErrInvalidID, err)
 	}
 	return u, nil
 }

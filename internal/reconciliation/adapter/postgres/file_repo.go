@@ -68,8 +68,8 @@ func (r *FileRepo) Update(ctx context.Context, f *domain.SettlementFile) error {
 		 WHERE id = $1 AND version = $10`,
 		f.ID, f.StorageURI, dateOf(f.PeriodStart), dateOf(f.PeriodEnd), f.RowCount, string(f.Status),
 		f.Error, f.ImportedAt, meta, f.Version)
-	if err := optimistic(tag, err, "settlement_file"); err != nil {
-		return err
+	if updErr := optimistic(tag, err, "settlement_file"); updErr != nil {
+		return updErr
 	}
 	f.Version++
 	return nil
@@ -98,7 +98,9 @@ func scanFile(row pgx.Row) (*domain.SettlementFile, error) {
 	f.PeriodStart, f.PeriodEnd = ps, pe
 	f.Metadata = map[string]string{}
 	if len(meta) > 0 {
-		_ = json.Unmarshal(meta, &f.Metadata)
+		if err = json.Unmarshal(meta, &f.Metadata); err != nil {
+			return nil, fmt.Errorf("postgres: unmarshal settlement_file metadata: %w", err)
+		}
 	}
 	return &f, nil
 }

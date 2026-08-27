@@ -52,7 +52,12 @@ func newEnv(t *testing.T) *env {
 	lis := bufconn.Listen(1 << 20)
 	srv, _ := grpcx.NewServer(grpcx.ServerOptions{})
 	NewServer(e.svc).Register(srv)
-	go func() { _ = srv.Serve(lis) }()
+	go func() {
+		// Stop 後 Serve 回 nil；其餘錯誤代表測試環境異常。
+		if serr := srv.Serve(lis); serr != nil {
+			t.Errorf("grpc serve: %v", serr)
+		}
+	}()
 	t.Cleanup(srv.Stop)
 	conn, err := grpc.NewClient("passthrough:///bufnet",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
@@ -206,7 +211,12 @@ func TestMerchantEndpointSource(t *testing.T) {
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
 	merchantv1.RegisterMerchantServiceServer(srv, fm)
-	go func() { _ = srv.Serve(lis) }()
+	go func() {
+		// Stop 後 Serve 回 nil；其餘錯誤代表測試環境異常。
+		if serr := srv.Serve(lis); serr != nil {
+			t.Errorf("grpc serve: %v", serr)
+		}
+	}()
 	t.Cleanup(srv.Stop)
 	conn, err := grpc.NewClient("passthrough:///bufnet",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),

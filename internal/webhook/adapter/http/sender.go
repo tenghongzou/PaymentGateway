@@ -155,10 +155,14 @@ func (s *Sender) Send(ctx context.Context, req app.SendRequest) domain.Outcome {
 		return done(domain.Outcome{Err: classifyErr(err)})
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, int64(s.maxBody)))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(s.maxBody)))
 	// 把剩餘 body 丟掉（上限 64KB）讓連線可重用。
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10)) //nolint:errcheck // 盡力 drain 供連線重用；失敗只影響連線重用，無需處理
 	out := domain.Outcome{StatusCode: resp.StatusCode, Body: string(body)}
+	if readErr != nil {
+		// 狀態碼已取得（結果分類不受影響），把讀取中斷記進 Outcome.Err 供診斷。
+		out.Err = fmt.Errorf("read response body: %w", classifyErr(readErr))
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		out.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	}

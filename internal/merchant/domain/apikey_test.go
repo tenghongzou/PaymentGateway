@@ -137,7 +137,8 @@ func TestApiKeyRotateSigningSecret(t *testing.T) {
 }
 
 func BenchmarkVerifyArgon2id(b *testing.B) {
-	plain, key, _ := GenerateKey(ModeLive)
+	plain, key, err := GenerateKey(ModeLive)
+	require.NoError(b, err)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key.Verify(plain)

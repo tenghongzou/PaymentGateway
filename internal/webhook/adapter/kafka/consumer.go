@@ -54,8 +54,8 @@ func NewConsumer(cfg Config, svc Ingester, log *slog.Logger) (*Consumer, error) 
 	if log == nil {
 		log = slog.Default()
 	}
-	if cfg.Options.Logger == nil {
-		cfg.Options.Logger = log
+	if cfg.Logger == nil {
+		cfg.Logger = log
 	}
 	c, err := eventbus.NewConsumer(eventbus.ConsumerConfig{Options: cfg.Options, Group: cfg.Group, Topics: cfg.Topics, DLQ: cfg.DLQ})
 	if err != nil {

@@ -97,13 +97,13 @@ func (p *StripeParser) Parse(r io.Reader) ([]SettlementLine, error) {
 		if err != nil {
 			return nil, WrapParse(err)
 		}
-		amount, _, err := parseDecimalToMinor(lineNo, "amount", get("amount"), currency)
+		amount, err := parseDecimalToMinor(lineNo, "amount", get("amount"), currency)
 		if err != nil {
 			return nil, WrapParse(err)
 		}
 		var fee int64
 		if f := get("fee"); f != "" {
-			if fee, _, err = parseDecimalToMinor(lineNo, "fee", f, currency); err != nil {
+			if fee, err = parseDecimalToMinor(lineNo, "fee", f, currency); err != nil {
 				return nil, WrapParse(err)
 			}
 		}
@@ -171,7 +171,7 @@ func parseStripeTime(s string) (time.Time, error) {
 			return t.UTC(), nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("unrecognised timestamp %q", s)
+	return time.Time{}, fmt.Errorf("unrecognized timestamp %q", s)
 }
 
 // firstPresent 回傳第一個存在於 idx 的欄名。

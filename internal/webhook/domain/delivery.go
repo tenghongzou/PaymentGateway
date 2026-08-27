@@ -67,7 +67,7 @@ func Backoff(attemptNo int) time.Duration {
 
 // NextAttemptAt 計算第 failedAttemptNo 次失敗後的下次嘗試時間：now + Backoff(failedAttemptNo+1) ± 20% jitter。
 // rnd 須為 [0,1) 的亂數（0.5 代表無 jitter），由呼叫端注入以利測試。
-func NextAttemptAt(now time.Time, failedAttemptNo int, rnd float64) time.Time {
+func NextAttemptAt(now time.Time, failedAttemptNo int, rnd float64) time.Time { //nolint:forbidigo // rnd 為 jitter 亂數，非金額
 	base := Backoff(failedAttemptNo + 1)
 	if base == 0 {
 		return now
@@ -80,7 +80,7 @@ func NextAttemptAt(now time.Time, failedAttemptNo int, rnd float64) time.Time {
 	}
 	// factor ∈ [1-Jitter, 1+Jitter)
 	factor := 1 - JitterRatio + 2*JitterRatio*rnd
-	return now.Add(time.Duration(float64(base) * factor))
+	return now.Add(time.Duration(float64(base) * factor)) //nolint:forbidigo // 退避時間乘上 jitter 係數，非金額
 }
 
 // Delivery 為 (event, endpoint) 的投遞狀態機（webhook_deliveries 一列）。
@@ -177,7 +177,7 @@ const (
 
 // ApplyOutcome 依 HTTP 結果推進狀態機（必須處於 in_flight），並回傳本次的 Attempt 紀錄。
 // rnd 為 [0,1) 亂數供 jitter 使用。
-func (d *Delivery) ApplyOutcome(now time.Time, o Outcome, rnd float64) (Transition, *Attempt, error) {
+func (d *Delivery) ApplyOutcome(now time.Time, o Outcome, rnd float64) (Transition, *Attempt, error) { //nolint:forbidigo // rnd 為 jitter 亂數，非金額
 	if d.Status != StatusInFlight {
 		return 0, nil, fmt.Errorf("%w: apply outcome in %s", ErrInvalidTransition, d.Status)
 	}

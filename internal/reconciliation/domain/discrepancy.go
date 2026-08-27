@@ -209,8 +209,10 @@ func (d *Discrepancy) LineSnapshot() (line SettlementLine, ok bool) {
 }
 
 func toString(v any) string {
-	s, _ := v.(string)
-	return s
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 func toInt64(v any) int64 {
@@ -219,7 +221,7 @@ func toInt64(v any) int64 {
 		return n
 	case int:
 		return int64(n)
-	case float64:
+	case float64: //nolint:forbidigo // jsonb details 反序列化後的數字型別為 float64，此處僅還原為 int64 最小單位，非以浮點數運算金額
 		return int64(n)
 	case int32:
 		return int64(n)

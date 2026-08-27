@@ -31,7 +31,10 @@ func (s *StaticEndpointSource) ListEndpoints(_ context.Context, merchantID uuid.
 
 // GetEndpoint 實作 EndpointSource。
 func (s *StaticEndpointSource) GetEndpoint(ctx context.Context, merchantID, endpointID uuid.UUID) (*domain.Endpoint, error) {
-	eps, _ := s.ListEndpoints(ctx, merchantID)
+	eps, err := s.ListEndpoints(ctx, merchantID)
+	if err != nil {
+		return nil, err
+	}
 	for _, ep := range eps {
 		if ep.ID == endpointID {
 			return ep, nil

@@ -95,8 +95,8 @@ func TestRepositoriesEndToEnd(t *testing.T) {
 
 	// 分頁：再建 3 個，page size 2 → 2 頁 + 1
 	for i := range 3 {
-		_, err := svc.CreateMerchant(ctx, app.CreateMerchantInput{Name: "M", LegalName: "L", Country: "JP", DefaultCurrency: "JPY", ContactEmail: "a@b.example", Metadata: map[string]string{"i": string(rune('0' + i))}})
-		require.NoError(t, err)
+		_, cerr := svc.CreateMerchant(ctx, app.CreateMerchantInput{Name: "M", LegalName: "L", Country: "JP", DefaultCurrency: "JPY", ContactEmail: "a@b.example", Metadata: map[string]string{"i": string(rune('0' + i))}})
+		require.NoError(t, cerr)
 	}
 	page1, next, err := svc.ListMerchants(ctx, app.ListMerchantsInput{Page: app.Page{Size: 2}})
 	require.NoError(t, err)
@@ -276,20 +276,20 @@ func TestRepositoriesEndToEnd(t *testing.T) {
 	require.ErrorIs(t, err, postgres.ErrNoTransaction)
 
 	// ---- rollback：outbox 失敗時業務資料不落地 ----
-	before := countRows(t, ctx, pool, "merchants")
+	before := countRows(ctx, t, pool, "merchants")
 	err = repos.Tx.WithinTx(ctx, func(ctx context.Context) error {
-		mm, err := domain.NewMerchant(domain.NewMerchantParams{Name: "R", LegalName: "R", Country: "TW", DefaultCurrency: "TWD", ContactEmail: "r@r.example"}, time.Now())
-		if err != nil {
-			return err
+		mm, merr := domain.NewMerchant(domain.NewMerchantParams{Name: "R", LegalName: "R", Country: "TW", DefaultCurrency: "TWD", ContactEmail: "r@r.example"}, time.Now())
+		if merr != nil {
+			return merr
 		}
-		if err := repos.Merchants.Create(ctx, mm); err != nil {
-			return err
+		if cerr := repos.Merchants.Create(ctx, mm); cerr != nil {
+			return cerr
 		}
-		_, err = repos.Outbox.Insert(ctx, app.OutboxMessage{ID: "not-a-uuid", AggregateType: "merchant", AggregateID: mm.PublicID(), EventType: "x", Payload: []byte("{}")})
-		return err
+		_, merr = repos.Outbox.Insert(ctx, app.OutboxMessage{ID: "not-a-uuid", AggregateType: "merchant", AggregateID: mm.PublicID(), EventType: "x", Payload: []byte("{}")})
+		return merr
 	})
 	require.Error(t, err)
-	assert.Equal(t, before, countRows(t, ctx, pool, "merchants"))
+	assert.Equal(t, before, countRows(ctx, t, pool, "merchants"))
 
 	// ---- seed-dev 走真實 DB ----
 	seed, err := svc.SeedDev(ctx)
@@ -353,7 +353,7 @@ func (c *capturePublisher) Publish(_ context.Context, topic, key string, _ []byt
 	return nil
 }
 
-func countRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, table string) int {
+func countRows(ctx context.Context, t *testing.T, pool *pgxpool.Pool, table string) int {
 	t.Helper()
 	var n int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM `+table).Scan(&n))

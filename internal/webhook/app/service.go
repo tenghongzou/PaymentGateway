@@ -38,7 +38,7 @@ type Deps struct {
 	// Policy 預設 StrictPolicy。
 	Policy domain.URLPolicy
 	// Rand 產生 [0,1) 亂數供 jitter；預設 math/rand/v2。
-	Rand func() float64
+	Rand func() float64 //nolint:forbidigo // jitter 亂數，非金額
 	// Consumer 預設 ConsumerName。
 	Consumer string
 	Logger   *slog.Logger
@@ -55,7 +55,7 @@ type Service struct {
 	sender     HTTPSender
 	clock      Clock
 	policy     domain.URLPolicy
-	rnd        func() float64
+	rnd        func() float64 //nolint:forbidigo // jitter 亂數，非金額
 	signer     domain.Signer
 	consumer   string
 	log        *slog.Logger
@@ -126,20 +126,20 @@ func (s *Service) IngestEvent(ctx context.Context, ev *domain.Event) (IngestResu
 
 	var res IngestResult
 	err = s.tx.InTx(ctx, func(ctx context.Context) error {
-		already, err := s.inbox.MarkProcessed(ctx, ev.ID, s.consumer)
-		if err != nil {
-			return err
+		already, markErr := s.inbox.MarkProcessed(ctx, ev.ID, s.consumer)
+		if markErr != nil {
+			return markErr
 		}
 		if already {
 			res.Duplicate = true
 			return nil
 		}
-		if err := s.events.Insert(ctx, ev); err != nil {
-			return err
+		if insErr := s.events.Insert(ctx, ev); insErr != nil {
+			return insErr
 		}
 		if len(ds) > 0 {
-			if err := s.deliveries.InsertPending(ctx, ds); err != nil {
-				return err
+			if insErr := s.deliveries.InsertPending(ctx, ds); insErr != nil {
+				return insErr
 			}
 		}
 		res.Deliveries = len(ds)

@@ -39,7 +39,7 @@ func TestNextAttemptAtJitter(t *testing.T) {
 	assert.Equal(t, now.Add(24*time.Minute), lo)
 	assert.WithinDuration(t, now.Add(36*time.Minute), hi, time.Second)
 	// 第 4 次失敗 → 2h 區間。
-	for _, rnd := range []float64{0, 0.25, 0.5, 0.75, 0.99} {
+	for _, rnd := range []float64{0, 0.25, 0.5, 0.75, 0.99} { //nolint:forbidigo // jitter 亂數，非金額
 		got := NextAttemptAt(now, 4, rnd)
 		assert.False(t, got.Before(now.Add(96*time.Minute)), "rnd=%v", rnd)
 		assert.False(t, got.After(now.Add(144*time.Minute)), "rnd=%v", rnd)
@@ -143,7 +143,7 @@ func TestDeliveryLifecycle_ConnectionErrorAndTruncation(t *testing.T) {
 
 	big := strings.Repeat("a", 5000) + "中"
 	assert.LessOrEqual(t, len(TruncateBody(big)), MaxResponseBodyBytes)
-	assert.Equal(t, 4096, len(TruncateBody(big)))
+	assert.Len(t, TruncateBody(big), 4096)
 	// 多位元組字元被截斷時不留下半個字。
 	s := strings.Repeat("a", 4095) + "中文"
 	out := TruncateBody(s)
@@ -154,7 +154,7 @@ func TestDeliveryLifecycle_ConnectionErrorAndTruncation(t *testing.T) {
 func TestDeliveryReapAndCancel(t *testing.T) {
 	now := time.Now().UTC()
 	d := newTestDelivery(now)
-	assert.ErrorIs(t, d.Reap(now), ErrInvalidTransition)
+	require.ErrorIs(t, d.Reap(now), ErrInvalidTransition)
 	require.NoError(t, d.Claim(now))
 	require.NoError(t, d.Reap(now.Add(3*time.Minute)))
 	assert.Equal(t, StatusFailed, d.Status)

@@ -94,7 +94,7 @@ func printEvent(out io.Writer, n int64, r *http.Request, body []byte, verified s
 	var pretty bytes.Buffer
 	if err := json.Indent(&pretty, body, "  ", "  "); err != nil {
 		pretty.Reset()
-		pretty.Write(body)
+		_, _ = pretty.Write(body) // bytes.Buffer.Write 不會回錯誤
 	}
 	fmt.Fprintf(out, "\n=== webhook #%d %s ===\n", n, time.Now().UTC().Format(time.RFC3339))
 	fmt.Fprintf(out, "  %s %s\n", r.Method, r.URL.Path)
@@ -129,7 +129,9 @@ func Main(args []string) int {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(sctx)
+		if err := srv.Shutdown(sctx); err != nil { //nolint:contextcheck // 關機階段：原 ctx 已取消，須用獨立 ctx 收尾（同 pkg/app 慣例）
+			log.Warn("sink shutdown", "err", err)
+		}
 	}()
 	log.Info("webhook dev sink listening", "addr", *addr, "secrets", len(secrets), "status", *status, "fail_first", *failFirst)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -142,6 +144,8 @@ func Main(args []string) int {
 type multiFlag []string
 
 func (m *multiFlag) String() string { return fmt.Sprint([]string(*m)) }
+
+// Set 實作 flag.Value（可重複指定）。
 func (m *multiFlag) Set(v string) error {
 	*m = append(*m, v)
 	return nil

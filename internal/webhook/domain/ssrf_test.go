@@ -14,7 +14,7 @@ func TestURLPolicyValidateURL(t *testing.T) {
 	ok := []string{"https://merchant.example.com/hooks", "https://merchant.example.com:8443/hooks", "https://a.b.co:443/x?y=1"}
 	for _, u := range ok {
 		_, err := strict.ValidateURL(u)
-		assert.NoError(t, err, u)
+		require.NoError(t, err, u)
 	}
 	bad := []string{
 		"http://merchant.example.com/hooks",
@@ -33,12 +33,12 @@ func TestURLPolicyValidateURL(t *testing.T) {
 	}
 	for _, u := range bad {
 		_, err := strict.ValidateURL(u)
-		assert.ErrorIs(t, err, ErrURLNotAllowed, u)
+		require.ErrorIs(t, err, ErrURLNotAllowed, u)
 	}
 	// dev 模式允許 http / localhost / 任意 port。
 	for _, u := range []string{"http://localhost:8099/sink", "http://127.0.0.1:8099/sink", "https://merchant.example.com/hooks"} {
 		_, err := DevPolicy.ValidateURL(u)
-		assert.NoError(t, err, u)
+		require.NoError(t, err, u)
 	}
 	_, err := DevPolicy.ValidateURL("ftp://x/y")
 	assert.Error(t, err)
@@ -51,11 +51,11 @@ func TestURLPolicyCheckAddr(t *testing.T) {
 		"0.0.0.0", "224.0.0.1", "255.255.255.255", "::1", "::", "fe80::1", "fd00::1", "::ffff:10.0.0.1", "64:ff9b::a00:1",
 	}
 	for _, s := range blocked {
-		assert.ErrorIs(t, strict.CheckAddr(netip.MustParseAddr(s)), ErrIPNotAllowed, s)
+		require.ErrorIs(t, strict.CheckAddr(netip.MustParseAddr(s)), ErrIPNotAllowed, s)
 	}
 	allowed := []string{"93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946", "172.32.0.1"}
 	for _, s := range allowed {
-		assert.NoError(t, strict.CheckAddr(netip.MustParseAddr(s)), s)
+		require.NoError(t, strict.CheckAddr(netip.MustParseAddr(s)), s)
 	}
 	assert.NoError(t, DevPolicy.CheckAddr(netip.MustParseAddr("127.0.0.1")))
 }
@@ -75,9 +75,9 @@ func TestURLPolicyResolveAndCheck(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, addrs, 1)
 	_, err = StrictPolicy.ResolveAndCheck(context.Background(), r, "mixed.example.com")
-	assert.ErrorIs(t, err, ErrIPNotAllowed)
+	require.ErrorIs(t, err, ErrIPNotAllowed)
 	_, err = StrictPolicy.ResolveAndCheck(context.Background(), r, "169.254.169.254")
-	assert.ErrorIs(t, err, ErrIPNotAllowed)
+	require.ErrorIs(t, err, ErrIPNotAllowed)
 	_, err = StrictPolicy.ResolveAndCheck(context.Background(), r, "unknown.example.com")
 	assert.Error(t, err)
 }

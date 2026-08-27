@@ -105,21 +105,21 @@ func (s *Service) postJournalTx(ctx context.Context, j *domain.Journal) (*domain
 
 	// 2. 沖銷：原 journal 必須存在、尚未被沖銷、分錄互為鏡像。
 	if j.ReversalOf != nil {
-		orig, err := s.journals.GetByID(ctx, *j.ReversalOf)
-		if err != nil {
-			return nil, false, err
+		orig, gerr := s.journals.GetByID(ctx, *j.ReversalOf)
+		if gerr != nil {
+			return nil, false, gerr
 		}
-		if err := domain.ValidateReversal(orig, j); err != nil {
-			return nil, false, err
+		if verr := domain.ValidateReversal(orig, j); verr != nil {
+			return nil, false, verr
 		}
 	}
 
 	// 3. 帳戶 lazy create 並解析 AccountID；帳戶必須 active。
 	resolved := make(map[domain.AccountKey]*domain.Account, len(j.Entries))
 	for _, key := range j.AccountKeys() {
-		acct, created, err := s.accounts.EnsureAccount(ctx, key)
-		if err != nil {
-			return nil, false, err
+		acct, created, aerr := s.accounts.EnsureAccount(ctx, key)
+		if aerr != nil {
+			return nil, false, aerr
 		}
 		if created {
 			s.log.DebugContext(ctx, "ledger account created", "account", key.String(), "account_id", acct.ID)
@@ -161,8 +161,8 @@ func (s *Service) postJournalTx(ctx context.Context, j *domain.Journal) (*domain
 	j.Metadata[domain.MetaLivemode] = fmt.Sprintf("%t", j.Livemode)
 
 	// 5. 寫入 journal + entries（同交易；deferred trigger 於 commit 再驗平衡）。
-	if err := s.journals.Insert(ctx, j); err != nil {
-		return nil, false, err
+	if ierr := s.journals.Insert(ctx, j); ierr != nil {
+		return nil, false, ierr
 	}
 
 	// 6. outbox：ledger.journal.posted → ledger.events（同交易，docs/02 §7.6 第 7 點）。
@@ -248,6 +248,9 @@ func (s *Service) PostManualJournal(ctx context.Context, in PostJournalInput) (*
 			refType = domain.RefReversal
 		case domain.SourcePayout:
 			refType = domain.RefSettlement
+		case domain.SourceReconciliationAdjustment, domain.SourceManualAdjustment, domain.SourcePaymentEvent:
+			// payment_event 已在上方被拒絕，列出僅為 switch 完整性。
+			refType = domain.RefAdjustment
 		default:
 			refType = domain.RefAdjustment
 		}
@@ -307,10 +310,10 @@ func (s *Service) ReverseJournal(ctx context.Context, journalID uuid.UUID, idemp
 		return nil, false, err
 	}
 	// 冪等：同一 idempotency key 重放時直接回傳既有沖銷 journal（此時原 journal 已帶 ReversedBy，domain.Reverse 會拒絕）。
-	if existing, err := s.journals.GetByEventID(ctx, eventID); err == nil {
+	if existing, gerr := s.journals.GetByEventID(ctx, eventID); gerr == nil {
 		return existing, true, nil
-	} else if !errors.Is(err, domain.ErrJournalNotFound) {
-		return nil, false, err
+	} else if !errors.Is(gerr, domain.ErrJournalNotFound) {
+		return nil, false, gerr
 	}
 	orig, err := s.journals.GetByID(ctx, journalID)
 	if err != nil {
@@ -413,6 +416,10 @@ func (s *Service) GetMerchantBalances(ctx context.Context, merchantID uuid.UUID,
 			mb.Pending = b.Balance
 		case domain.KindChargebackReserve:
 			mb.Reserved = b.Balance
+		case domain.KindPSPReceivable, domain.KindBankCash, domain.KindSettlementSuspense,
+			domain.KindFeeRevenue, domain.KindChargebackFeeRevenue,
+			domain.KindPSPFeeExpense, domain.KindChargebackFeeExpense:
+			// 系統科目不屬於商戶餘額拆解（ListByMerchant 依 merchant_id 過濾，正常不會出現）。
 		}
 		if b.UpdatedAt.After(mb.AsOf) {
 			mb.AsOf = b.UpdatedAt

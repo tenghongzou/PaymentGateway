@@ -37,6 +37,8 @@ func (t LineType) Matchable() bool {
 	switch t {
 	case LinePayment, LineRefund, LineChargeback:
 		return true
+	case LineFee, LineAdjustment:
+		return false
 	}
 	return false
 }

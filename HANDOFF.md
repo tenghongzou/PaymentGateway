@@ -1,6 +1,6 @@
 # HANDOFF — PaymentGateway Phase 0
 
-**日期**：2026-08-21　**狀態**：Phase 0 完成（設計 + 可編譯 monorepo + provider-mock 端到端）
+**日期**：2026-08-21（收尾更新 2026-08-27）　**狀態**：Phase 0 完成並收尾（設計 + 可編譯 monorepo + provider-mock 端到端；lint 全 repo 0 issues）
 
 ## 10 分鐘上手
 1. 讀 [`docs/01-architecture.md`](docs/01-architecture.md)（單一事實來源）→ [`docs/10-codebase-guide.md`](docs/10-codebase-guide.md)（程式碼導覽）。
@@ -16,8 +16,11 @@
 | 部署 | Dockerfile、compose、Helm、GitHub Actions、OTel/告警 | `compose config`、`helm lint/template` |
 | 程式 | `pkg/` 14 套件 + 8 服務（api-gateway、payment、merchant、ledger、webhook、reconciliation、provider-mock、provider-stripe 骨架） | `go build/vet` ✅、`go test ./...` 36 套件 ✅、`make build` 8 binary ✅、e2e 7 案例 ✅ |
 
-## 立即待辦
-- **Lint**：`internal/{merchant,ledger,webhook,reconciliation}` 共 412 條 golangci-lint（核心套件 0）。一次只跑一個目錄，指令見 `docs/11` §2.1。
+## 收尾狀態（2026-08-27）
+- **Lint**：~~412 條~~ → **全 repo 0 issues**（`./bin/golangci-lint run ./...`；修法與保留的單行 nolint 清單見 `docs/11` §2.1）。
+- **文件小修**：02 §0.2 前綴依 SQL 改 `re_/dp_/we_`；02 附錄 B 與 05 §7.2 #11 依 OpenAPI 改為 14 種事件全推送（`docs/11` §2.2）。
+
+## Phase 1 待辦
 - **Schema backlog**：部分欄位暫存 jsonb，Phase 1 第一個 migration 清單見 `docs/11` §3。
 - **Proto backlog**：`IngestProviderWebhook`、`LedgerEvent`、`DisputeOpened.stage` 等，見 `docs/11` §4。
 - **已知風險**：簽章 canonical 無 nonce，同商戶同秒完全相同的請求會被判重放（`docs/11` §5）。

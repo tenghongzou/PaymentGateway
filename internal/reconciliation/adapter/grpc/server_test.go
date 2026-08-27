@@ -49,7 +49,11 @@ func newEnv(t *testing.T, maxBytes int64) *env {
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer()
 	srv.Register(gs)
-	go func() { _ = gs.Serve(lis) }()
+	go func() {
+		if err := gs.Serve(lis); err != nil {
+			panic(err) // bufconn 上 Serve 只在測試環境異常時失敗
+		}
+	}()
 	t.Cleanup(gs.Stop)
 
 	conn, err := grpc.NewClient("passthrough:///bufnet",
@@ -285,10 +289,15 @@ func TestImportSettlementFile_SourceURL(t *testing.T) {
 		assert.Equal(t, int64(6), resp.GetRun().GetSummary().GetTotalRecords())
 	})
 	t.Run("http url", func(t *testing.T) {
-		content, _ := os.ReadFile(abs)
+		content, err := os.ReadFile(abs)
+		require.NoError(t, err)
 		body := append([]byte(nil), content...)
 		body = append(body, []byte("payment,mock_ch_HTTP,1,TWD,0,2026-08-19T00:00:00Z\n")...)
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if _, werr := w.Write(body); werr != nil {
+				t.Errorf("write body: %v", werr)
+			}
+		}))
 		defer ts.Close()
 		m := mockMeta()
 		m.SourceUrl = ts.URL + "/mock.csv"
@@ -330,20 +339,25 @@ func TestFetcher_Limits(t *testing.T) {
 
 	f := grpcadapter.NewFetcher(grpcadapter.FetcherOptions{MaxBytes: 1024, AllowedDirs: []string{dir}})
 	_, err := f.Fetch(context.Background(), "file://"+filepath.ToSlash(big))
-	assert.ErrorIs(t, err, grpcadapter.ErrFileTooLarge)
+	require.ErrorIs(t, err, grpcadapter.ErrFileTooLarge)
 	b, err := f.Fetch(context.Background(), "file://"+filepath.ToSlash(small))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("x"), b)
 
-	abs, _ := filepath.Abs(fixturePath())
+	abs, err := filepath.Abs(fixturePath())
+	require.NoError(t, err)
 	_, err = f.Fetch(context.Background(), "file://"+filepath.ToSlash(abs))
 	require.Error(t, err, "AllowedDirs 之外")
 	st := grpcx.ErrorFromDomain(err)
 	assert.Equal(t, codes.PermissionDenied, status.Code(st))
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(make([]byte, 4096)) }))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if _, werr := w.Write(make([]byte, 4096)); werr != nil {
+			t.Errorf("write body: %v", werr)
+		}
+	}))
 	defer ts.Close()
 	_, err = f.Fetch(context.Background(), ts.URL)
-	assert.ErrorIs(t, err, grpcadapter.ErrFileTooLarge)
+	require.ErrorIs(t, err, grpcadapter.ErrFileTooLarge)
 	assert.Equal(t, codes.ResourceExhausted, status.Code(grpcx.ErrorFromDomain(err)))
 }

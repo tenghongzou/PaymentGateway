@@ -30,7 +30,7 @@ type apiKeyMeta struct {
 	PreviousSecretExpiresAt  *time.Time `json:"_previous_secret_expires_at,omitempty"`
 }
 
-const apiKeyColumns = `id, merchant_id, prefix, key_hash, mode, name, scopes, last_used_at, expires_at, revoked_at, metadata, created_at, updated_at`
+const apiKeyColumns = `id, merchant_id, prefix, key_hash, mode, name, scopes, last_used_at, expires_at, revoked_at, metadata, created_at, updated_at` //nolint:gosec // G101 誤判：SQL 欄位名稱清單，非硬編碼憑證
 
 func apiKeyMetaJSON(k *domain.ApiKey) ([]byte, error) {
 	b, err := json.Marshal(apiKeyMeta{

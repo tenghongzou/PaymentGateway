@@ -43,7 +43,9 @@ func scanAccount(row pgx.Row) (*domain.Account, error) {
 	a.Key.Currency = strings.TrimSpace(a.Key.Currency)
 	a.Metadata = map[string]string{}
 	if len(meta) > 0 {
-		_ = json.Unmarshal(meta, &a.Metadata)
+		if err := json.Unmarshal(meta, &a.Metadata); err != nil {
+			return nil, fmt.Errorf("ledger/postgres: decode account metadata: %w", err)
+		}
 	}
 	return &a, nil
 }
@@ -62,7 +64,10 @@ func (r *AccountRepo) EnsureAccount(ctx context.Context, key domain.AccountKey) 
 		return nil, false, err
 	}
 	acct.Metadata["livemode"] = fmt.Sprintf("%t", key.Livemode)
-	meta, _ := json.Marshal(acct.Metadata)
+	meta, err := json.Marshal(acct.Metadata)
+	if err != nil {
+		return nil, false, fmt.Errorf("ledger/postgres: encode account metadata: %w", err)
+	}
 	q := querierFrom(ctx, r.pool)
 	row := q.QueryRow(ctx, `
 		INSERT INTO accounts (merchant_id, code, name, type, normal_balance, currency, metadata)

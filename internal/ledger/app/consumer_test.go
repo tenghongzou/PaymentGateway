@@ -71,7 +71,8 @@ func TestHandlePaymentEvent_CapturePostsJCAP(t *testing.T) {
 	j := f.journals[0]
 	assert.Equal(t, domain.TemplateJCAP, j.Template)
 	assert.Equal(t, eventID, j.SourceID)
-	u, _ := ids.ParseWithPrefix(eventID, ids.PrefixEvent)
+	u, err := ids.ParseWithPrefix(eventID, ids.PrefixEvent)
+	require.NoError(t, err)
 	assert.Equal(t, u, j.EventID)
 	assert.Equal(t, "pay_1", j.Metadata[domain.MetaPaymentID])
 	assert.Equal(t, int64(967), f.balances.Of(domain.MerchantPayable(merchantA, "TWD", true)))
@@ -91,7 +92,8 @@ func TestHandlePaymentEvent_NoTemplateIsAcked(t *testing.T) {
 	require.NoError(t, svc.HandlePaymentEvent(context.Background(), rec))
 	assert.Empty(t, f.journals)
 	assert.Empty(t, f.outbox)
-	u, _ := ids.ParseWithPrefix(eventID, ids.PrefixEvent)
+	u, err := ids.ParseWithPrefix(eventID, ids.PrefixEvent)
+	require.NoError(t, err)
 	assert.True(t, f.processed[u.String()+"|"+ConsumerPaymentEvents], "processed_events still records the event")
 }
 
@@ -101,26 +103,27 @@ func TestHandlePaymentEvent_PoisonMessages(t *testing.T) {
 
 	// 無法反序列化
 	err := svc.HandlePaymentEvent(ctx, eventbus.Record{Value: []byte{0xff, 0xfe, 0x01}, Headers: map[string]string{eventbus.HeaderEventID: ids.New(ids.PrefixEvent)}})
-	assert.ErrorIs(t, err, ErrPoisonMessage)
+	require.ErrorIs(t, err, ErrPoisonMessage)
 
 	// event_id 格式錯誤
 	rec, _ := envelope(t, paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_CAPTURED, merchantA,
 		&paymentv1.PaymentCaptured{Amount: pmoney(1000), Provider: "stripe"})
 	rec.Headers[eventbus.HeaderEventID] = "garbage"
-	assert.ErrorIs(t, svc.HandlePaymentEvent(ctx, rec), ErrPoisonMessage)
+	require.ErrorIs(t, svc.HandlePaymentEvent(ctx, rec), ErrPoisonMessage)
 
 	// 缺 provider → 範本無法建立 → poison，且 processed_events 已 rollback（重試時會再處理）
 	rec, eventID := envelope(t, paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_CAPTURED, merchantA,
 		&paymentv1.PaymentCaptured{Amount: pmoney(1000)})
-	assert.ErrorIs(t, svc.HandlePaymentEvent(ctx, rec), ErrPoisonMessage)
-	u, _ := ids.ParseWithPrefix(eventID, ids.PrefixEvent)
+	require.ErrorIs(t, svc.HandlePaymentEvent(ctx, rec), ErrPoisonMessage)
+	u, err := ids.ParseWithPrefix(eventID, ids.PrefixEvent)
+	require.NoError(t, err)
 	assert.False(t, f.processed[u.String()+"|"+ConsumerPaymentEvents])
 	assert.Empty(t, f.journals)
 
 	// fee > amount
 	rec, _ = envelope(t, paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_CAPTURED, merchantA,
 		&paymentv1.PaymentCaptured{Amount: pmoney(10), Fee: pmoney(11), Provider: "stripe"})
-	assert.ErrorIs(t, svc.HandlePaymentEvent(ctx, rec), ErrPoisonMessage)
+	require.ErrorIs(t, svc.HandlePaymentEvent(ctx, rec), ErrPoisonMessage)
 
 	// 壞的 merchant_id
 	rec, _ = envelope(t, paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_CAPTURED, merchantA,
@@ -128,7 +131,8 @@ func TestHandlePaymentEvent_PoisonMessages(t *testing.T) {
 	var ev paymentv1.PaymentEvent
 	require.NoError(t, proto.Unmarshal(rec.Value, &ev))
 	ev.MerchantId = "mch_bad"
-	rec.Value, _ = proto.Marshal(&ev)
+	rec.Value, err = proto.Marshal(&ev)
+	require.NoError(t, err)
 	assert.ErrorIs(t, svc.HandlePaymentEvent(ctx, rec), ErrPoisonMessage)
 }
 
@@ -139,7 +143,8 @@ func TestHandlePaymentEvent_EventIDFallsBackToPayload(t *testing.T) {
 	delete(rec.Headers, eventbus.HeaderEventID)
 	require.NoError(t, svc.HandlePaymentEvent(context.Background(), rec))
 	require.Len(t, f.journals, 1)
-	u, _ := ids.ParseWithPrefix(eventID, ids.PrefixEvent)
+	u, err := ids.ParseWithPrefix(eventID, ids.PrefixEvent)
+	require.NoError(t, err)
 	assert.Equal(t, u, f.journals[0].EventID)
 }
 

@@ -105,9 +105,9 @@ func TestPostJournal_DuplicateRaceFallsBackToExisting(t *testing.T) {
 	var got *domain.Journal
 	var replayed bool
 	errRun := svc.tx.RunInTx(ctx, func(ctx context.Context) error {
-		var err error
-		got, replayed, err = svc.postJournalTx(ctx, j)
-		return err
+		var txErr error
+		got, replayed, txErr = svc.postJournalTx(ctx, j)
+		return txErr
 	})
 	require.ErrorIs(t, errRun, domain.ErrDuplicateEvent)
 	assert.Nil(t, got)
@@ -138,7 +138,7 @@ func TestPostJournal_RejectsInvalidAndRollsBack(t *testing.T) {
 	j := captureJournal(t, merchantA, uuid.New())
 	j.Entries[1].Amount = twd(900)
 	_, _, err := svc.PostJournal(ctx, j)
-	assert.ErrorIs(t, err, domain.ErrJournalUnbalanced)
+	require.ErrorIs(t, err, domain.ErrJournalUnbalanced)
 	assert.Empty(t, f.accounts)
 	assert.Empty(t, f.outbox)
 
@@ -156,7 +156,7 @@ func TestPostJournal_RejectsInvalidAndRollsBack(t *testing.T) {
 	require.NoError(t, err)
 	f.freeze(domain.MerchantPayable(merchantA, "TWD", true))
 	_, _, err = svc.PostJournal(ctx, captureJournal(t, merchantA, uuid.New()))
-	assert.ErrorIs(t, err, domain.ErrAccountInactive)
+	require.ErrorIs(t, err, domain.ErrAccountInactive)
 	assert.Len(t, f.journals, 1)
 }
 
@@ -189,7 +189,7 @@ func TestReverseJournal(t *testing.T) {
 
 	// 第二次沖銷（不同 key）被拒
 	_, _, err = svc.ReverseJournal(ctx, orig.ID, "ops-ticket-43", "again")
-	assert.ErrorIs(t, err, domain.ErrJournalAlreadyReversed)
+	require.ErrorIs(t, err, domain.ErrJournalAlreadyReversed)
 	assert.Len(t, f.journals, 2)
 
 	// 不存在
@@ -247,7 +247,7 @@ func TestPostManualJournal(t *testing.T) {
 	bad.IdempotencyKey = "y"
 	bad.Entries = []EntryInput{{AccountID: uuid.New(), Direction: domain.Debit, Amount: twd(1)}, {AccountID: recv.ID, Direction: domain.Credit, Amount: twd(1)}}
 	_, _, err = svc.PostManualJournal(ctx, bad)
-	assert.ErrorIs(t, err, domain.ErrAccountNotFound)
+	require.ErrorIs(t, err, domain.ErrAccountNotFound)
 
 	// 缺 description / key
 	bad = in
@@ -257,7 +257,7 @@ func TestPostManualJournal(t *testing.T) {
 	bad = in
 	bad.IdempotencyKey = ""
 	_, _, err = svc.PostManualJournal(ctx, bad)
-	assert.ErrorIs(t, err, domain.ErrEventIDMissing)
+	require.ErrorIs(t, err, domain.ErrEventIDMissing)
 
 	// 以 reverses_journal_id 手動沖銷：必須為鏡像
 	revIn := PostJournalInput{
@@ -278,7 +278,7 @@ func TestPostManualJournal(t *testing.T) {
 	notMirror.Entries[0].Amount = twd(11)
 	notMirror.Entries[1].Amount = twd(11)
 	_, _, err = svc.PostManualJournal(ctx, notMirror)
-	assert.ErrorIs(t, err, domain.ErrJournalAlreadyReversed)
+	require.ErrorIs(t, err, domain.ErrJournalAlreadyReversed)
 
 	// reverses_journal_id 但 source_type 不是 REVERSAL
 	wrongSrc := revIn
@@ -312,11 +312,11 @@ func TestQueries(t *testing.T) {
 	assert.Len(t, js2, 1)
 	assert.Nil(t, next2)
 	_, err = NewPage(2, "not-a-token")
-	assert.ErrorIs(t, err, ErrPageTokenInvalid)
+	require.ErrorIs(t, err, ErrPageTokenInvalid)
 
 	// GetJournal 商戶隔離
 	_, err = svc.GetJournal(ctx, js[0].ID, merchantB)
-	assert.ErrorIs(t, err, domain.ErrJournalNotFound)
+	require.ErrorIs(t, err, domain.ErrJournalNotFound)
 	got, err := svc.GetJournal(ctx, js[0].ID, merchantA)
 	require.NoError(t, err)
 	assert.Equal(t, js[0].ID, got.ID)
@@ -343,7 +343,7 @@ func TestQueries(t *testing.T) {
 	assert.Equal(t, int64(967*3), b.TotalCredit)
 	assert.Equal(t, int64(3), b.EntryCount)
 	_, err = svc.GetBalance(ctx, uuid.New())
-	assert.ErrorIs(t, err, domain.ErrAccountNotFound)
+	require.ErrorIs(t, err, domain.ErrAccountNotFound)
 
 	// GetMerchantBalances
 	mbs, err := svc.GetMerchantBalances(ctx, merchantA, "TWD", true)
@@ -375,9 +375,12 @@ func TestIdempotencyKeyToEventID(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, uuid.Nil, got)
 
-	a, _ := IdempotencyKeyToEventID("ticket-1")
-	b, _ := IdempotencyKeyToEventID("ticket-1")
-	c, _ := IdempotencyKeyToEventID("ticket-2")
+	a, err := IdempotencyKeyToEventID("ticket-1")
+	require.NoError(t, err)
+	b, err := IdempotencyKeyToEventID("ticket-1")
+	require.NoError(t, err)
+	c, err := IdempotencyKeyToEventID("ticket-2")
+	require.NoError(t, err)
 	assert.Equal(t, a, b)
 	assert.NotEqual(t, a, c)
 

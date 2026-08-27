@@ -36,7 +36,7 @@ func TestDiscrepancy_StateMachine(t *testing.T) {
 	})
 	t.Run("ignore requires note", func(t *testing.T) {
 		d := newOpen()
-		assert.ErrorIs(t, d.Ignore("  ", "ops:bob", now), ErrResolutionNoteRequired)
+		require.ErrorIs(t, d.Ignore("  ", "ops:bob", now), ErrResolutionNoteRequired)
 		assert.Equal(t, DiscrepancyOpen, d.Status)
 	})
 	t.Run("resolved_by required", func(t *testing.T) {
@@ -46,7 +46,7 @@ func TestDiscrepancy_StateMachine(t *testing.T) {
 	t.Run("resolved → ignored rejected", func(t *testing.T) {
 		d := newOpen()
 		require.NoError(t, d.Resolve("x", "ops:a", now))
-		assert.ErrorIs(t, d.Ignore("y", "ops:a", now), ErrInvalidTransition)
+		require.ErrorIs(t, d.Ignore("y", "ops:a", now), ErrInvalidTransition)
 		assert.ErrorIs(t, d.Resolve("y", "ops:a", now), ErrInvalidTransition)
 	})
 	t.Run("ignored → resolved rejected", func(t *testing.T) {
@@ -65,7 +65,7 @@ func TestDiscrepancy_StateMachine(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, d.ID, u)
 		_, err = ParseDiscrepancyID("dsc_nope")
-		assert.ErrorIs(t, err, ErrDiscrepancyNotFound)
+		require.ErrorIs(t, err, ErrDiscrepancyNotFound)
 		_, err = ParseDiscrepancyID("garbage")
 		assert.ErrorIs(t, err, ErrDiscrepancyNotFound)
 	})
@@ -77,10 +77,10 @@ func TestRun_Lifecycle(t *testing.T) {
 	assert.Equal(t, time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC), start)
 	assert.Equal(t, 24*time.Hour, end.Sub(start))
 	_, _, err = PeriodForDate("19/08/2026")
-	assert.ErrorIs(t, err, ErrInvalidPeriod)
+	require.ErrorIs(t, err, ErrInvalidPeriod)
 
 	_, err = NewRun(MockProvider, end, start, "api", now)
-	assert.ErrorIs(t, err, ErrInvalidPeriod)
+	require.ErrorIs(t, err, ErrInvalidPeriod)
 
 	r, err := NewRun(MockProvider, start, end, "", now)
 	require.NoError(t, err)
@@ -92,15 +92,15 @@ func TestRun_Lifecycle(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, r.ID, u)
 	_, err = ParseRunID("rcn_x")
-	assert.ErrorIs(t, err, ErrRunNotFound)
+	require.ErrorIs(t, err, ErrRunNotFound)
 
 	require.NoError(t, r.Start(now))
 	assert.Equal(t, RunRunning, r.Status)
-	assert.ErrorIs(t, r.Start(now), ErrInvalidTransition)
+	require.ErrorIs(t, r.Start(now), ErrInvalidTransition)
 
 	res := NewMatcher().Match(MatchInput{Provider: MockProvider, Now: now,
 		Lines:   []SettlementLine{line(LinePayment, "ch_1", 1000, 59, "TWD"), line(LinePayment, "ch_2", 500, 0, "TWD"), line(LineFee, "f", 10, 0, "TWD")},
-		Records: []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD"), record(RecordPayment, "ch_3", StatusCaptured, 7, "TWD")},
+		Records: []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000), record(RecordPayment, "ch_3", StatusCaptured, 7)},
 	})
 	finish := now.Add(1500 * time.Millisecond)
 	require.NoError(t, r.Complete(res, finish))
@@ -114,15 +114,17 @@ func TestRun_Lifecycle(t *testing.T) {
 	assert.Equal(t, int64(69), r.Summary.TotalFees["TWD"])
 	assert.Equal(t, int64(1500), r.Summary.DurationMs)
 	assert.Equal(t, 2, r.Version)
-	assert.ErrorIs(t, r.Fail("x", now), ErrInvalidTransition)
-	assert.ErrorIs(t, r.Complete(res, now), ErrInvalidTransition)
+	require.ErrorIs(t, r.Fail("x", now), ErrInvalidTransition)
+	require.ErrorIs(t, r.Complete(res, now), ErrInvalidTransition)
 
-	r2, _ := NewRun(MockProvider, start, end, "scheduler", now)
+	r2, err := NewRun(MockProvider, start, end, "scheduler", now)
+	require.NoError(t, err)
 	require.NoError(t, r2.Fail("parse error", now))
 	assert.Equal(t, RunFailed, r2.Status)
 	assert.Equal(t, "parse error", r2.Error)
 
-	r3, _ := NewRun(MockProvider, start, end, "scheduler", now)
+	r3, err := NewRun(MockProvider, start, end, "scheduler", now)
+	require.NoError(t, err)
 	require.NoError(t, r3.Complete(MatchResult{}, now), "pending 可直接完成")
 	assert.NotNil(t, r3.StartedAt)
 }

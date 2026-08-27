@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "migrations:", err)
 		os.Exit(1)
 	}
-	if err := pgdb.Migrate(ctx, url, "reconciliation", src); err != nil {
+	if err = pgdb.Migrate(ctx, url, "reconciliation", src); err != nil {
 		fmt.Fprintln(os.Stderr, "migrate:", err)
 		os.Exit(1)
 	}
@@ -62,7 +62,9 @@ func TestMain(m *testing.M) {
 	}
 	code := m.Run()
 	pool.Close()
-	_ = testcontainers.TerminateContainer(pg)
+	if err = testcontainers.TerminateContainer(pg); err != nil {
+		fmt.Fprintln(os.Stderr, "terminate postgres:", err)
+	}
 	os.Exit(code)
 }
 
@@ -92,9 +94,9 @@ func TestFileRepo(t *testing.T) {
 	require.NoError(t, repos.FileRepo.Create(ctx, f))
 
 	dup := domain.NewSettlementFile("mock", "b.csv", f.FileHash, nil, nil, now)
-	assert.ErrorIs(t, repos.FileRepo.Create(ctx, dup), domain.ErrDuplicateFile)
+	require.ErrorIs(t, repos.FileRepo.Create(ctx, dup), domain.ErrDuplicateFile)
 
-	got, err := repos.FileRepo.GetByHash(ctx, f.FileHash)
+	got, err := repos.GetByHash(ctx, f.FileHash)
 	require.NoError(t, err)
 	assert.Equal(t, f.ID, got.ID)
 	assert.Equal(t, domain.FileImporting, got.Status)
@@ -108,7 +110,7 @@ func TestFileRepo(t *testing.T) {
 	assert.Equal(t, 1, got.Version)
 	stale := *f
 	stale.MarkFailed("x", now)
-	assert.ErrorIs(t, repos.FileRepo.Update(ctx, &stale), domain.ErrConcurrentModification)
+	require.ErrorIs(t, repos.FileRepo.Update(ctx, &stale), domain.ErrConcurrentModification)
 
 	byID, err := repos.FileRepo.GetByID(ctx, f.ID)
 	require.NoError(t, err)
@@ -116,8 +118,8 @@ func TestFileRepo(t *testing.T) {
 	assert.Equal(t, 3, byID.RowCount)
 	require.NotNil(t, byID.ImportedAt)
 
-	_, err = repos.FileRepo.GetByHash(ctx, "nope")
-	assert.ErrorIs(t, err, domain.ErrFileNotFound)
+	_, err = repos.GetByHash(ctx, "nope")
+	require.ErrorIs(t, err, domain.ErrFileNotFound)
 	_, err = repos.FileRepo.GetByID(ctx, ids.NewUUID())
 	assert.ErrorIs(t, err, domain.ErrFileNotFound)
 }
@@ -142,7 +144,7 @@ func TestLineRepo(t *testing.T) {
 	// 重跑：(file_id, line_no) 衝突略過。
 	require.NoError(t, repos.LineRepo.InsertBatch(ctx, lines))
 
-	got, err := repos.LineRepo.ListByFile(ctx, f.ID)
+	got, err := repos.ListByFile(ctx, f.ID)
 	require.NoError(t, err)
 	require.Len(t, got, 6)
 	assert.Equal(t, lines[0].ID, got[0].ID)
@@ -165,24 +167,24 @@ func TestPaymentRecordRepo(t *testing.T) {
 	old := now.Add(-5 * 24 * time.Hour)
 
 	r := record(domain.RecordPayment, "mock_ch_1", domain.StatusAuthorized, 1000, old)
-	applied, err := repos.PaymentRecordRepo.Upsert(ctx, &r)
+	applied, err := repos.Upsert(ctx, &r)
 	require.NoError(t, err)
 	assert.True(t, applied)
 
 	// 較新 seq：套用。
 	r.Status, r.SourceSeq = domain.StatusCaptured, 2
-	applied, err = repos.PaymentRecordRepo.Upsert(ctx, &r)
+	applied, err = repos.Upsert(ctx, &r)
 	require.NoError(t, err)
 	assert.True(t, applied)
 
 	// 較舊 seq：不套用。
 	stale := r
 	stale.Status, stale.SourceSeq = domain.StatusVoided, 1
-	applied, err = repos.PaymentRecordRepo.Upsert(ctx, &stale)
+	applied, err = repos.Upsert(ctx, &stale)
 	require.NoError(t, err)
 	assert.False(t, applied)
 
-	got, err := repos.PaymentRecordRepo.Get(ctx, r.ID)
+	got, err := repos.Get(ctx, r.ID)
 	require.NoError(t, err)
 	assert.Equal(t, domain.StatusCaptured, got.Status)
 	assert.Equal(t, 2, got.SourceSeq)
@@ -191,12 +193,13 @@ func TestPaymentRecordRepo(t *testing.T) {
 	// provider_reference 為空的更新不會抹掉既有值（COALESCE）。
 	noRef := r
 	noRef.ProviderReference, noRef.SourceSeq = "", 3
-	_, err = repos.PaymentRecordRepo.Upsert(ctx, &noRef)
+	_, err = repos.Upsert(ctx, &noRef)
 	require.NoError(t, err)
-	got, _ = repos.PaymentRecordRepo.Get(ctx, r.ID)
+	got, err = repos.Get(ctx, r.ID)
+	require.NoError(t, err)
 	assert.Equal(t, "mock_ch_1", got.ProviderReference)
 
-	missing, err := repos.PaymentRecordRepo.Get(ctx, ids.NewUUID())
+	missing, err := repos.Get(ctx, ids.NewUUID())
 	require.NoError(t, err)
 	assert.Nil(t, missing)
 
@@ -206,19 +209,19 @@ func TestPaymentRecordRepo(t *testing.T) {
 	other := record(domain.RecordPayment, "stripe_ch", domain.StatusCaptured, 5, old)
 	other.Provider = "stripe"
 	for _, x := range []*domain.PaymentRecord{&refund, &pending, &recent, &other} {
-		_, err := repos.PaymentRecordRepo.Upsert(ctx, x)
+		_, err = repos.Upsert(ctx, x)
 		require.NoError(t, err)
 	}
 
-	found, err := repos.PaymentRecordRepo.FindByProviderRefs(ctx, "mock", []string{"mock_ch_1", "mock_re_1", "zzz"})
+	found, err := repos.FindByProviderRefs(ctx, "mock", []string{"mock_ch_1", "mock_re_1", "zzz"})
 	require.NoError(t, err)
 	assert.Len(t, found, 2)
-	found, err = repos.PaymentRecordRepo.FindByProviderRefs(ctx, "mock", nil)
+	found, err = repos.FindByProviderRefs(ctx, "mock", nil)
 	require.NoError(t, err)
 	assert.Empty(t, found)
 
 	// 未結算：captured 付款 + succeeded 退款；pending 退款、近期、其他 provider 不算。
-	unsettled, err := repos.PaymentRecordRepo.ListUnsettled(ctx, "mock", now.Add(-72*time.Hour), 100)
+	unsettled, err := repos.ListUnsettled(ctx, "mock", now.Add(-72*time.Hour), 100)
 	require.NoError(t, err)
 	refs := map[string]bool{}
 	for _, u := range unsettled {
@@ -233,13 +236,13 @@ func TestPaymentRecordRepo(t *testing.T) {
 		ID: ids.NewUUID(), FileID: f.ID, LineNo: 1, Provider: "mock", ProviderReference: "mock_ch_1", Type: domain.LinePayment,
 		Amount: money.MustNew(1000, "TWD"), Fee: money.MustNew(59, "TWD"), SettledAt: now, CreatedAt: now,
 	}}))
-	unsettled, err = repos.PaymentRecordRepo.ListUnsettled(ctx, "mock", now.Add(-72*time.Hour), 100)
+	unsettled, err = repos.ListUnsettled(ctx, "mock", now.Add(-72*time.Hour), 100)
 	require.NoError(t, err)
 	require.Len(t, unsettled, 1)
 	assert.Equal(t, "mock_re_1", unsettled[0].ProviderReference)
 
 	// limit。
-	unsettled, err = repos.PaymentRecordRepo.ListUnsettled(ctx, "mock", now, 1)
+	unsettled, err = repos.ListUnsettled(ctx, "mock", now, 1)
 	require.NoError(t, err)
 	assert.Len(t, unsettled, 1)
 }
@@ -256,11 +259,11 @@ func TestRunAndDiscrepancyRepo(t *testing.T) {
 	run.Summary.FileID = fileID.String()
 	require.NoError(t, repos.RunRepo.Create(ctx, run))
 
-	byFile, err := repos.RunRepo.FindByFileID(ctx, fileID)
+	byFile, err := repos.FindByFileID(ctx, fileID)
 	require.NoError(t, err)
 	require.NotNil(t, byFile)
 	assert.Equal(t, run.ID, byFile.ID)
-	none, err := repos.RunRepo.FindByFileID(ctx, ids.NewUUID())
+	none, err := repos.FindByFileID(ctx, ids.NewUUID())
 	require.NoError(t, err)
 	assert.Nil(t, none)
 
@@ -299,20 +302,20 @@ func TestRunAndDiscrepancyRepo(t *testing.T) {
 	// 樂觀鎖：用舊版本更新 → 衝突。
 	stale := *got
 	stale.Version = got.Version - 1
-	assert.ErrorIs(t, repos.RunRepo.Update(ctx, &stale), domain.ErrConcurrentModification)
+	require.ErrorIs(t, repos.RunRepo.Update(ctx, &stale), domain.ErrConcurrentModification)
 	_, err = repos.RunRepo.GetByID(ctx, ids.NewUUID())
-	assert.ErrorIs(t, err, domain.ErrRunNotFound)
+	require.ErrorIs(t, err, domain.ErrRunNotFound)
 
 	// fee_mismatch 讀回仍是 fee_mismatch；DB 內 kind 為 amount_mismatch。
 	all, next, err := repos.DiscrepancyRepo.List(ctx, app.DiscrepancyFilter{PageSize: 10})
 	require.NoError(t, err)
 	assert.Empty(t, next)
 	require.Len(t, all, 3)
-	kinds := map[domain.DiscrepancyKind]int{}
+	kinds := map[string]int{}
 	for _, d := range all {
-		kinds[d.Kind]++
+		kinds[string(d.Kind)]++
 	}
-	assert.Equal(t, map[domain.DiscrepancyKind]int{domain.KindFeeMismatch: 1, domain.KindMissingInLedger: 1, domain.KindMissingInPSP: 1}, kinds)
+	assert.Equal(t, map[string]int{"fee_mismatch": 1, "missing_in_ledger": 1, "missing_in_psp": 1}, kinds)
 	var dbKind string
 	var details []byte
 	require.NoError(t, pool.QueryRow(ctx, `SELECT kind, details FROM discrepancies WHERE details->>'kind' = 'fee_mismatch'`).Scan(&dbKind, &details))
@@ -364,19 +367,19 @@ func TestRunAndDiscrepancyRepo(t *testing.T) {
 	assert.Empty(t, tok2)
 	assert.True(t, p1[0].CreatedAt.After(p1[1].CreatedAt) && p1[1].CreatedAt.After(p2[0].CreatedAt), "created_at DESC")
 	_, _, err = repos.DiscrepancyRepo.List(ctx, app.DiscrepancyFilter{PageToken: "!!"})
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	// ExistsOpen。
-	exists, err := repos.DiscrepancyRepo.ExistsOpen(ctx, "mock", domain.KindFeeMismatch, "mock_ch_1", "")
+	exists, err := repos.ExistsOpen(ctx, "mock", domain.KindFeeMismatch, "mock_ch_1", "")
 	require.NoError(t, err)
 	assert.True(t, exists)
-	exists, err = repos.DiscrepancyRepo.ExistsOpen(ctx, "mock", domain.KindAmountMismatch, "mock_ch_1", "")
+	exists, err = repos.ExistsOpen(ctx, "mock", domain.KindAmountMismatch, "mock_ch_1", "")
 	require.NoError(t, err)
 	assert.False(t, exists)
-	exists, err = repos.DiscrepancyRepo.ExistsOpen(ctx, "mock", domain.KindMissingInPSP, "", missing.PublicID)
+	exists, err = repos.ExistsOpen(ctx, "mock", domain.KindMissingInPSP, "", missing.PublicID)
 	require.NoError(t, err)
 	assert.True(t, exists)
-	exists, err = repos.DiscrepancyRepo.ExistsOpen(ctx, "stripe", domain.KindMissingInPSP, "", missing.PublicID)
+	exists, err = repos.ExistsOpen(ctx, "stripe", domain.KindMissingInPSP, "", missing.PublicID)
 	require.NoError(t, err)
 	assert.False(t, exists)
 
@@ -392,19 +395,20 @@ func TestRunAndDiscrepancyRepo(t *testing.T) {
 	assert.Equal(t, domain.KindFeeMismatch, got2.Kind)
 	assert.Equal(t, 1, got2.Version)
 	// 同版本再更新 → 衝突。
-	assert.ErrorIs(t, repos.DiscrepancyRepo.Update(ctx, &d), domain.ErrConcurrentModification)
-	exists, err = repos.DiscrepancyRepo.ExistsOpen(ctx, "mock", domain.KindFeeMismatch, "mock_ch_1", "")
+	require.ErrorIs(t, repos.DiscrepancyRepo.Update(ctx, &d), domain.ErrConcurrentModification)
+	exists, err = repos.ExistsOpen(ctx, "mock", domain.KindFeeMismatch, "mock_ch_1", "")
 	require.NoError(t, err)
 	assert.False(t, exists, "resolved 不算 open")
 	_, err = repos.DiscrepancyRepo.GetByID(ctx, ids.NewUUID())
-	assert.ErrorIs(t, err, domain.ErrDiscrepancyNotFound)
+	require.ErrorIs(t, err, domain.ErrDiscrepancyNotFound)
 
 	// CHECK：status=resolved 但 resolved_at NULL 會被 DB 擋下（繞過 domain）。
 	_, err = pool.Exec(ctx, `UPDATE discrepancies SET status = 'ignored', resolved_at = NULL WHERE id = $1`, d.ID)
 	assert.True(t, pgdb.IsCheckViolation(err))
 
 	// Run list。
-	run2, _ := domain.NewRun("mock", start.Add(24*time.Hour), start.Add(48*time.Hour), "scheduler", now.Add(time.Minute))
+	run2, err := domain.NewRun("mock", start.Add(24*time.Hour), start.Add(48*time.Hour), "scheduler", now.Add(time.Minute))
+	require.NoError(t, err)
 	require.NoError(t, repos.RunRepo.Create(ctx, run2))
 	runs, tok, err := repos.RunRepo.List(ctx, app.RunFilter{PageSize: 1})
 	require.NoError(t, err)
@@ -431,27 +435,27 @@ func TestTxManagerOutboxInbox(t *testing.T) {
 	repos := postgres.NewRepos(pool)
 
 	// 交易外使用 outbox / inbox → 錯誤。
-	_, err := repos.Outbox.Insert(ctx, app.OutboxMessage{AggregateType: "x", AggregateID: "y", EventType: "z", Payload: []byte("{}")})
-	assert.Error(t, err)
-	_, err = repos.Inbox.MarkProcessed(ctx, ids.NewUUID().String(), "c")
-	assert.Error(t, err)
+	_, err := repos.Insert(ctx, app.OutboxMessage{AggregateType: "x", AggregateID: "y", EventType: "z", Payload: []byte("{}")})
+	require.Error(t, err)
+	_, err = repos.MarkProcessed(ctx, ids.NewUUID().String(), "c")
+	require.Error(t, err)
 
 	eventID := ids.NewUUID().String()
 	err = repos.Tx.WithinTx(ctx, func(ctx context.Context) error {
-		already, err := repos.Inbox.MarkProcessed(ctx, eventID, "recon.test")
-		if err != nil {
-			return err
+		already, markErr := repos.MarkProcessed(ctx, eventID, "recon.test")
+		if markErr != nil {
+			return markErr
 		}
 		assert.False(t, already)
 		// 巢狀重用同一交易。
 		return repos.Tx.WithinTx(ctx, func(ctx context.Context) error {
-			already, err := repos.Inbox.MarkProcessed(ctx, eventID, "recon.test")
-			if err != nil {
-				return err
+			again, nestedErr := repos.MarkProcessed(ctx, eventID, "recon.test")
+			if nestedErr != nil {
+				return nestedErr
 			}
-			assert.True(t, already)
-			_, err = repos.Outbox.Insert(ctx, app.OutboxMessage{AggregateType: "reconciliation_run", AggregateID: "rr_1", EventType: "reconciliation.run.completed", Payload: []byte(`{"a":1}`), Headers: map[string]string{"content-type": "application/json"}})
-			return err
+			assert.True(t, again)
+			_, insErr := repos.Insert(ctx, app.OutboxMessage{AggregateType: "reconciliation_run", AggregateID: "rr_1", EventType: "reconciliation.run.completed", Payload: []byte(`{"a":1}`), Headers: map[string]string{"content-type": "application/json"}})
+			return insErr
 		})
 	})
 	require.NoError(t, err)
@@ -465,10 +469,11 @@ func TestTxManagerOutboxInbox(t *testing.T) {
 	// 回滾：fn 回錯誤 → 什麼都不留。
 	boom := errors.New("boom")
 	err = repos.Tx.WithinTx(ctx, func(ctx context.Context) error {
-		_, _ = repos.Inbox.MarkProcessed(ctx, ids.NewUUID().String(), "rollback")
+		_, markErr := repos.MarkProcessed(ctx, ids.NewUUID().String(), "rollback")
+		require.NoError(t, markErr)
 		return boom
 	})
-	assert.ErrorIs(t, err, boom)
+	require.ErrorIs(t, err, boom)
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM processed_events WHERE consumer = 'rollback'`).Scan(&n))
 	assert.Equal(t, 0, n)
 }
@@ -491,7 +496,7 @@ func TestEndToEndImport(t *testing.T) {
 		record(domain.RecordPayment, "mock_ch_OLD", domain.StatusCaptured, 77, old),
 	} {
 		rr := r
-		_, err := repos.PaymentRecordRepo.Upsert(ctx, &rr)
+		_, err := repos.Upsert(ctx, &rr)
 		require.NoError(t, err)
 	}
 	content, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "test", "fixtures", "settlement", "mock-2026-08-19.csv"))
@@ -525,7 +530,7 @@ func TestEndToEndImport(t *testing.T) {
 
 	// 解析失敗 → 檔案 failed 落地。
 	_, err = svc.ImportSettlementFile(ctx, app.ImportCommand{Provider: "mock", Format: domain.FormatMockCSV, FileName: "bad.csv", Content: []byte("type,provider_reference,amount_minor,currency,fee_minor,settled_at\npayment,x,abc,TWD,0,2026-08-19T00:00:00Z\n"), SettlementDate: "2026-08-19"})
-	assert.ErrorIs(t, err, domain.ErrParse)
+	require.ErrorIs(t, err, domain.ErrParse)
 	var st string
 	require.NoError(t, pool.QueryRow(ctx, `SELECT status FROM settlement_files WHERE file_name = 'bad.csv'`).Scan(&st))
 	assert.Equal(t, "failed", st)

@@ -29,7 +29,7 @@ type CreateApiKeyOutput struct { //nolint:revive // 與 proto 命名一致
 }
 
 // CreateApiKey 建立 API Key：Argon2id hash 入庫、signing secret 加密入庫、同交易寫 outbox。
-func (s *Service) CreateApiKey(ctx context.Context, in CreateApiKeyInput) (*CreateApiKeyOutput, error) {
+func (s *Service) CreateApiKey(ctx context.Context, in CreateApiKeyInput) (*CreateApiKeyOutput, error) { //nolint:revive // 與 proto 命名一致
 	if _, err := domain.ParseMode(string(in.Mode)); err != nil {
 		return nil, err
 	}
@@ -45,13 +45,13 @@ func (s *Service) CreateApiKey(ctx context.Context, in CreateApiKeyInput) (*Crea
 		return nil, domain.ErrParameterInvalid.WithParam("expires_at").WithMessage("expires_at must be in the future")
 	}
 	var out *CreateApiKeyOutput
-	err = s.tx.WithinTx(ctx, func(ctx context.Context) error {
+	txErr := s.tx.WithinTx(ctx, func(ctx context.Context) error {
 		m, err := s.lockMerchant(ctx, in.MerchantID)
 		if err != nil {
 			return err
 		}
-		if err := m.AssertWritable(); err != nil {
-			return err
+		if werr := m.AssertWritable(); werr != nil {
+			return werr
 		}
 		n, err := s.keys.CountActive(ctx, m.ID, in.Mode, now)
 		if err != nil {
@@ -82,14 +82,14 @@ func (s *Service) CreateApiKey(ctx context.Context, in CreateApiKeyInput) (*Crea
 		out = &CreateApiKeyOutput{Key: key, Plaintext: plaintext, SigningSecret: secret}
 		return s.emit(ctx, AggregateAPIKey, EventAPIKeyCreated, m.PublicID(), apiKeyEventData(key, now, ""))
 	})
-	if err != nil {
-		return nil, err
+	if txErr != nil {
+		return nil, txErr
 	}
 	return out, nil
 }
 
 // RevokeApiKey 撤銷 key（冪等）；發佈 api_key.revoked 讓 gateway 清快取。
-func (s *Service) RevokeApiKey(ctx context.Context, merchantID, apiKeyID, reason string) (*domain.ApiKey, error) {
+func (s *Service) RevokeApiKey(ctx context.Context, merchantID, apiKeyID, reason string) (*domain.ApiKey, error) { //nolint:revive // 與 proto 命名一致
 	mid, err := domain.ParseMerchantID(merchantID)
 	if err != nil {
 		return nil, err
@@ -99,7 +99,7 @@ func (s *Service) RevokeApiKey(ctx context.Context, merchantID, apiKeyID, reason
 		return nil, err
 	}
 	var out *domain.ApiKey
-	err = s.tx.WithinTx(ctx, func(ctx context.Context) error {
+	txErr := s.tx.WithinTx(ctx, func(ctx context.Context) error {
 		key, err := s.keys.Get(ctx, mid, kid)
 		if err != nil {
 			return err
@@ -116,8 +116,8 @@ func (s *Service) RevokeApiKey(ctx context.Context, merchantID, apiKeyID, reason
 		s.lastUsed.Delete(key.ID)
 		return s.emit(ctx, AggregateAPIKey, EventAPIKeyRevoked, merchantID, apiKeyEventData(key, now, reason))
 	})
-	if err != nil {
-		return nil, err
+	if txErr != nil {
+		return nil, txErr
 	}
 	return out, nil
 }
@@ -131,7 +131,7 @@ type ListApiKeysInput struct { //nolint:revive // 與 proto 命名一致
 }
 
 // ListApiKeys 列出商戶的 key（不含 hash / secret）。
-func (s *Service) ListApiKeys(ctx context.Context, in ListApiKeysInput) ([]*domain.ApiKey, string, error) {
+func (s *Service) ListApiKeys(ctx context.Context, in ListApiKeysInput) ([]*domain.ApiKey, string, error) { //nolint:revive // 與 proto 命名一致
 	mid, err := domain.ParseMerchantID(in.MerchantID)
 	if err != nil {
 		return nil, "", err
@@ -170,11 +170,11 @@ type VerifyApiKeyResult struct { //nolint:revive // 與 proto 命名一致
 //
 // 任何「無效」都回 Valid=false + Reason，不回 error（error 只代表系統故障）。
 // 找不到候選時仍執行一次 Argon2id，讓回應時間與比對失敗一致，避免列舉。
-func (s *Service) VerifyApiKey(ctx context.Context, plaintext string) (*VerifyApiKeyResult, error) {
+func (s *Service) VerifyApiKey(ctx context.Context, plaintext string) (*VerifyApiKeyResult, error) { //nolint:revive // 與 proto 命名一致
 	_, prefix, err := domain.ParseKey(plaintext)
 	if err != nil {
 		s.burnArgon2(plaintext)
-		return &VerifyApiKeyResult{Reason: ReasonNotFound}, nil
+		return &VerifyApiKeyResult{Reason: ReasonNotFound}, nil //nolint:nilerr // 格式不合法的 key 依契約回 Valid=false + Reason，不回 error（見函式註解）
 	}
 	candidates, err := s.keys.FindByPrefix(ctx, prefix)
 	if err != nil {
@@ -237,7 +237,7 @@ func (s *Service) burnArgon2(plaintext string) {
 // touchLastUsed 以每把 key 最多每 LastUsedInterval 一次的頻率更新 last_used_at（預設非同步）。
 func (s *Service) touchLastUsed(ctx context.Context, id uuid.UUID, now time.Time) {
 	if prev, ok := s.lastUsed.Load(id); ok {
-		if t, _ := prev.(time.Time); now.Sub(t) < s.cfg.LastUsedInterval {
+		if t, isTime := prev.(time.Time); isTime && now.Sub(t) < s.cfg.LastUsedInterval {
 			return
 		}
 	}

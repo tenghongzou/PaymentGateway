@@ -101,7 +101,9 @@ func scanJournal(row pgx.Row) (*domain.Journal, error) {
 	}
 	j.Metadata = map[string]string{}
 	if len(meta) > 0 {
-		_ = json.Unmarshal(meta, &j.Metadata)
+		if err := json.Unmarshal(meta, &j.Metadata); err != nil {
+			return nil, fmt.Errorf("ledger/postgres: decode journal metadata: %w", err)
+		}
 	}
 	j.Template = j.Metadata[domain.MetaTemplate]
 	j.SourceType = domain.SourceType(j.Metadata[domain.MetaSourceType])

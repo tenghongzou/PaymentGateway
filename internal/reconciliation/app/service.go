@@ -143,8 +143,9 @@ func (s *Service) ImportSettlementFile(ctx context.Context, cmd ImportCommand) (
 	}
 
 	// 1. 快速路徑：同檔已匯入且有 run → 直接回傳。
-	if res, err := s.findImported(ctx, hash); err != nil || res != nil {
-		return res, err
+	imported, err := s.findImported(ctx, hash)
+	if err != nil || imported != nil {
+		return imported, err
 	}
 
 	// 2. 解析（在交易外，避免長時間持有交易）。
@@ -158,7 +159,7 @@ func (s *Service) ImportSettlementFile(ctx context.Context, cmd ImportCommand) (
 
 	// 3. 主交易。
 	var out *ImportResult
-	err = s.d.Tx.WithinTx(ctx, func(ctx context.Context) error {
+	txErr := s.d.Tx.WithinTx(ctx, func(ctx context.Context) error {
 		now := s.d.Clock.Now()
 		file, err := s.loadOrCreateFile(ctx, cmd, hash, periodStart, periodEnd, now)
 		if err != nil {
@@ -166,14 +167,16 @@ func (s *Service) ImportSettlementFile(ctx context.Context, cmd ImportCommand) (
 		}
 		if file.Status == domain.FileImported {
 			// 曾匯入但沒有 run（匯入到一半崩潰）：以 DB 內既有的 lines 重做比對。
-			if run, err := s.d.Runs.FindByFileID(ctx, file.ID); err != nil {
+			var prev *domain.Run
+			if prev, err = s.d.Runs.FindByFileID(ctx, file.ID); err != nil {
 				return err
-			} else if run != nil {
-				out = &ImportResult{Run: run, File: file, AlreadyImported: true}
+			}
+			if prev != nil {
+				out = &ImportResult{Run: prev, File: file, AlreadyImported: true}
 				return nil
 			}
-			existing, err := s.d.Lines.ListByFile(ctx, file.ID)
-			if err != nil {
+			var existing []domain.SettlementLine
+			if existing, err = s.d.Lines.ListByFile(ctx, file.ID); err != nil {
 				return err
 			}
 			if len(existing) > 0 {
@@ -187,12 +190,12 @@ func (s *Service) ImportSettlementFile(ctx context.Context, cmd ImportCommand) (
 			lines[i].FileID = file.ID
 			lines[i].CreatedAt = now
 		}
-		if err := s.d.Lines.InsertBatch(ctx, lines); err != nil {
-			return err
+		if insErr := s.d.Lines.InsertBatch(ctx, lines); insErr != nil {
+			return insErr
 		}
 		file.MarkImported(len(lines), now)
-		if err := s.d.Files.Update(ctx, file); err != nil {
-			return err
+		if upErr := s.d.Files.Update(ctx, file); upErr != nil {
+			return upErr
 		}
 
 		run, err := domain.NewRun(cmd.Provider, periodStart, periodEnd, cmd.TriggeredBy, now)
@@ -216,8 +219,8 @@ func (s *Service) ImportSettlementFile(ctx context.Context, cmd ImportCommand) (
 		out = &ImportResult{Run: run, File: file}
 		return nil
 	})
-	if err != nil {
-		return nil, err
+	if txErr != nil {
+		return nil, txErr
 	}
 	return out, nil
 }
@@ -257,7 +260,7 @@ func (s *Service) loadOrCreateFile(ctx context.Context, cmd ImportCommand, hash 
 		if cmd.TriggeredBy != "" {
 			file.Metadata["triggered_by"] = cmd.TriggeredBy
 		}
-		if err := s.d.Files.Create(ctx, file); err != nil {
+		if err = s.d.Files.Create(ctx, file); err != nil {
 			if !errors.Is(err, domain.ErrDuplicateFile) {
 				return nil, err
 			}
@@ -288,7 +291,7 @@ func (s *Service) recordParseFailure(ctx context.Context, cmd ImportCommand, has
 			file.StorageURI = cmd.StorageURI
 			file.Metadata["format"] = string(cmd.Format)
 			file.MarkFailed(truncate(cause.Error(), 1000), now)
-			if err := s.d.Files.Create(ctx, file); err != nil && !errors.Is(err, domain.ErrDuplicateFile) {
+			if err = s.d.Files.Create(ctx, file); err != nil && !errors.Is(err, domain.ErrDuplicateFile) {
 				return err
 			}
 			return nil
@@ -334,7 +337,8 @@ func (s *Service) reconcile(ctx context.Context, run *domain.Run, file *domain.S
 	// 跨 run 去重：同 provider / kind / 參照已有 open 差異則不重複開單。
 	toInsert := make([]domain.Discrepancy, 0, len(res.Discrepancies))
 	suppressed := 0
-	for _, d := range res.Discrepancies {
+	for i := range res.Discrepancies {
+		d := &res.Discrepancies[i]
 		exists, err := s.d.Discrepancies.ExistsOpen(ctx, run.Provider, d.Kind, d.ProviderReference, d.InternalReference)
 		if err != nil {
 			return err
@@ -346,7 +350,7 @@ func (s *Service) reconcile(ctx context.Context, run *domain.Run, file *domain.S
 		d.RunID = run.ID
 		d.CreatedAt = now
 		d.UpdatedAt = now
-		toInsert = append(toInsert, d)
+		toInsert = append(toInsert, *d)
 	}
 	if err := s.d.Discrepancies.InsertBatch(ctx, toInsert); err != nil {
 		return err
@@ -368,7 +372,8 @@ func (s *Service) reconcile(ctx context.Context, run *domain.Run, file *domain.S
 	}); err != nil {
 		return err
 	}
-	for _, p := range res.Matched {
+	for i := range res.Matched {
+		p := &res.Matched[i]
 		if p.Record.Kind != domain.RecordPayment {
 			continue
 		}
@@ -464,7 +469,7 @@ func (s *Service) ResolveDiscrepancy(ctx context.Context, cmd ResolveCommand) (*
 		return nil, err
 	}
 	var out *domain.Discrepancy
-	err = s.d.Tx.WithinTx(ctx, func(ctx context.Context) error {
+	txErr := s.d.Tx.WithinTx(ctx, func(ctx context.Context) error {
 		d, err := s.d.Discrepancies.GetByID(ctx, id)
 		if err != nil {
 			return err
@@ -491,8 +496,8 @@ func (s *Service) ResolveDiscrepancy(ctx context.Context, cmd ResolveCommand) (*
 			}
 			d.Details[domain.DetailIdempotencyKey] = cmd.IdempotencyKey
 		}
-		if err := s.d.Discrepancies.Update(ctx, d); err != nil {
-			return err
+		if upErr := s.d.Discrepancies.Update(ctx, d); upErr != nil {
+			return upErr
 		}
 		run, err := s.d.Runs.GetByID(ctx, d.RunID)
 		runPublicID := ""
@@ -509,8 +514,8 @@ func (s *Service) ResolveDiscrepancy(ctx context.Context, cmd ResolveCommand) (*
 		out = d
 		return nil
 	})
-	if err != nil {
-		return nil, err
+	if txErr != nil {
+		return nil, txErr
 	}
 	return out, nil
 }

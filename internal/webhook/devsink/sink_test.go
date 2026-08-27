@@ -41,7 +41,7 @@ func TestHandler(t *testing.T) {
 	assert.Contains(t, s, `"type": "payment.captured"`)
 	assert.Equal(t, 5, strings.Count(s, "=== webhook #"))
 
-	req := httptest.NewRequest(http.MethodGet, "/webhook", nil)
+	req := httptest.NewRequest(http.MethodGet, "/webhook", http.NoBody)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)

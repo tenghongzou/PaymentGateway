@@ -66,9 +66,7 @@ func (r *DiscrepancyRepo) InsertBatch(ctx context.Context, ds []domain.Discrepan
 			d.ExpectedAmount, d.ActualAmount, d.Currency, string(d.Status), d.ResolutionNote, d.ResolvedBy, d.ResolvedAt, details,
 			d.CreatedAt, d.UpdatedAt, d.Version)
 	}
-	res := q(ctx, r.pool).(interface {
-		SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
-	}).SendBatch(ctx, batch)
+	res := q(ctx, r.pool).SendBatch(ctx, batch)
 	defer res.Close()
 	for range ds {
 		if _, err := res.Exec(); err != nil {
@@ -122,6 +120,8 @@ func kindCond(w *whereBuilder, kinds []domain.DiscrepancyKind) {
 			extra = append(extra, "(kind = 'amount_mismatch' AND details->>'kind' = 'fee_mismatch')")
 		case domain.KindAmountMismatch:
 			extra = append(extra, "(kind = 'amount_mismatch' AND (details->>'kind') IS DISTINCT FROM 'fee_mismatch')")
+		case domain.KindMissingInLedger, domain.KindMissingInPSP, domain.KindStatusMismatch:
+			plain = append(plain, string(k))
 		default:
 			plain = append(plain, string(k))
 		}
@@ -239,10 +239,12 @@ func scanDiscrepancies(rows pgx.Rows) ([]domain.Discrepancy, error) {
 		d.ResolutionNote, d.ResolvedBy = deref(note), deref(by)
 		d.Details = map[string]any{}
 		if len(details) > 0 {
-			_ = json.Unmarshal(details, &d.Details)
+			if err := json.Unmarshal(details, &d.Details); err != nil {
+				return nil, fmt.Errorf("postgres: unmarshal discrepancy details: %w", err)
+			}
 		}
-		if real := d.Detail(domain.DetailKind); real != "" && domain.DiscrepancyKind(real).IsValid() {
-			d.Kind = domain.DiscrepancyKind(real)
+		if actual := d.Detail(domain.DetailKind); actual != "" && domain.DiscrepancyKind(actual).IsValid() {
+			d.Kind = domain.DiscrepancyKind(actual)
 		}
 		out = append(out, d)
 	}

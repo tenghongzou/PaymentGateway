@@ -25,11 +25,11 @@ func line(t LineType, ref string, amount, fee int64, cur string) SettlementLine 
 	}
 }
 
-func record(kind RecordKind, ref, status string, amount int64, cur string) PaymentRecord {
+func record(kind RecordKind, ref, status string, amount int64) PaymentRecord {
 	return PaymentRecord{
 		ID: uuid.New(), Kind: kind, PublicID: string(kind) + "_" + ref, MerchantID: merchantID,
 		Provider: MockProvider, ProviderReference: ref, Status: status,
-		Amount:     money.Money{AmountMinor: amount, Currency: cur},
+		Amount:     money.Money{AmountMinor: amount, Currency: "TWD"},
 		OccurredAt: now.Add(-48 * time.Hour), SourceSeq: 1,
 	}
 }
@@ -55,13 +55,13 @@ func TestMatcher_Kinds(t *testing.T) {
 		{
 			name:        "exact match payment",
 			lines:       []SettlementLine{line(LinePayment, "ch_1", 1000, 59, "TWD")},
-			records:     []PaymentRecord{withFee(record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD"), 59)},
+			records:     []PaymentRecord{withFee(record(RecordPayment, "ch_1", StatusCaptured, 1000), 59)},
 			wantMatched: 1,
 		},
 		{
 			name:        "match ignores fee when internal fee unknown",
 			lines:       []SettlementLine{line(LinePayment, "ch_1", 1000, 59, "TWD")},
-			records:     []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")},
+			records:     []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000)},
 			wantMatched: 1,
 		},
 		{
@@ -84,12 +84,12 @@ func TestMatcher_Kinds(t *testing.T) {
 		{
 			name:      "missing_in_ledger when type differs",
 			lines:     []SettlementLine{line(LineRefund, "ch_1", 1000, 0, "TWD")},
-			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")},
+			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000)},
 			wantKinds: []DiscrepancyKind{KindMissingInLedger, KindMissingInPSP},
 		},
 		{
 			name:      "missing_in_psp",
-			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")},
+			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000)},
 			wantKinds: []DiscrepancyKind{KindMissingInPSP},
 			check: func(t *testing.T, res MatchResult) {
 				d := res.Discrepancies[0]
@@ -103,29 +103,29 @@ func TestMatcher_Kinds(t *testing.T) {
 		},
 		{
 			name:         "missing_in_psp deferred within grace",
-			records:      []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")},
+			records:      []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000)},
 			grace:        72 * time.Hour,
 			wantDeferred: 1,
 		},
 		{
 			name:      "missing_in_psp opened after grace",
-			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")},
+			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000)},
 			grace:     24 * time.Hour,
 			wantKinds: []DiscrepancyKind{KindMissingInPSP},
 		},
 		{
 			name: "non-settleable records never missing_in_psp",
 			records: []PaymentRecord{
-				record(RecordPayment, "ch_a", StatusAuthorized, 1000, "TWD"),
-				record(RecordPayment, "ch_v", StatusVoided, 1000, "TWD"),
-				record(RecordRefund, "re_p", RefundPending, 100, "TWD"),
-				record(RecordDispute, "du_w", DisputeWon, 100, "TWD"),
+				record(RecordPayment, "ch_a", StatusAuthorized, 1000),
+				record(RecordPayment, "ch_v", StatusVoided, 1000),
+				record(RecordRefund, "re_p", RefundPending, 100),
+				record(RecordDispute, "du_w", DisputeWon, 100),
 			},
 		},
 		{
 			name:      "amount_mismatch",
 			lines:     []SettlementLine{line(LinePayment, "ch_1", 900, 0, "TWD")},
-			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")},
+			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000)},
 			wantKinds: []DiscrepancyKind{KindAmountMismatch},
 			check: func(t *testing.T, res MatchResult) {
 				d := res.Discrepancies[0]
@@ -139,7 +139,7 @@ func TestMatcher_Kinds(t *testing.T) {
 		{
 			name:      "currency mismatch reported as amount_mismatch",
 			lines:     []SettlementLine{line(LinePayment, "ch_1", 1000, 0, "USD")},
-			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")},
+			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000)},
 			wantKinds: []DiscrepancyKind{KindAmountMismatch},
 			check: func(t *testing.T, res MatchResult) {
 				assert.Equal(t, "currency_mismatch", res.Discrepancies[0].Detail(DetailReason))
@@ -149,7 +149,7 @@ func TestMatcher_Kinds(t *testing.T) {
 		{
 			name:      "status_mismatch voided payment settled",
 			lines:     []SettlementLine{line(LinePayment, "ch_1", 1000, 0, "TWD")},
-			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusVoided, 1000, "TWD")},
+			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusVoided, 1000)},
 			wantKinds: []DiscrepancyKind{KindStatusMismatch},
 			check: func(t *testing.T, res MatchResult) {
 				d := res.Discrepancies[0]
@@ -160,25 +160,25 @@ func TestMatcher_Kinds(t *testing.T) {
 		{
 			name:      "status_mismatch pending refund settled",
 			lines:     []SettlementLine{line(LineRefund, "re_1", 300, 0, "TWD")},
-			records:   []PaymentRecord{record(RecordRefund, "re_1", RefundPending, 300, "TWD")},
+			records:   []PaymentRecord{record(RecordRefund, "re_1", RefundPending, 300)},
 			wantKinds: []DiscrepancyKind{KindStatusMismatch},
 		},
 		{
 			name:      "status_mismatch won dispute settled as chargeback",
 			lines:     []SettlementLine{line(LineChargeback, "du_1", 1000, 0, "TWD")},
-			records:   []PaymentRecord{record(RecordDispute, "du_1", DisputeWon, 1000, "TWD")},
+			records:   []PaymentRecord{record(RecordDispute, "du_1", DisputeWon, 1000)},
 			wantKinds: []DiscrepancyKind{KindStatusMismatch},
 		},
 		{
 			name:      "status takes precedence over amount",
 			lines:     []SettlementLine{line(LinePayment, "ch_1", 1, 0, "TWD")},
-			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusAuthorized, 1000, "TWD")},
+			records:   []PaymentRecord{record(RecordPayment, "ch_1", StatusAuthorized, 1000)},
 			wantKinds: []DiscrepancyKind{KindStatusMismatch},
 		},
 		{
 			name:      "fee_mismatch",
 			lines:     []SettlementLine{line(LinePayment, "ch_1", 1000, 60, "TWD")},
-			records:   []PaymentRecord{withFee(record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD"), 59)},
+			records:   []PaymentRecord{withFee(record(RecordPayment, "ch_1", StatusCaptured, 1000), 59)},
 			wantKinds: []DiscrepancyKind{KindFeeMismatch},
 			check: func(t *testing.T, res MatchResult) {
 				d := res.Discrepancies[0]
@@ -191,13 +191,13 @@ func TestMatcher_Kinds(t *testing.T) {
 		{
 			name:      "amount takes precedence over fee",
 			lines:     []SettlementLine{line(LinePayment, "ch_1", 999, 60, "TWD")},
-			records:   []PaymentRecord{withFee(record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD"), 59)},
+			records:   []PaymentRecord{withFee(record(RecordPayment, "ch_1", StatusCaptured, 1000), 59)},
 			wantKinds: []DiscrepancyKind{KindAmountMismatch},
 		},
 		{
 			name:        "refund and chargeback match",
 			lines:       []SettlementLine{line(LineRefund, "re_1", 300, 0, "TWD"), line(LineChargeback, "du_1", 1000, 450, "TWD")},
-			records:     []PaymentRecord{record(RecordRefund, "re_1", RefundSucceeded, 300, "TWD"), record(RecordDispute, "du_1", DisputeLost, 1000, "TWD")},
+			records:     []PaymentRecord{record(RecordRefund, "re_1", RefundSucceeded, 300), record(RecordDispute, "du_1", DisputeLost, 1000)},
 			wantMatched: 2,
 		},
 		{
@@ -208,7 +208,7 @@ func TestMatcher_Kinds(t *testing.T) {
 		{
 			name:        "duplicate in settlement",
 			lines:       []SettlementLine{line(LinePayment, "ch_1", 1000, 0, "TWD"), line(LinePayment, "ch_1", 1000, 0, "TWD")},
-			records:     []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")},
+			records:     []PaymentRecord{record(RecordPayment, "ch_1", StatusCaptured, 1000)},
 			wantMatched: 1,
 			wantKinds:   []DiscrepancyKind{KindMissingInLedger},
 			check: func(t *testing.T, res MatchResult) {
@@ -219,7 +219,7 @@ func TestMatcher_Kinds(t *testing.T) {
 			name:  "records from other provider ignored",
 			lines: []SettlementLine{line(LinePayment, "ch_1", 1000, 0, "TWD")},
 			records: []PaymentRecord{func() PaymentRecord {
-				r := record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")
+				r := record(RecordPayment, "ch_1", StatusCaptured, 1000)
 				r.Provider = "stripe"
 				return r
 			}()},
@@ -231,12 +231,12 @@ func TestMatcher_Kinds(t *testing.T) {
 			lines: []SettlementLine{line(LinePayment, "ch_1", 1000, 0, "TWD")},
 			records: []PaymentRecord{
 				func() PaymentRecord {
-					r := record(RecordPayment, "ch_1", StatusAuthorized, 1000, "TWD")
+					r := record(RecordPayment, "ch_1", StatusAuthorized, 1000)
 					r.SourceSeq = 1
 					return r
 				}(),
 				func() PaymentRecord {
-					r := record(RecordPayment, "ch_1", StatusCaptured, 1000, "TWD")
+					r := record(RecordPayment, "ch_1", StatusCaptured, 1000)
 					r.SourceSeq = 2
 					return r
 				}(),

@@ -39,7 +39,8 @@ func TestHandlePaymentEvent_Projection(t *testing.T) {
 	svc, store, _ := newSvc(t, app.Config{ConsumerName: "recon.test"})
 	ctx := context.Background()
 	payID := ids.New(ids.PrefixPayment)
-	payUUID, _ := ids.ParseWithPrefix(payID, ids.PrefixPayment)
+	payUUID, err := ids.ParseWithPrefix(payID, ids.PrefixPayment)
+	require.NoError(t, err)
 
 	// authorized → captured。
 	auth := envelope(paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_AUTHORIZED, payID, 2)
@@ -60,12 +61,12 @@ func TestHandlePaymentEvent_Projection(t *testing.T) {
 	require.NotNil(t, r.Fee)
 	assert.Equal(t, int64(59), r.Fee.AmountMinor)
 
-	cap := envelope(paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_CAPTURED, payID, 3)
-	cap.PaymentStatus = paymentv1.PaymentStatus_PAYMENT_STATUS_CAPTURED
-	cap.Payload = &paymentv1.PaymentEvent_PaymentCaptured{PaymentCaptured: &paymentv1.PaymentCaptured{
+	captured := envelope(paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_CAPTURED, payID, 3)
+	captured.PaymentStatus = paymentv1.PaymentStatus_PAYMENT_STATUS_CAPTURED
+	captured.Payload = &paymentv1.PaymentEvent_PaymentCaptured{PaymentCaptured: &paymentv1.PaymentCaptured{
 		Amount: twd(800), TotalCapturedAmount: twd(800), Provider: "mock", ProviderReference: "mock_ch_1", Fee: twd(53), IsFinal: true,
 	}}
-	require.NoError(t, svc.HandlePaymentEvent(ctx, uuid.NewString(), mustMarshal(t, cap)))
+	require.NoError(t, svc.HandlePaymentEvent(ctx, uuid.NewString(), mustMarshal(t, captured)))
 	r = store.Records[payUUID]
 	assert.Equal(t, domain.StatusCaptured, r.Status)
 	assert.Equal(t, int64(800), r.Amount.AmountMinor, "以累計已請款為準")
@@ -80,14 +81,15 @@ func TestHandlePaymentEvent_Projection(t *testing.T) {
 	dupID := uuid.NewString()
 	voided := envelope(paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_VOIDED, payID, 9)
 	voided.Payload = &paymentv1.PaymentEvent_PaymentVoided{PaymentVoided: &paymentv1.PaymentVoided{Amount: twd(800), Provider: "mock", ProviderReference: "mock_ch_1"}}
-	require.NoError(t, svc.HandlePaymentEvent(ctx, dupID, mustMarshal(t, cap)))
+	require.NoError(t, svc.HandlePaymentEvent(ctx, dupID, mustMarshal(t, captured)))
 	require.NoError(t, svc.HandlePaymentEvent(ctx, dupID, mustMarshal(t, voided)))
 	assert.Equal(t, domain.StatusCaptured, store.Records[payUUID].Status)
 	assert.True(t, store.Processed[dupID+"|recon.test"])
 
 	// 退款：created（pending，無參照）→ succeeded。
 	refID := ids.New(ids.PrefixRefund)
-	refUUID, _ := ids.ParseWithPrefix(refID, ids.PrefixRefund)
+	refUUID, err := ids.ParseWithPrefix(refID, ids.PrefixRefund)
+	require.NoError(t, err)
 	rc := envelope(paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_REFUND_CREATED, payID, 4)
 	rc.Payload = &paymentv1.PaymentEvent_RefundCreated{RefundCreated: &paymentv1.RefundCreated{RefundId: refID, Amount: twd(300), Provider: "mock"}}
 	require.NoError(t, svc.HandlePaymentEvent(ctx, uuid.NewString(), mustMarshal(t, rc)))
@@ -103,7 +105,8 @@ func TestHandlePaymentEvent_Projection(t *testing.T) {
 
 	// 爭議：opened → lost。
 	dpID := ids.New(ids.PrefixDispute)
-	dpUUID, _ := ids.ParseWithPrefix(dpID, ids.PrefixDispute)
+	dpUUID, err := ids.ParseWithPrefix(dpID, ids.PrefixDispute)
+	require.NoError(t, err)
 	do := envelope(paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_DISPUTE_OPENED, payID, 6)
 	do.Payload = &paymentv1.PaymentEvent_DisputeOpened{DisputeOpened: &paymentv1.DisputeOpened{DisputeId: dpID, Amount: twd(800), Provider: "mock", ProviderReference: "mock_du_1", Fee: twd(450)}}
 	require.NoError(t, svc.HandlePaymentEvent(ctx, uuid.NewString(), mustMarshal(t, do)))
@@ -143,7 +146,7 @@ func TestHandlePaymentEvent_IrrelevantAndPoison(t *testing.T) {
 	err := svc.HandlePaymentEvent(ctx, uuid.NewString(), []byte{0xff, 0xff, 0xff})
 	require.Error(t, err)
 	var poison *app.ErrPoisonMessage
-	assert.ErrorAs(t, err, &poison)
+	require.ErrorAs(t, err, &poison)
 
 	// 缺 event_id。
 	err = svc.HandlePaymentEvent(ctx, "", mustMarshal(t, created))

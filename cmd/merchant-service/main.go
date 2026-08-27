@@ -199,8 +199,8 @@ func runSeedDev() int {
 		log.Error("migration source", "err", err)
 		return 1
 	}
-	if err := pgdb.Migrate(ctx, cfg.EffectiveMigrateURL(), migrationService, src); err != nil {
-		log.Error("migrate up", "err", err)
+	if merr := pgdb.Migrate(ctx, cfg.EffectiveMigrateURL(), migrationService, src); merr != nil {
+		log.Error("migrate up", "err", merr)
 		return 1
 	}
 	pool, err := pgdb.Connect(ctx, cfg.DatabaseURL)

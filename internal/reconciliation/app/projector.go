@@ -45,7 +45,7 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, eventID string, payloa
 			return nil
 		}
 		var ev paymentv1.PaymentEvent
-		if err := proto.Unmarshal(payload, &ev); err != nil {
+		if err = proto.Unmarshal(payload, &ev); err != nil {
 			return &ErrPoisonMessage{Err: err}
 		}
 		rec, ok := ProjectPaymentEvent(&ev, s.d.Clock.Now())
@@ -138,6 +138,14 @@ func ProjectPaymentEvent(ev *paymentv1.PaymentEvent, now time.Time) (*domain.Pay
 		if ev.GetEventType() == paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_DISPUTE_WON || p.GetOutcome() == providerv1.DisputeOutcome_DISPUTE_OUTCOME_WON {
 			base.Status = domain.DisputeWon
 		}
+	case paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_UNSPECIFIED,
+		paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_CREATED,
+		paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_REQUIRES_ACTION,
+		paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_FAILED,
+		paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_EXPIRED,
+		paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_DISPUTE_EVIDENCE_SUBMITTED:
+		// 未請款 / 未進入結算的事件與對帳讀模型無關：只去重，不投影。
+		return nil, false
 	default:
 		return nil, false
 	}

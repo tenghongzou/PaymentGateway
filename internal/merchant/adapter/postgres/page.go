@@ -23,14 +23,17 @@ type cursor struct {
 func filterHash(parts ...string) string {
 	h := sha256.New()
 	for _, p := range parts {
-		h.Write([]byte(p))
-		h.Write([]byte{0})
+		_, _ = h.Write([]byte(p)) // hash.Hash.Write 不回錯誤
+		_, _ = h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))[:8]
 }
 
 func encodeCursor(createdAt time.Time, id uuid.UUID, filter string) string {
-	b, _ := json.Marshal(cursor{CreatedAt: createdAt, ID: id, Filter: filter})
+	b, err := json.Marshal(cursor{CreatedAt: createdAt, ID: id, Filter: filter})
+	if err != nil {
+		return "" // cursor 欄位皆可序列化，理論上不會發生；發生時視為無下一頁
+	}
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 

@@ -40,8 +40,8 @@ func (s *Service) CreateWebhookEndpoint(ctx context.Context, in CreateWebhookEnd
 		if err != nil {
 			return err
 		}
-		if err := m.AssertWritable(); err != nil {
-			return err
+		if werr := m.AssertWritable(); werr != nil {
+			return werr
 		}
 		n, err := s.hooks.CountLive(ctx, m.ID)
 		if err != nil {
@@ -129,13 +129,13 @@ func (s *Service) UpdateWebhookEndpoint(ctx context.Context, in UpdateWebhookEnd
 		}
 	}
 	var out *WebhookEndpointView
-	err = s.tx.WithinTx(ctx, func(ctx context.Context) error {
+	txErr := s.tx.WithinTx(ctx, func(ctx context.Context) error {
 		m, err := s.merchants.GetForUpdate(ctx, mid)
 		if err != nil {
 			return err
 		}
-		if err := m.AssertWritable(); err != nil {
-			return err
+		if werr := m.AssertWritable(); werr != nil {
+			return werr
 		}
 		e, err := s.hooks.Get(ctx, mid, eid)
 		if err != nil {
@@ -188,8 +188,8 @@ func (s *Service) UpdateWebhookEndpoint(ctx context.Context, in UpdateWebhookEnd
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, err
+	if txErr != nil {
+		return nil, txErr
 	}
 	return out, nil
 }
@@ -263,8 +263,8 @@ func (s *Service) ListWebhookEndpoints(ctx context.Context, in ListWebhookEndpoi
 		return nil, "", err
 	}
 	if in.Mode != "" {
-		if _, err := domain.ParseMode(string(in.Mode)); err != nil {
-			return nil, "", err
+		if _, perr := domain.ParseMode(string(in.Mode)); perr != nil {
+			return nil, "", perr
 		}
 	}
 	items, next, err := s.hooks.List(ctx, mid, WebhookEndpointFilter{Mode: in.Mode, IncludeDeleted: in.IncludeDeleted}, in.Page.Normalize())

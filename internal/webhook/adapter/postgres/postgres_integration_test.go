@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -98,7 +99,7 @@ func TestIntegration_IngestDedupAndClaim(t *testing.T) {
 	assert.Empty(t, ds2)
 	// Inbox 在交易外呼叫 → 錯誤。
 	_, err := f.inbox.MarkProcessed(ctx, ev.ID, app.ConsumerName)
-	assert.Error(t, err)
+	require.Error(t, err)
 	// 同 (event, endpoint) 再 InsertPending → 靜默略過。
 	require.NoError(t, f.del.InsertPending(ctx, []*domain.Delivery{domain.NewDelivery(ev, f.ep, now)}))
 	page, err := f.del.List(ctx, app.DeliveryFilter{MerchantID: f.merch})
@@ -112,7 +113,7 @@ func TestIntegration_IngestDedupAndClaim(t *testing.T) {
 	assert.True(t, got.Livemode)
 	assert.JSONEq(t, string(ev.Payload), string(got.Payload))
 	_, err = f.ev.Get(ctx, uuid.New(), ev.ID)
-	assert.ErrorIs(t, err, domain.ErrEventNotFound)
+	require.ErrorIs(t, err, domain.ErrEventNotFound)
 
 	// 取件：未到期取不到；到期取到並轉 in_flight、attempt_no=1、帶 payload。
 	claimed, err := f.del.ClaimDue(ctx, now.Add(-time.Second), 10)
@@ -141,7 +142,7 @@ func TestIntegration_IngestDedupAndClaim(t *testing.T) {
 	// 樂觀鎖：舊版本再寫 → ErrConcurrentModification。
 	stale := *d
 	stale.Version = d.Version // 未 +1 → WHERE version = $v-1 不成立
-	assert.ErrorIs(t, f.del.Save(ctx, &stale, nil), pgdb.ErrConcurrentModification)
+	require.ErrorIs(t, f.del.Save(ctx, &stale, nil), pgdb.ErrConcurrentModification)
 
 	got2, err := f.del.Get(ctx, f.merch, d.ID)
 	require.NoError(t, err)
@@ -156,7 +157,7 @@ func TestIntegration_IngestDedupAndClaim(t *testing.T) {
 	assert.Equal(t, 250, atts[0].DurationMS)
 	assert.Equal(t, 503, *atts[0].ResponseStatus)
 	_, err = f.del.Get(ctx, uuid.New(), d.ID)
-	assert.ErrorIs(t, err, domain.ErrDeliveryNotFound)
+	require.ErrorIs(t, err, domain.ErrDeliveryNotFound)
 
 	// 到了 next_attempt_at 再次取件 → attempt_no=2；成功 → succeeded。
 	claimed, err = f.del.ClaimDue(ctx, got2.NextAttemptAt, 10)
@@ -170,7 +171,8 @@ func TestIntegration_IngestDedupAndClaim(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.StatusSucceeded, got3.Status)
 	require.NotNil(t, got3.DeliveredAt)
-	atts, _ = f.del.ListAttempts(ctx, d.ID)
+	atts, err = f.del.ListAttempts(ctx, d.ID)
+	require.NoError(t, err)
 	assert.Len(t, atts, 2)
 }
 
@@ -185,7 +187,12 @@ func TestIntegration_ClaimSkipLockedAndOrdering(t *testing.T) {
 	// 6 筆 pending；在一個未 commit 的交易內先鎖 2 筆，另一個連線只能拿到其餘 4 筆。
 	tx, err := f.store.Pool().Begin(ctx)
 	require.NoError(t, err)
-	defer tx.Rollback(ctx)
+	defer func() {
+		// 測試中段已明確 Rollback，這裡的收尾 Rollback 會回 ErrTxClosed。
+		if rerr := tx.Rollback(ctx); rerr != nil && !errors.Is(rerr, pgx.ErrTxClosed) {
+			t.Errorf("rollback: %v", rerr)
+		}
+	}()
 	rows, err := tx.Query(ctx, `SELECT id FROM webhook_deliveries WHERE status = 'pending' ORDER BY next_attempt_at LIMIT 2 FOR UPDATE SKIP LOCKED`)
 	require.NoError(t, err)
 	var locked []uuid.UUID
@@ -215,10 +222,11 @@ func TestIntegration_ReapCancelAndList(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	var evs []*domain.Event
 	for i := 0; i < 5; i++ {
-		ev := f.newEvent("payment.captured", now.Add(time.Duration(i)*time.Second))
+		typ := "payment.captured"
 		if i == 4 {
-			ev.Type = "refund.succeeded"
+			typ = "refund.succeeded"
 		}
+		ev := f.newEvent(typ, now.Add(time.Duration(i)*time.Second))
 		f.ingest(t, ev, f.ep)
 		evs = append(evs, ev)
 	}
@@ -239,7 +247,7 @@ func TestIntegration_ReapCancelAndList(t *testing.T) {
 	}
 	assert.Len(t, seen, 5)
 	_, err := f.del.List(ctx, app.DeliveryFilter{MerchantID: f.merch, PageToken: "garbage"})
-	assert.ErrorIs(t, err, app.ErrInvalidPageToken)
+	require.ErrorIs(t, err, app.ErrInvalidPageToken)
 
 	// 篩選：event_type、event_id、endpoint_id、livemode、時間。
 	page, err := f.del.List(ctx, app.DeliveryFilter{MerchantID: f.merch, EventType: "refund.succeeded"})
@@ -308,5 +316,5 @@ func TestIntegration_BodyLengthConstraint(t *testing.T) {
 	got, err := f.del.Get(ctx, f.merch, claimed[0].ID)
 	require.NoError(t, err)
 	assert.Len(t, *got.LastResponseBody, 4096)
-	assert.False(t, errors.Is(err, pgdb.ErrNotFound))
+	assert.NotErrorIs(t, err, pgdb.ErrNotFound)
 }

@@ -257,7 +257,14 @@ func errorTypeForCategory(c providerv1.ProviderErrorCategory) string {
 		return "invalid_request_error"
 	case providerv1.ProviderErrorCategory_PROVIDER_ERROR_CATEGORY_UNSPECIFIED, providerv1.ProviderErrorCategory_PROVIDER_ERROR_CATEGORY_UNKNOWN:
 		return "api_error"
+	case providerv1.ProviderErrorCategory_PROVIDER_ERROR_CATEGORY_DECLINED_HARD,
+		providerv1.ProviderErrorCategory_PROVIDER_ERROR_CATEGORY_DECLINED_SOFT,
+		providerv1.ProviderErrorCategory_PROVIDER_ERROR_CATEGORY_PROVIDER_UNAVAILABLE,
+		providerv1.ProviderErrorCategory_PROVIDER_ERROR_CATEGORY_FRAUD_SUSPECTED,
+		providerv1.ProviderErrorCategory_PROVIDER_ERROR_CATEGORY_AUTHENTICATION_REQUIRED:
+		return "provider_error"
 	default:
+		// 未來新增的 enum 值也視為 PSP 端錯誤。
 		return "provider_error"
 	}
 }

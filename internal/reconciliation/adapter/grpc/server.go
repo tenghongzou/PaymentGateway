@@ -98,7 +98,7 @@ func (s *Server) ImportSettlementFile(stream grpc.ClientStreamingServer[reconcil
 		}
 		// 清空剩餘訊息（client 不應再送 chunk，但容忍）。
 		for {
-			if _, err := stream.Recv(); err != nil {
+			if _, err = stream.Recv(); err != nil {
 				if errors.Is(err, io.EOF) {
 					break
 				}
@@ -264,6 +264,8 @@ func (s *Server) ResolveDiscrepancy(ctx context.Context, req *reconciliationv1.R
 	case reconciliationv1.ResolutionAction_RESOLUTION_ACTION_ADJUST_LEDGER, reconciliationv1.ResolutionAction_RESOLUTION_ACTION_RESYNC_PAYMENT:
 		// TODO(phase-1)：ADJUST_LEDGER 改由 ledger 消費 discrepancy 事件 + ops 工具 J-REV（docs/05 §9.2 第 6 點）；RESYNC_PAYMENT 需 payment-service GetPayment。
 		return nil, status.Errorf(codes.Unimplemented, "resolution action %s is not supported yet", req.GetAction())
+	case reconciliationv1.ResolutionAction_RESOLUTION_ACTION_UNSPECIFIED:
+		return nil, grpcx.ErrorFromDomain(apperr.ErrParameterMissing.WithMessage("action is required.").WithParam("action"))
 	default:
 		return nil, grpcx.ErrorFromDomain(apperr.ErrParameterMissing.WithMessage("action is required.").WithParam("action"))
 	}

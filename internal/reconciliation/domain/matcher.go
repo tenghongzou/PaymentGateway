@@ -166,6 +166,8 @@ func (m *Matcher) accumulate(t *Totals, line SettlementLine) {
 		t.Chargebacks[cur] += line.Amount.AmountMinor
 	case LineFee:
 		t.Fees[cur] += line.Amount.AmountMinor
+	case LineAdjustment:
+		// 調整列不列入任何合計（僅保留原始資料供人工檢視）。
 	}
 	if line.Fee.AmountMinor != 0 {
 		t.Fees[cur] += line.Fee.AmountMinor

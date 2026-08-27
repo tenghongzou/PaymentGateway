@@ -43,7 +43,7 @@ func newFixture(t *testing.T, outcomes ...domain.Outcome) *fixture {
 	f.eps.Add(f.ep)
 	f.svc = app.New(app.Deps{
 		Tx: f.store, Inbox: f.store, Events: &apptest.MemEventRepo{MemStore: f.store}, Deliveries: f.store, Endpoints: f.eps, Disabler: f.eps,
-		Sender: f.sender, Clock: f.clock, Policy: domain.StrictPolicy, Rand: func() float64 { return 0.5 },
+		Sender: f.sender, Clock: f.clock, Policy: domain.StrictPolicy, Rand: func() float64 { return 0.5 }, //nolint:forbidigo // jitter 亂數，非金額
 	})
 	return f
 }
@@ -153,16 +153,16 @@ func TestDispatch_TenFailuresToDeadLetter(t *testing.T) {
 	require.NoError(t, err)
 
 	for n := 1; n <= domain.MaxAttempts; n++ {
-		got, err := f.svc.DispatchDue(ctx, 50, 4)
-		require.NoError(t, err)
+		got, derr := f.svc.DispatchDue(ctx, 50, 4)
+		require.NoError(t, derr)
 		require.Equal(t, 1, got, "attempt %d should be dispatched", n)
 		d := f.store.First()
 		if n < domain.MaxAttempts {
 			assert.Equal(t, domain.StatusFailed, d.Status)
 			assert.Equal(t, f.clock.Now().Add(domain.Backoff(n+1)), d.NextAttemptAt)
 			// 還沒到時間 → 取不到。
-			got, err = f.svc.DispatchDue(ctx, 50, 4)
-			require.NoError(t, err)
+			got, derr = f.svc.DispatchDue(ctx, 50, 4)
+			require.NoError(t, derr)
 			assert.Equal(t, 0, got)
 			f.clock.Set(d.NextAttemptAt)
 		} else {
@@ -172,12 +172,14 @@ func TestDispatch_TenFailuresToDeadLetter(t *testing.T) {
 	assert.Len(t, f.sender.Requests, domain.MaxAttempts)
 	assert.Equal(t, "10", f.sender.Requests[9].Headers["X-PG-Attempt"])
 	d := f.store.First()
-	atts, _ := f.store.ListAttempts(ctx, d.ID)
+	atts, err := f.store.ListAttempts(ctx, d.ID)
+	require.NoError(t, err)
 	assert.Len(t, atts, 10)
 
 	// 死信不會再被取件。
 	f.clock.Advance(48 * time.Hour)
-	got, _ := f.svc.DispatchDue(ctx, 50, 4)
+	got, err := f.svc.DispatchDue(ctx, 50, 4)
+	require.NoError(t, err)
 	assert.Equal(t, 0, got)
 
 	// 手動重送 → pending、attempt 歸零、下一輪送出（這次成功）。
@@ -186,7 +188,8 @@ func TestDispatch_TenFailuresToDeadLetter(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.StatusPending, rd.Status)
 	assert.Equal(t, 0, rd.AttemptNo)
-	got, _ = f.svc.DispatchDue(ctx, 50, 4)
+	got, err = f.svc.DispatchDue(ctx, 50, 4)
+	require.NoError(t, err)
 	assert.Equal(t, 1, got)
 	assert.Equal(t, 1, f.store.CountByStatus(domain.StatusSucceeded))
 	assert.Equal(t, "1", f.sender.Requests[10].Headers["X-PG-Attempt"])
@@ -272,7 +275,8 @@ func TestDispatch_EndpointLookupErrorReleases(t *testing.T) {
 	assert.Equal(t, domain.StatusFailed, d.Status)
 	assert.Equal(t, 0, d.AttemptNo, "未真正嘗試，不計次")
 	assert.Equal(t, f.clock.Now().Add(app.EndpointLookupRetryIn), d.NextAttemptAt)
-	atts, _ := f.store.ListAttempts(ctx, d.ID)
+	atts, err := f.store.ListAttempts(ctx, d.ID)
+	require.NoError(t, err)
 	assert.Empty(t, atts)
 }
 
@@ -296,7 +300,8 @@ func TestReapStuckInFlight(t *testing.T) {
 	assert.EqualValues(t, 1, n)
 	assert.Equal(t, 1, f.store.CountByStatus(domain.StatusFailed))
 	// 回收後可再次取件。
-	got, _ := f.svc.DispatchDue(ctx, 50, 2)
+	got, err := f.svc.DispatchDue(ctx, 50, 2)
+	require.NoError(t, err)
 	assert.Equal(t, 1, got)
 }
 
@@ -307,11 +312,11 @@ func TestRetryDelivery_Preconditions(t *testing.T) {
 	require.NoError(t, err)
 	d := f.store.First()
 	_, err = f.svc.RetryDelivery(ctx, f.merch, d.ID, "")
-	assert.ErrorIs(t, err, domain.ErrIdempotencyKeyMissing)
+	require.ErrorIs(t, err, domain.ErrIdempotencyKeyMissing)
 	_, err = f.svc.RetryDelivery(ctx, f.merch, d.ID, "k1")
-	assert.ErrorIs(t, err, domain.ErrDeliveryNotRetryable, "pending 不可重送")
+	require.ErrorIs(t, err, domain.ErrDeliveryNotRetryable, "pending 不可重送")
 	_, err = f.svc.RetryDelivery(ctx, uuid.New(), d.ID, "k1")
-	assert.ErrorIs(t, err, domain.ErrDeliveryNotFound, "跨商戶 NOT_FOUND")
+	require.ErrorIs(t, err, domain.ErrDeliveryNotFound, "跨商戶 NOT_FOUND")
 
 	// 送成功後允許重放。
 	_, err = f.svc.DispatchDue(ctx, 50, 2)
@@ -325,7 +330,7 @@ func TestRetryDelivery_Preconditions(t *testing.T) {
 	assert.Equal(t, rd.ID, again.ID)
 	// 同 key 不同 delivery → 拒絕。
 	_, err = f.svc.RetryDelivery(ctx, f.merch, uuid.New(), "k2")
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	// 端點停用 → 拒絕。
 	_, err = f.svc.DispatchDue(ctx, 50, 2)
@@ -362,12 +367,15 @@ func TestEndpointCache(t *testing.T) {
 	eps, err := c.ListEndpoints(ctx, m)
 	require.NoError(t, err)
 	assert.Len(t, eps, 1)
-	_, _ = c.ListEndpoints(ctx, m)
-	_, _ = c.GetEndpoint(ctx, m, eps[0].ID)
+	_, err = c.ListEndpoints(ctx, m)
+	require.NoError(t, err)
+	_, err = c.GetEndpoint(ctx, m, eps[0].ID)
+	require.NoError(t, err)
 	assert.Equal(t, 1, src.Calls, "TTL 內只打一次上游")
 
 	clock.Advance(61 * time.Second)
-	_, _ = c.ListEndpoints(ctx, m)
+	_, err = c.ListEndpoints(ctx, m)
+	require.NoError(t, err)
 	assert.Equal(t, 2, src.Calls, "TTL 過期重新取得")
 
 	// 上游失敗 → 回過期資料。
@@ -380,7 +388,7 @@ func TestEndpointCache(t *testing.T) {
 	// Invalidate 後下次必打上游；上游仍失敗且無快取 → 錯誤。
 	c.Invalidate(m)
 	_, err = c.ListEndpoints(ctx, m)
-	assert.Error(t, err)
+	require.Error(t, err)
 	// 不存在的端點回 (nil, nil)。
 	src.Err = nil
 	ep, err := c.GetEndpoint(ctx, m, uuid.New())
@@ -399,7 +407,7 @@ func TestDispatcherWorkerStopsOnCancel(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("dispatcher did not stop")
 	}
@@ -410,7 +418,7 @@ func TestDispatcherWorkerStopsOnCancel(t *testing.T) {
 	rcancel()
 	select {
 	case err := <-rdone:
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("reaper did not stop")
 	}

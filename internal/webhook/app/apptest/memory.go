@@ -14,6 +14,7 @@ import (
 	"github.com/tenghongzou/paymentgateway/internal/webhook/domain"
 )
 
+// MemStore 為記憶體版 Transactor + Inbox + DeliveryRepo（含事件儲存）。
 type MemStore struct {
 	mu         sync.Mutex
 	processed  map[string]bool
@@ -23,6 +24,7 @@ type MemStore struct {
 	FailSave   error
 }
 
+// NewMemStore 建立 MemStore。
 func NewMemStore() *MemStore {
 	return &MemStore{
 		processed: map[string]bool{}, events: map[uuid.UUID]*domain.Event{},
@@ -30,10 +32,12 @@ func NewMemStore() *MemStore {
 	}
 }
 
+// InTx 實作 app.Transactor（記憶體版直接執行 fn）。
 func (m *MemStore) InTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	return fn(ctx)
 }
 
+// MarkProcessed 實作 app.Inbox。
 func (m *MemStore) MarkProcessed(_ context.Context, eventID uuid.UUID, consumer string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -48,6 +52,7 @@ func (m *MemStore) MarkProcessed(_ context.Context, eventID uuid.UUID, consumer 
 // MemEventRepo 實作 app.EventRepo（與 DeliveryRepo 的 Get 同名，故分開型別）。
 type MemEventRepo struct{ *MemStore }
 
+// Insert 實作 app.EventRepo。
 func (m *MemEventRepo) Insert(_ context.Context, ev *domain.Event) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -57,6 +62,7 @@ func (m *MemEventRepo) Insert(_ context.Context, ev *domain.Event) error {
 	return nil
 }
 
+// Get 實作 app.EventRepo。
 func (m *MemEventRepo) Get(_ context.Context, merchantID, eventID uuid.UUID) (*domain.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -67,6 +73,7 @@ func (m *MemEventRepo) Get(_ context.Context, merchantID, eventID uuid.UUID) (*d
 	return ev, nil
 }
 
+// InsertPending 實作 app.DeliveryRepo（同 (event, endpoint) 靜默略過）。
 func (m *MemStore) InsertPending(_ context.Context, ds []*domain.Delivery) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -85,6 +92,7 @@ func (m *MemStore) InsertPending(_ context.Context, ds []*domain.Delivery) error
 	return nil
 }
 
+// ClaimDue 實作 app.DeliveryRepo。
 func (m *MemStore) ClaimDue(_ context.Context, now time.Time, limit int) ([]*domain.Delivery, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -112,6 +120,7 @@ func (m *MemStore) ClaimDue(_ context.Context, now time.Time, limit int) ([]*dom
 	return out, nil
 }
 
+// Save 實作 app.DeliveryRepo（含樂觀鎖檢查）。
 func (m *MemStore) Save(_ context.Context, d *domain.Delivery, att *domain.Attempt) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -133,6 +142,7 @@ func (m *MemStore) Save(_ context.Context, d *domain.Delivery, att *domain.Attem
 	return nil
 }
 
+// Snapshot 回傳 delivery 目前狀態的複本（測試觀察用）。
 func (m *MemStore) Snapshot(id uuid.UUID) *domain.Delivery {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -144,6 +154,7 @@ func (m *MemStore) Snapshot(id uuid.UUID) *domain.Delivery {
 	return &c
 }
 
+// Get 實作 app.DeliveryRepo。
 func (m *MemStore) Get(_ context.Context, merchantID, id uuid.UUID) (*domain.Delivery, error) {
 	d := m.Snapshot(id)
 	if d == nil || d.MerchantID != merchantID {
@@ -157,12 +168,14 @@ func (m *MemStore) Get(_ context.Context, merchantID, id uuid.UUID) (*domain.Del
 	return d, nil
 }
 
+// ListAttempts 實作 app.DeliveryRepo。
 func (m *MemStore) ListAttempts(_ context.Context, id uuid.UUID) ([]*domain.Attempt, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]*domain.Attempt(nil), m.attempts[id]...), nil
 }
 
+// List 實作 app.DeliveryRepo（僅支援 merchant / status 篩選，不分頁）。
 func (m *MemStore) List(_ context.Context, f app.DeliveryFilter) (*app.DeliveryPage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -187,19 +200,23 @@ func (m *MemStore) List(_ context.Context, f app.DeliveryFilter) (*app.DeliveryP
 	return &app.DeliveryPage{Deliveries: out}, nil
 }
 
+// ReapStuck 實作 app.DeliveryRepo。
 func (m *MemStore) ReapStuck(_ context.Context, before, now time.Time) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var n int64
 	for _, d := range m.deliveries {
 		if d.Status == domain.StatusInFlight && d.UpdatedAt.Before(before) {
-			_ = d.Reap(now)
+			if err := d.Reap(now); err != nil {
+				return n, err
+			}
 			n++
 		}
 	}
 	return n, nil
 }
 
+// CancelForEndpoint 實作 app.DeliveryRepo。
 func (m *MemStore) CancelForEndpoint(_ context.Context, endpointID uuid.UUID, now time.Time, reason string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -212,6 +229,7 @@ func (m *MemStore) CancelForEndpoint(_ context.Context, endpointID uuid.UUID, no
 	return n, nil
 }
 
+// CountByStatus 回傳指定狀態的 delivery 數（測試觀察用）。
 func (m *MemStore) CountByStatus(s domain.DeliveryStatus) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -234,14 +252,17 @@ type MemEndpoints struct {
 	Invalidated int
 }
 
+// NewMemEndpoints 建立 MemEndpoints。
 func NewMemEndpoints() *MemEndpoints {
 	return &MemEndpoints{ByMerch: map[uuid.UUID][]*domain.Endpoint{}}
 }
 
+// Add 加入端點。
 func (m *MemEndpoints) Add(ep *domain.Endpoint) {
 	m.ByMerch[ep.MerchantID] = append(m.ByMerch[ep.MerchantID], ep)
 }
 
+// ListEndpoints 實作 app.EndpointSource。
 func (m *MemEndpoints) ListEndpoints(_ context.Context, merchantID uuid.UUID) ([]*domain.Endpoint, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -252,6 +273,7 @@ func (m *MemEndpoints) ListEndpoints(_ context.Context, merchantID uuid.UUID) ([
 	return m.ByMerch[merchantID], nil
 }
 
+// GetEndpoint 實作 app.EndpointSource。
 func (m *MemEndpoints) GetEndpoint(ctx context.Context, merchantID, endpointID uuid.UUID) (*domain.Endpoint, error) {
 	eps, err := m.ListEndpoints(ctx, merchantID)
 	if err != nil {
@@ -265,6 +287,7 @@ func (m *MemEndpoints) GetEndpoint(ctx context.Context, merchantID, endpointID u
 	return nil, nil
 }
 
+// DisableEndpoint 實作 app.EndpointDisabler。
 func (m *MemEndpoints) DisableEndpoint(_ context.Context, _ uuid.UUID, endpointID uuid.UUID, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -279,6 +302,7 @@ func (m *MemEndpoints) DisableEndpoint(_ context.Context, _ uuid.UUID, endpointI
 	return nil
 }
 
+// Invalidate 實作 app.EndpointInvalidator（只計數）。
 func (m *MemEndpoints) Invalidate(uuid.UUID) {
 	m.mu.Lock()
 	m.Invalidated++
@@ -292,6 +316,7 @@ type ScriptedSender struct {
 	Requests []app.SendRequest
 }
 
+// Send 實作 app.HTTPSender。
 func (s *ScriptedSender) Send(_ context.Context, req app.SendRequest) domain.Outcome {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -312,18 +337,21 @@ type FakeClock struct {
 	t  time.Time
 }
 
+// Now 實作 app.Clock。
 func (c *FakeClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.t
 }
 
+// Advance 把時間往前撥 d。
 func (c *FakeClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	c.t = c.t.Add(d)
 	c.mu.Unlock()
 }
 
+// Set 把時間設為 t。
 func (c *FakeClock) Set(t time.Time) {
 	c.mu.Lock()
 	c.t = t

@@ -52,7 +52,7 @@ func TestURLPolicyProduction(t *testing.T) {
 			if tt.wantErr {
 				require.Error(t, err)
 				if tt.url != "" {
-					assert.ErrorIs(t, err, ErrWebhookURLInvalid)
+					require.ErrorIs(t, err, ErrWebhookURLInvalid)
 				}
 				return
 			}
@@ -64,7 +64,7 @@ func TestURLPolicyProduction(t *testing.T) {
 func TestURLPolicyDev(t *testing.T) {
 	p := URLPolicy{AllowInsecure: true}
 	for _, u := range []string{"http://localhost:8080/hook", "http://127.0.0.1:3000/hook", "https://hooks.example.com/pg", "http://host.docker.internal:9000/x"} {
-		assert.NoError(t, p.Validate(context.Background(), u), u)
+		require.NoError(t, p.Validate(context.Background(), u), u)
 	}
 	require.Error(t, p.Validate(context.Background(), "ftp://localhost/x"))
 	require.Error(t, p.Validate(context.Background(), "not a url"))

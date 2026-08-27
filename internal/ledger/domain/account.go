@@ -37,6 +37,8 @@ func (t AccountType) NormalBalance() NormalBalance {
 	switch t {
 	case AccountTypeAsset, AccountTypeExpense:
 		return NormalDebit
+	case AccountTypeLiability, AccountTypeRevenue:
+		return NormalCredit
 	default:
 		return NormalCredit
 	}
@@ -214,13 +216,19 @@ func (k AccountKey) IsSystem() bool { return k.MerchantID == uuid.Nil }
 
 // Kind 回傳科目種類（code 不合法時為空）。
 func (k AccountKey) Kind() Kind {
-	kind, _, _ := ParseCode(k.Code)
+	kind, _, err := ParseCode(k.Code)
+	if err != nil {
+		return ""
+	}
 	return kind
 }
 
-// Qualifier 回傳 code 的後綴（provider / bank account）。
+// Qualifier 回傳 code 的後綴（provider / bank account；code 不合法時為空）。
 func (k AccountKey) Qualifier() string {
-	_, q, _ := ParseCode(k.Code)
+	_, q, err := ParseCode(k.Code)
+	if err != nil {
+		return ""
+	}
 	return q
 }
 

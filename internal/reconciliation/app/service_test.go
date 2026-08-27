@@ -42,12 +42,12 @@ func newSvc(t *testing.T, cfg app.Config) (*app.Service, *porttest.Store, *portt
 	return app.NewService(store.Deps(clock), cfg), store, clock
 }
 
-func rec(kind domain.RecordKind, ref, status string, amount int64, cur string, occurred time.Time) domain.PaymentRecord {
+func rec(kind domain.RecordKind, ref, status string, amount int64, occurred time.Time) domain.PaymentRecord {
 	u := ids.NewUUID()
 	prefix := map[domain.RecordKind]string{domain.RecordPayment: ids.PrefixPayment, domain.RecordRefund: ids.PrefixRefund, domain.RecordDispute: ids.PrefixDispute}[kind]
 	return domain.PaymentRecord{
 		ID: u, Kind: kind, PublicID: ids.Format(prefix, u), MerchantID: merchantID, Provider: domain.MockProvider,
-		ProviderReference: ref, Amount: money.Money{AmountMinor: amount, Currency: cur}, Status: status, OccurredAt: occurred, SourceSeq: 1,
+		ProviderReference: ref, Amount: money.Money{AmountMinor: amount, Currency: "TWD"}, Status: status, OccurredAt: occurred, SourceSeq: 1,
 	}
 }
 
@@ -62,14 +62,14 @@ func TestImportSettlementFile_Success(t *testing.T) {
 	svc, store, _ := newSvc(t, app.Config{GracePeriod: 72 * time.Hour})
 	old := now.Add(-5 * 24 * time.Hour)
 	// 對應 fixture：G3 完全對上、G4 金額不符、G5 缺少（missing_in_ledger）、H1 退款對上、J1 拒付對上；另一筆很舊的已請款付款不在檔案內。
-	store.AddRecord(rec(domain.RecordPayment, "mock_ch_01K2W3X4Y5Z6A7B8C9D0E1F2G3", domain.StatusCaptured, 1000, "TWD", old))
-	store.AddRecord(rec(domain.RecordPayment, "mock_ch_01K2W3X4Y5Z6A7B8C9D0E1F2G4", domain.StatusCaptured, 250001, "TWD", old))
-	store.AddRecord(rec(domain.RecordRefund, "mock_re_01K2W3X4Y5Z6A7B8C9D0E1F2H1", domain.RefundSucceeded, 300, "TWD", old))
-	store.AddRecord(rec(domain.RecordDispute, "mock_du_01K2W3X4Y5Z6A7B8C9D0E1F2J1", domain.DisputeLost, 1000, "TWD", old))
-	missing := rec(domain.RecordPayment, "mock_ch_OLD", domain.StatusCaptured, 77, "TWD", old)
+	store.AddRecord(rec(domain.RecordPayment, "mock_ch_01K2W3X4Y5Z6A7B8C9D0E1F2G3", domain.StatusCaptured, 1000, old))
+	store.AddRecord(rec(domain.RecordPayment, "mock_ch_01K2W3X4Y5Z6A7B8C9D0E1F2G4", domain.StatusCaptured, 250001, old))
+	store.AddRecord(rec(domain.RecordRefund, "mock_re_01K2W3X4Y5Z6A7B8C9D0E1F2H1", domain.RefundSucceeded, 300, old))
+	store.AddRecord(rec(domain.RecordDispute, "mock_du_01K2W3X4Y5Z6A7B8C9D0E1F2J1", domain.DisputeLost, 1000, old))
+	missing := rec(domain.RecordPayment, "mock_ch_OLD", domain.StatusCaptured, 77, old)
 	store.AddRecord(missing)
 	// grace 期內的紀錄不開單（repo 的 ListUnsettled 以 now-grace 為上限，根本不會載入）。
-	store.AddRecord(rec(domain.RecordPayment, "mock_ch_RECENT", domain.StatusCaptured, 88, "TWD", now.Add(-time.Hour)))
+	store.AddRecord(rec(domain.RecordPayment, "mock_ch_RECENT", domain.StatusCaptured, 88, now.Add(-time.Hour)))
 
 	res, err := svc.ImportSettlementFile(context.Background(), importCmd(fixture(t)))
 	require.NoError(t, err)
@@ -150,7 +150,7 @@ func TestImportSettlementFile_Idempotent(t *testing.T) {
 	assert.Equal(t, first.Run.ID, second.Run.ID)
 	assert.Len(t, store.Runs, 1)
 	assert.Len(t, store.Files, 1)
-	assert.Equal(t, outboxBefore, len(store.Outbox), "重複匯入不再發事件")
+	assert.Len(t, store.Outbox, outboxBefore, "重複匯入不再發事件")
 
 	// 不同檔名、同內容仍視為同檔。
 	cmd := importCmd(fixture(t))
@@ -182,9 +182,9 @@ func TestImportSettlementFile_ParseFailureRecorded(t *testing.T) {
 
 	_, err := svc.ImportSettlementFile(context.Background(), importCmd(bad))
 	require.Error(t, err)
-	assert.ErrorIs(t, err, domain.ErrParse)
+	require.ErrorIs(t, err, domain.ErrParse)
 	var pe *domain.ParseError
-	require.True(t, errors.As(err, &pe))
+	require.ErrorAs(t, err, &pe)
 	assert.Equal(t, 1, pe.Line)
 
 	require.Len(t, store.Files, 1)
@@ -198,7 +198,7 @@ func TestImportSettlementFile_ParseFailureRecorded(t *testing.T) {
 
 	// 再匯入同一壞檔：仍失敗、不是 already_imported、檔案仍只有一筆。
 	_, err = svc.ImportSettlementFile(context.Background(), importCmd(bad))
-	assert.ErrorIs(t, err, domain.ErrParse)
+	require.ErrorIs(t, err, domain.ErrParse)
 	assert.Len(t, store.Files, 1)
 
 	// 空檔。
@@ -302,7 +302,7 @@ func TestImportSettlementFile_SuppressesDuplicateOpenDiscrepancies(t *testing.T)
 	_, err := svc.ImportSettlementFile(context.Background(), importCmd(fixture(t)))
 	require.NoError(t, err)
 	before := len(store.Discrepancies)
-	assert.Greater(t, before, 0)
+	assert.Positive(t, before)
 
 	// 第二份檔案（不同 hash，多一列）含同樣的 G5：不重複開單。
 	content := append([]byte(nil), fixture(t)...)
@@ -311,7 +311,7 @@ func TestImportSettlementFile_SuppressesDuplicateOpenDiscrepancies(t *testing.T)
 	cmd.SettlementDate = "2026-08-20"
 	res, err := svc.ImportSettlementFile(context.Background(), cmd)
 	require.NoError(t, err)
-	assert.Equal(t, before+1, len(store.Discrepancies), "只有 mock_ch_NEW 是新差異")
+	assert.Len(t, store.Discrepancies, before+1, "只有 mock_ch_NEW 是新差異")
 	assert.Equal(t, before, res.Run.Summary.Suppressed)
 	assert.Equal(t, before+1, res.Run.UnmatchedCount, "run 仍記錄實際發現的差異數")
 }
@@ -347,9 +347,9 @@ func TestGetAndListRuns(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, r1.Run.ID, got.ID)
 	_, err = svc.GetReconciliationRun(ctx, "rr_nope")
-	assert.ErrorIs(t, err, domain.ErrRunNotFound)
+	require.ErrorIs(t, err, domain.ErrRunNotFound)
 	_, err = svc.GetReconciliationRun(ctx, ids.New(domain.PrefixRun))
-	assert.ErrorIs(t, err, domain.ErrRunNotFound)
+	require.ErrorIs(t, err, domain.ErrRunNotFound)
 
 	runs, next, err := svc.ListReconciliationRuns(ctx, app.RunFilter{PageSize: 1})
 	require.NoError(t, err)
@@ -377,7 +377,7 @@ func TestGetAndListRuns(t *testing.T) {
 func TestListDiscrepancies(t *testing.T) {
 	svc, store, _ := newSvc(t, app.Config{})
 	ctx := context.Background()
-	store.AddRecord(rec(domain.RecordPayment, "mock_ch_01K2W3X4Y5Z6A7B8C9D0E1F2G4", domain.StatusCaptured, 1, "TWD", now.Add(-30*24*time.Hour)))
+	store.AddRecord(rec(domain.RecordPayment, "mock_ch_01K2W3X4Y5Z6A7B8C9D0E1F2G4", domain.StatusCaptured, 1, now.Add(-30*24*time.Hour)))
 	res, err := svc.ImportSettlementFile(ctx, importCmd(fixture(t)))
 	require.NoError(t, err)
 
@@ -405,7 +405,7 @@ func TestListDiscrepancies(t *testing.T) {
 	assert.Empty(t, open)
 
 	_, _, err = svc.ListDiscrepancies(ctx, app.DiscrepancyFilter{Kinds: []domain.DiscrepancyKind{"bogus"}})
-	assert.ErrorIs(t, err, apperr.ErrParameterInvalid)
+	require.ErrorIs(t, err, apperr.ErrParameterInvalid)
 
 	page1, next, err := svc.ListDiscrepancies(ctx, app.DiscrepancyFilter{PageSize: 2})
 	require.NoError(t, err)
@@ -422,14 +422,14 @@ func TestResolveDiscrepancy(t *testing.T) {
 	ctx := context.Background()
 	res, err := svc.ImportSettlementFile(ctx, importCmd(fixture(t)))
 	require.NoError(t, err)
-	var ids_ []string
+	dscIDs := make([]string, 0, len(store.Discrepancies))
 	for _, d := range store.Discrepancies {
-		ids_ = append(ids_, d.PublicID())
+		dscIDs = append(dscIDs, d.PublicID())
 	}
-	require.GreaterOrEqual(t, len(ids_), 2)
+	require.GreaterOrEqual(t, len(dscIDs), 2)
 
 	t.Run("resolve", func(t *testing.T) {
-		d, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: ids_[0], Action: app.ActionResolve, Note: "fixed", ResolvedBy: "ops:alice", IdempotencyKey: "k1"})
+		d, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: dscIDs[0], Action: app.ActionResolve, Note: "fixed", ResolvedBy: "ops:alice", IdempotencyKey: "k1"})
 		require.NoError(t, err)
 		assert.Equal(t, domain.DiscrepancyResolved, d.Status)
 		assert.Equal(t, "ops:alice", d.ResolvedBy)
@@ -445,25 +445,25 @@ func TestResolveDiscrepancy(t *testing.T) {
 		assert.Equal(t, "resolved", ev.Status)
 	})
 	t.Run("idempotent replay", func(t *testing.T) {
-		d, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: ids_[0], Action: app.ActionResolve, Note: "fixed", ResolvedBy: "ops:alice", IdempotencyKey: "k1"})
+		d, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: dscIDs[0], Action: app.ActionResolve, Note: "fixed", ResolvedBy: "ops:alice", IdempotencyKey: "k1"})
 		require.NoError(t, err)
 		assert.Equal(t, domain.DiscrepancyResolved, d.Status)
 		assert.Len(t, store.OutboxByType(app.EventDiscrepancyResolved), 1, "重送不再發事件")
 	})
 	t.Run("already resolved with different key", func(t *testing.T) {
-		_, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: ids_[0], Action: app.ActionIgnore, Note: "x", ResolvedBy: "ops:bob", IdempotencyKey: "k2"})
+		_, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: dscIDs[0], Action: app.ActionIgnore, Note: "x", ResolvedBy: "ops:bob", IdempotencyKey: "k2"})
 		assert.ErrorIs(t, err, domain.ErrInvalidTransition)
 	})
 	t.Run("ignore requires note", func(t *testing.T) {
-		_, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: ids_[1], Action: app.ActionIgnore, ResolvedBy: "ops:bob"})
+		_, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: dscIDs[1], Action: app.ActionIgnore, ResolvedBy: "ops:bob"})
 		assert.ErrorIs(t, err, domain.ErrResolutionNoteRequired)
 	})
 	t.Run("resolved_by required", func(t *testing.T) {
-		_, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: ids_[1], Action: app.ActionResolve})
+		_, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: dscIDs[1], Action: app.ActionResolve})
 		assert.ErrorIs(t, err, domain.ErrResolvedByRequired)
 	})
 	t.Run("ignore", func(t *testing.T) {
-		d, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: ids_[1], Action: app.ActionIgnore, Note: "T+2", ResolvedBy: "ops:bob"})
+		d, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: dscIDs[1], Action: app.ActionIgnore, Note: "T+2", ResolvedBy: "ops:bob"})
 		require.NoError(t, err)
 		assert.Equal(t, domain.DiscrepancyIgnored, d.Status)
 	})
@@ -475,7 +475,7 @@ func TestResolveDiscrepancy(t *testing.T) {
 	})
 	t.Run("not found", func(t *testing.T) {
 		_, err := svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: ids.New(domain.PrefixDiscrepancy), Action: app.ActionResolve, ResolvedBy: "x"})
-		assert.ErrorIs(t, err, domain.ErrDiscrepancyNotFound)
+		require.ErrorIs(t, err, domain.ErrDiscrepancyNotFound)
 		_, err = svc.ResolveDiscrepancy(ctx, app.ResolveCommand{DiscrepancyID: "garbage", Action: app.ActionResolve, ResolvedBy: "x"})
 		assert.ErrorIs(t, err, domain.ErrDiscrepancyNotFound)
 	})

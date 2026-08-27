@@ -134,6 +134,7 @@ func (m *Memory) failNext() error {
 
 type txManager struct{ m *Memory }
 
+// WithinTx 直接執行 fn（記憶體實作無真正交易）。
 func (t txManager) WithinTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	t.m.mu.Lock()
 	t.m.TxCalls++
@@ -161,6 +162,7 @@ func maps(in map[string]string) map[string]string {
 	return out
 }
 
+// Create 寫入商戶複本。
 func (r merchantRepo) Create(_ context.Context, m *domain.Merchant) error {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -171,6 +173,7 @@ func (r merchantRepo) Create(_ context.Context, m *domain.Merchant) error {
 	return nil
 }
 
+// Get 依 id 取得商戶複本。
 func (r merchantRepo) Get(_ context.Context, id uuid.UUID) (*domain.Merchant, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -181,10 +184,12 @@ func (r merchantRepo) Get(_ context.Context, id uuid.UUID) (*domain.Merchant, er
 	return copyMerchant(m), nil
 }
 
+// GetForUpdate 等同 Get（記憶體實作無列鎖）。
 func (r merchantRepo) GetForUpdate(ctx context.Context, id uuid.UUID) (*domain.Merchant, error) {
 	return r.Get(ctx, id)
 }
 
+// FindByExternalRef 依 external_ref 尋找商戶。
 func (r merchantRepo) FindByExternalRef(_ context.Context, ref string) (*domain.Merchant, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -196,6 +201,7 @@ func (r merchantRepo) FindByExternalRef(_ context.Context, ref string) (*domain.
 	return nil, domain.ErrNotFound
 }
 
+// Update 以樂觀鎖（Version）更新商戶。
 func (r merchantRepo) Update(_ context.Context, m *domain.Merchant) error {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -214,6 +220,7 @@ func (r merchantRepo) Update(_ context.Context, m *domain.Merchant) error {
 	return nil
 }
 
+// List 依條件過濾並以 created_at 排序（記憶體實作不分頁）。
 func (r merchantRepo) List(_ context.Context, f app.MerchantFilter, p app.Page) ([]*domain.Merchant, string, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -244,6 +251,7 @@ func copyKey(k *domain.ApiKey) *domain.ApiKey {
 	return &c
 }
 
+// Create 寫入 key 複本；prefix 重複回 ErrAlreadyExists。
 func (r keyRepo) Create(_ context.Context, k *domain.ApiKey) error {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -259,6 +267,7 @@ func (r keyRepo) Create(_ context.Context, k *domain.ApiKey) error {
 	return nil
 }
 
+// Get 依商戶 + id 取得 key 複本。
 func (r keyRepo) Get(_ context.Context, merchantID, id uuid.UUID) (*domain.ApiKey, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -269,6 +278,7 @@ func (r keyRepo) Get(_ context.Context, merchantID, id uuid.UUID) (*domain.ApiKe
 	return copyKey(k), nil
 }
 
+// FindByPrefix 依 prefix 找出候選 key。
 func (r keyRepo) FindByPrefix(_ context.Context, prefix string) ([]*domain.ApiKey, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -281,6 +291,7 @@ func (r keyRepo) FindByPrefix(_ context.Context, prefix string) ([]*domain.ApiKe
 	return out, nil
 }
 
+// Update 覆寫既有 key。
 func (r keyRepo) Update(_ context.Context, k *domain.ApiKey) error {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -294,6 +305,7 @@ func (r keyRepo) Update(_ context.Context, k *domain.ApiKey) error {
 	return nil
 }
 
+// CountActive 計算指定 mode 的有效 key 數。
 func (r keyRepo) CountActive(_ context.Context, merchantID uuid.UUID, mode domain.Mode, now time.Time) (int, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -306,6 +318,7 @@ func (r keyRepo) CountActive(_ context.Context, merchantID uuid.UUID, mode domai
 	return n, nil
 }
 
+// List 依條件過濾並以 created_at 排序（記憶體實作不分頁）。
 func (r keyRepo) List(_ context.Context, merchantID uuid.UUID, f app.ApiKeyFilter, p app.Page) ([]*domain.ApiKey, string, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -330,6 +343,7 @@ func (r keyRepo) List(_ context.Context, merchantID uuid.UUID, f app.ApiKeyFilte
 	return out, "", nil
 }
 
+// TouchLastUsed 更新 last_used_at。
 func (r keyRepo) TouchLastUsed(_ context.Context, id uuid.UUID, at time.Time) error {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -351,6 +365,7 @@ func copyHook(e *domain.WebhookEndpoint) *domain.WebhookEndpoint {
 	return &c
 }
 
+// Create 寫入端點複本。
 func (r hookRepo) Create(_ context.Context, e *domain.WebhookEndpoint) error {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -361,6 +376,7 @@ func (r hookRepo) Create(_ context.Context, e *domain.WebhookEndpoint) error {
 	return nil
 }
 
+// Get 依商戶 + id 取得端點複本。
 func (r hookRepo) Get(_ context.Context, merchantID, id uuid.UUID) (*domain.WebhookEndpoint, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -371,6 +387,7 @@ func (r hookRepo) Get(_ context.Context, merchantID, id uuid.UUID) (*domain.Webh
 	return copyHook(e), nil
 }
 
+// Update 以樂觀鎖（Version）更新端點。
 func (r hookRepo) Update(_ context.Context, e *domain.WebhookEndpoint) error {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -389,6 +406,7 @@ func (r hookRepo) Update(_ context.Context, e *domain.WebhookEndpoint) error {
 	return nil
 }
 
+// CountLive 計算未刪除的端點數。
 func (r hookRepo) CountLive(_ context.Context, merchantID uuid.UUID) (int, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -401,6 +419,7 @@ func (r hookRepo) CountLive(_ context.Context, merchantID uuid.UUID) (int, error
 	return n, nil
 }
 
+// List 依條件過濾並以 created_at 排序（記憶體實作不分頁）。
 func (r hookRepo) List(_ context.Context, merchantID uuid.UUID, f app.WebhookEndpointFilter, p app.Page) ([]*domain.WebhookEndpoint, string, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -428,6 +447,7 @@ func (r hookRepo) List(_ context.Context, merchantID uuid.UUID, f app.WebhookEnd
 
 type routingRepo struct{ m *Memory }
 
+// Get 取得路由偏好複本。
 func (r routingRepo) Get(_ context.Context, merchantID uuid.UUID) (*domain.RoutingPreferences, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -440,6 +460,7 @@ func (r routingRepo) Get(_ context.Context, merchantID uuid.UUID) (*domain.Routi
 	return &c, nil
 }
 
+// Upsert 寫入路由偏好並遞增 Version。
 func (r routingRepo) Upsert(_ context.Context, p *domain.RoutingPreferences) error {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -463,6 +484,7 @@ func (r routingRepo) Upsert(_ context.Context, p *domain.RoutingPreferences) err
 
 type outboxStore struct{ m *Memory }
 
+// Insert 附加 outbox 訊息；ID 為空時自動產生。
 func (o outboxStore) Insert(_ context.Context, msg app.OutboxMessage) (string, error) {
 	o.m.mu.Lock()
 	defer o.m.mu.Unlock()

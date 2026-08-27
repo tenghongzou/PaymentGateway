@@ -64,33 +64,30 @@ func parseMinor(line int, field, s string) (int64, error) {
 
 // parseDecimalToMinor 把「主單位小數字串」（例：USD "12.34"、JPY "1200"）轉成最小單位整數。
 //
-// 規則：小數位數不得超過幣別 exponent（JPY "10.5" 為錯誤）；負號代表方向，取絕對值並回傳 negative=true；
-// 全程以整數運算，絕不經過浮點數。
-func parseDecimalToMinor(line int, field, s, currency string) (minor int64, negative bool, err error) {
+// 規則：小數位數不得超過幣別 exponent（JPY "10.5" 為錯誤）；負號代表方向，一律取絕對值
+// （方向由列的 type 表達）；全程以整數運算，絕不經過浮點數。
+func parseDecimalToMinor(line int, field, s, currency string) (minor int64, err error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return 0, false, newParseError(line, field, "empty amount")
+		return 0, newParseError(line, field, "empty amount")
 	}
 	exp := money.Exponent(currency)
 	if exp < 0 {
-		return 0, false, newParseError(line, field, "unsupported currency %q", currency)
+		return 0, newParseError(line, field, "unsupported currency %q", currency)
 	}
-	if strings.HasPrefix(s, "-") {
-		negative = true
-		s = s[1:]
-	} else if strings.HasPrefix(s, "+") {
+	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
 		s = s[1:]
 	}
 	s = strings.ReplaceAll(s, ",", "")
 	intPart, fracPart, hasDot := strings.Cut(s, ".")
 	if intPart == "" && fracPart == "" {
-		return 0, false, newParseError(line, field, "invalid amount %q", s)
+		return 0, newParseError(line, field, "invalid amount %q", s)
 	}
 	if intPart == "" {
 		intPart = "0"
 	}
 	if hasDot && len(fracPart) > exp {
-		return 0, false, newParseError(line, field, "amount %q has more than %d decimal places for %s", s, exp, currency)
+		return 0, newParseError(line, field, "amount %q has more than %d decimal places for %s", s, exp, currency)
 	}
 	for len(fracPart) < exp {
 		fracPart += "0"
@@ -98,14 +95,14 @@ func parseDecimalToMinor(line int, field, s, currency string) (minor int64, nega
 	digits := intPart + fracPart
 	for _, c := range digits {
 		if c < '0' || c > '9' {
-			return 0, false, newParseError(line, field, "invalid amount %q", s)
+			return 0, newParseError(line, field, "invalid amount %q", s)
 		}
 	}
 	v, perr := strconv.ParseInt(digits, 10, 64)
 	if perr != nil {
-		return 0, false, newParseError(line, field, "amount %q overflows int64", s)
+		return 0, newParseError(line, field, "amount %q overflows int64", s)
 	}
-	return v, negative, nil
+	return v, nil
 }
 
 // normalizeCurrency 驗證並正規化幣別（大寫三碼、在 pkg/money 支援表內）。

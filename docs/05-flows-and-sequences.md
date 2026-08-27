@@ -456,7 +456,7 @@ sequenceDiagram
         K->>LS: refund.pending → J-REF-PEND（借 merchant_payable / 貸 refund_clearing）
         K->>LS: refund.succeeded → J-REF-OK（借 refund_clearing / 貸 psp_receivable）+ 依政策 J-REF-FEE-RET
     and
-        K->>WS: refund.succeeded → 通知商戶（refund.pending 不推送）
+        K->>WS: refund.pending → 通知商戶（refund.created）、refund.succeeded → 通知商戶
     end
 ```
 
@@ -658,7 +658,7 @@ sequenceDiagram
 8. **手動重試**：保留原 `event_id`、新 `delivery_id`。
 9. **回應處理**：只看 HTTP status；2xx 成功；3xx 不跟隨（失敗）；4xx/5xx/逾時都重試（`410` 例外）。
 10. **payload**：對外 JSON（`id, type, api_version, created, livemode, data.object`）；> 64KB 時改 thin payload（只含 `id, type, data.object.id`），商戶回查 API。
-11. 不推送給商戶的事件：`payment.created`、`refund.pending`（02 附錄 B）。
+11. 全部 14 種事件皆推送給商戶（清單以 OpenAPI `EventType` 與 03 §5.1 為準；02 附錄 B）。內部事件 `refund.pending` 對商戶以 `refund.created` 型別推送。
 
 ### 7.3 失敗情境與補償
 

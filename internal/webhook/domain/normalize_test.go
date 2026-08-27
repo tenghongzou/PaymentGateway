@@ -20,7 +20,7 @@ func TestEventTypeFromEnumName(t *testing.T) {
 	for v, name := range paymentv1.PaymentEventType_name {
 		got := EventTypeFromEnumName(name)
 		if v == 0 {
-			assert.Equal(t, "", got)
+			assert.Empty(t, got)
 			continue
 		}
 		assert.True(t, IsKnownEventType(got), "%s → %q must be a known event type", name, got)
@@ -78,19 +78,32 @@ func TestFromPaymentEvent_Captured(t *testing.T) {
 	assert.Contains(t, got, "request")
 	assert.Nil(t, got["request"])
 
-	obj := got["data"].(map[string]any)["object"].(map[string]any)
+	data, ok := got["data"].(map[string]any)
+	require.True(t, ok)
+	obj, ok := data["object"].(map[string]any)
+	require.True(t, ok)
+	// encoding/json 解回 map[string]any 的數字為浮點，金額欄位以 EqualValues 斷言避免直接寫浮點字面值。
+	assertMoney := func(v any, minor int64, currency string) {
+		t.Helper()
+		m, mok := v.(map[string]any)
+		require.True(t, mok)
+		assert.EqualValues(t, minor, m["amount_minor"])
+		assert.Equal(t, currency, m["currency"])
+	}
 	assert.Equal(t, "payment", obj["object"])
 	assert.Equal(t, "pay_01J5X9Q3K8T2M4N6P8R0S2T4V6", obj["id"])
 	assert.Equal(t, "captured", obj["status"])
 	assert.EqualValues(t, 7, obj["version"])
-	assert.Equal(t, map[string]any{"amount_minor": float64(150000), "currency": "TWD"}, obj["amount"])
-	assert.Equal(t, map[string]any{"amount_minor": float64(150000), "currency": "TWD"}, obj["captured_amount"])
-	assert.Equal(t, map[string]any{"amount_minor": float64(0), "currency": "TWD"}, obj["refunded_amount"])
+	assertMoney(obj["amount"], 150000, "TWD")
+	assertMoney(obj["captured_amount"], 150000, "TWD")
+	assertMoney(obj["refunded_amount"], 0, "TWD")
 	assert.Equal(t, "stripe", obj["provider"])
 	assert.Equal(t, "pi_3NXyzABC", obj["provider_reference"])
 	assert.Equal(t, map[string]any{"order_id": "A10023"}, obj["metadata"])
-	assert.Equal(t, "card", obj["payment_method"].(map[string]any)["type"])
-	assert.Equal(t, "4242", obj["payment_method"].(map[string]any)["last4"])
+	pm, ok := obj["payment_method"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "card", pm["type"])
+	assert.Equal(t, "4242", pm["last4"])
 	assert.Equal(t, true, obj["is_final_capture"])
 }
 
@@ -166,18 +179,18 @@ func TestFromPaymentEvent_RefundAndDispute(t *testing.T) {
 func TestFromPaymentEvent_Errors(t *testing.T) {
 	now := time.Now()
 	_, err := FromPaymentEvent(nil, now)
-	assert.ErrorIs(t, err, ErrUnsupportedEvent)
+	require.ErrorIs(t, err, ErrUnsupportedEvent)
 	_, err = FromPaymentEvent(&paymentv1.PaymentEvent{EventId: ids.New(ids.PrefixEvent), MerchantId: ids.New(ids.PrefixMerchant)}, now)
-	assert.ErrorIs(t, err, ErrUnsupportedEvent, "unspecified type")
+	require.ErrorIs(t, err, ErrUnsupportedEvent, "unspecified type")
 	_, err = FromPaymentEvent(&paymentv1.PaymentEvent{
 		EventId: "bogus", MerchantId: ids.New(ids.PrefixMerchant), EventType: paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_VOIDED,
 	}, now)
-	assert.ErrorIs(t, err, ErrInvalidID)
+	require.ErrorIs(t, err, ErrInvalidID)
 	// 缺 payload。
 	_, err = FromPaymentEvent(&paymentv1.PaymentEvent{
 		EventId: ids.New(ids.PrefixEvent), MerchantId: ids.New(ids.PrefixMerchant), EventType: paymentv1.PaymentEventType_PAYMENT_EVENT_TYPE_PAYMENT_VOIDED,
 	}, now)
-	assert.ErrorIs(t, err, ErrUnsupportedEvent)
+	require.ErrorIs(t, err, ErrUnsupportedEvent)
 	// 純 uuid 也接受。
 	u := uuid.New()
 	got, err := ParseEventID(u.String())

@@ -130,8 +130,8 @@ func (r *Run) Complete(res MatchResult, now time.Time) error {
 	s.Skipped = res.Skipped
 	s.Deferred = res.Deferred
 	s.ByKind = map[string]int{}
-	for _, d := range res.Discrepancies {
-		s.ByKind[string(d.Kind)]++
+	for i := range res.Discrepancies {
+		s.ByKind[string(res.Discrepancies[i].Kind)]++
 	}
 	s.TotalSettled = res.Totals.Settled
 	s.TotalFees = res.Totals.Fees

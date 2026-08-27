@@ -69,9 +69,14 @@ func (r *DeliveryRepo) InsertPending(ctx context.Context, ds []*domain.Delivery)
 			ON CONFLICT ON CONSTRAINT webhook_deliveries_event_endpoint_key DO NOTHING`,
 			d.ID, d.EventID, d.EndpointID, d.MerchantID, d.NextAttemptAt, d.CreatedAt)
 	}
-	br := r.s.q(ctx).(interface {
+	sb, ok := r.s.q(ctx).(interface {
 		SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
-	}).SendBatch(ctx, batch)
+	})
+	if !ok {
+		// pgxpool.Pool 與 pgx.Tx 都支援 SendBatch；此分支僅防禦 querier 實作被抽換。
+		return errors.New("postgres: querier does not support SendBatch")
+	}
+	br := sb.SendBatch(ctx, batch)
 	defer br.Close()
 	for range ds {
 		if _, err := br.Exec(); err != nil {

@@ -37,12 +37,14 @@ func TestSender_SignatureVerifiableByMerchant(t *testing.T) {
 	var verifyErr error
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeaders = r.Header.Clone()
-		raw, _ := io.ReadAll(r.Body)
+		raw, rerr := io.ReadAll(r.Body)
+		assert.NoError(t, rerr)
 		verifyErr = sig.VerifyWebhook([]string{"whsec_previous"}, r.Header.Get("X-PG-Signature"), raw, time.Now(), 0)
 		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, body, raw)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"received":true}`))
+		_, werr := w.Write([]byte(`{"received":true}`))
+		assert.NoError(t, werr)
 	}))
 	defer srv.Close()
 
@@ -53,7 +55,7 @@ func TestSender_SignatureVerifiableByMerchant(t *testing.T) {
 	assert.True(t, out.Succeeded())
 	assert.Equal(t, `{"received":true}`, out.Body)
 	assert.Greater(t, out.Duration, time.Duration(0))
-	assert.NoError(t, verifyErr, "商戶用 previous secret 也能驗過")
+	require.NoError(t, verifyErr, "商戶用 previous secret 也能驗過")
 	assert.Equal(t, "application/json", gotHeaders.Get("Content-Type"))
 	assert.Equal(t, "PaymentGateway-Webhooks/1.0", gotHeaders.Get("User-Agent"))
 	assert.Equal(t, "evt_1", gotHeaders.Get("X-PG-Event-Id"))
@@ -66,7 +68,9 @@ func TestSender_SignatureVerifiableByMerchant(t *testing.T) {
 func TestSender_TLS(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) }))
 	defer srv.Close()
-	tlsCfg := srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	tr, ok := srv.Client().Transport.(*http.Transport)
+	require.True(t, ok)
+	tlsCfg := tr.TLSClientConfig.Clone()
 	s := NewSender(Options{Policy: domain.DevPolicy, TLSConfig: tlsCfg})
 	out := s.Send(context.Background(), signedRequest(t, srv.URL, []string{"s"}, []byte(`{}`)))
 	require.NoError(t, out.Err)
@@ -75,7 +79,7 @@ func TestSender_TLS(t *testing.T) {
 	// 未信任的憑證 → 失敗（不是 2xx）。
 	s2 := NewSender(Options{Policy: domain.DevPolicy, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}})
 	out = s2.Send(context.Background(), signedRequest(t, srv.URL, []string{"s"}, []byte(`{}`)))
-	assert.Error(t, out.Err)
+	require.Error(t, out.Err)
 	assert.Equal(t, 0, out.StatusCode)
 }
 
@@ -104,7 +108,8 @@ func TestSender_RetryAfterAndBodyTruncation(t *testing.T) {
 			w.WriteHeader(429)
 		case "/big":
 			w.WriteHeader(500)
-			_, _ = w.Write([]byte(strings.Repeat("x", 10_000)))
+			_, werr := w.Write([]byte(strings.Repeat("x", 10_000)))
+			assert.NoError(t, werr)
 		}
 	}))
 	defer srv.Close()
@@ -149,12 +154,12 @@ func TestSender_SSRFBlockedAtDial(t *testing.T) {
 	s := NewSender(Options{Policy: domain.StrictPolicy, Resolver: staticResolver{"127.0.0.1"}})
 	out := s.Send(context.Background(), signedRequest(t, "https://hooks.example.com:8443/x", []string{"s"}, []byte(`{}`)))
 	require.Error(t, out.Err)
-	assert.ErrorIs(t, out.Err, domain.ErrIPNotAllowed)
+	require.ErrorIs(t, out.Err, domain.ErrIPNotAllowed)
 	assert.Equal(t, 0, out.StatusCode)
 
 	// 嚴格政策：IP literal / http 在 ValidateURL 就被擋。
 	out = s.Send(context.Background(), signedRequest(t, "http://127.0.0.1:"+port+"/x", []string{"s"}, []byte(`{}`)))
-	assert.ErrorIs(t, out.Err, domain.ErrURLNotAllowed)
+	require.ErrorIs(t, out.Err, domain.ErrURLNotAllowed)
 
 	// dev 政策 + 解析到 loopback 的網域名稱 → 允許並成功連線到 httptest。
 	dev := NewSender(Options{Policy: domain.DevPolicy, Resolver: staticResolver{"127.0.0.1"}})

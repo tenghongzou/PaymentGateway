@@ -145,24 +145,24 @@ func TestReverse(t *testing.T) {
 	r := uuid.New()
 	already.ReversedBy = &r
 	_, err = Reverse(&already, uuid.New(), "", now)
-	assert.ErrorIs(t, err, ErrJournalAlreadyReversed)
-	assert.ErrorIs(t, ValidateReversal(&already, rev), ErrJournalAlreadyReversed)
+	require.ErrorIs(t, err, ErrJournalAlreadyReversed)
+	require.ErrorIs(t, ValidateReversal(&already, rev), ErrJournalAlreadyReversed)
 
 	// 不是鏡像
 	bad := *rev
 	bad.Entries = append([]Entry(nil), rev.Entries...)
 	bad.Entries[0].Amount = twd(999)
-	assert.ErrorIs(t, ValidateReversal(orig, &bad), ErrReversalMismatch)
+	require.ErrorIs(t, ValidateReversal(orig, &bad), ErrReversalMismatch)
 
 	// reversal_of 指錯
 	wrong := *rev
 	x := uuid.New()
 	wrong.ReversalOf = &x
-	assert.ErrorIs(t, ValidateReversal(orig, &wrong), ErrReversalMismatch)
+	require.ErrorIs(t, ValidateReversal(orig, &wrong), ErrReversalMismatch)
 
 	// 未儲存的 journal 不可沖銷
 	_, err = Reverse(validJournal(m), uuid.New(), "", now)
-	assert.ErrorIs(t, err, ErrJournalNotFound)
+	require.ErrorIs(t, err, ErrJournalNotFound)
 	_, err = Reverse(nil, uuid.New(), "", now)
 	assert.ErrorIs(t, err, ErrJournalNotFound)
 }

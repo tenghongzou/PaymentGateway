@@ -30,10 +30,10 @@ func encodeBase62(raw []byte, n int) string {
 		digits = append(digits, base62Alphabet[mod.Int64()])
 	}
 	for i := len(digits); i < n; i++ {
-		sb.WriteByte('0')
+		_ = sb.WriteByte('0') // strings.Builder 不回錯誤
 	}
 	for i := len(digits) - 1; i >= 0; i-- {
-		sb.WriteByte(digits[i])
+		_ = sb.WriteByte(digits[i])
 	}
 	return sb.String()
 }

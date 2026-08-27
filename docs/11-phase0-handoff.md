@@ -16,31 +16,24 @@
 | payment-service（狀態機、failover、outbox、gRPC） | ✅ 核心流程 | 單元 + 整合（testcontainers）+ e2e 7 案例；lint 0 |
 | api-gateway（驗簽、冪等、限流、REST） | ✅ | handler 測試 + e2e；lint 0 |
 | provider-mock（tok_* 情境） | ✅ | 單元測試；lint 0 |
-| merchant-service | ✅ 14 rpc 全實作 | 單元 + 整合 + smoke；**lint 59 條待清** |
-| ledger-service | ✅ 7 rpc + consumer + 分錄範本 | 單元 + property-based + 整合；**lint 97 條待清** |
-| webhook-service | ✅ 4 rpc + dispatcher + reaper + dev sink | 單元 + 整合 + race + smoke；**lint 124 條待清** |
-| reconciliation-service | ✅ 5 rpc + matcher + consumer | 單元 + 整合；**lint 132 條待清** |
+| merchant-service | ✅ 14 rpc 全實作 | 單元 + 整合 + smoke；lint 0 |
+| ledger-service | ✅ 7 rpc + consumer + 分錄範本 | 單元 + property-based + 整合；lint 0 |
+| webhook-service | ✅ 4 rpc + dispatcher + reaper + dev sink | 單元 + 整合 + race + smoke；lint 0 |
+| reconciliation-service | ✅ 5 rpc + matcher + consumer | 單元 + 整合；lint 0 |
 | provider-stripe | ⏳ 骨架（HealthCheck NOT_SERVING） | Phase 1 |
 
 最終整合驗證（2026-08-21）：`go build ./...` ✅、`go vet ./...` ✅、`go test ./...` 36 套件全過 ✅、`make build` 8 個 binary ✅、服務間 import 隔離（`go list -deps`）✅。
 
-## 2. 立即待辦（Phase 0 收尾）
+收尾驗證（2026-08-27，lint 清零後重跑）：`make build` 8 binary ✅、`go test ./...` 36 套件 ✅、各服務 `-tags integration`（testcontainers）✅、ledger/webhook 含 `-race` ✅、`buf lint`/`buf build` ✅、`compose config` ✅、全 repo `golangci-lint run ./...` **0 issues** ✅、compose 全 stack e2e 7 案例（Healthz / CreateGetRefund / HardDecline / UnavailableOnceRecovers / ManualCaptureAndVoid / 3DSConfirm / AuthRejected）✅。
 
-### 2.1 Lint 清理（412 條，均為第二波服務）
-核心套件已是 0 issue。剩餘集中在四個服務，多數為 `testifylint` / `revive` 風格問題，但含少量實質項目（`errcheck`、`exhaustive`、`contextcheck`、`forbidigo`）。
+## 2. 立即待辦（Phase 0 收尾）— ✅ 已完成（2026-08-27）
 
-```bash
-# 逐目錄執行（快取暖後每個數秒；不要同時跑多個 lint）
-./bin/golangci-lint run --timeout 5m ./internal/merchant/...       ./cmd/merchant-service/...
-./bin/golangci-lint run --timeout 5m ./internal/ledger/...         ./cmd/ledger-service/...
-./bin/golangci-lint run --timeout 5m ./internal/webhook/...        ./cmd/webhook-service/...
-./bin/golangci-lint run --timeout 5m ./internal/reconciliation/... ./cmd/reconciliation-service/...
-```
-原則：不改 `.golangci.yaml`、不大範圍 `//nolint`；`exhaustive` 補實際 case（例如 `internal/ledger/app/proto.go` 的 `domain.Kind` 映射需涵蓋 10 個科目）；`errcheck` 真正處理錯誤。
+### 2.1 Lint 清理 — 完成
+四個第二波服務的 lint issue（交接時記 412 條、收尾時實測 402 條：merchant 59、ledger 96、webhook 120、reconciliation 127）已全數清零；全 repo `./bin/golangci-lint run ./...` 為 **0 issues**。遵循原則：未改 `.golangci.yaml`；`exhaustive` 一律補實際 case（含 `internal/ledger/app/proto.go` 的 `domain.Kind` 映射涵蓋 10 個科目）；`errcheck` 真正處理錯誤；`depguard`（ledger property test 的 `math/rand`）以遷移至 `math/rand/v2` 修復。僅保留少量附理由的單行 `//nolint`：protoc 產生的 gRPC 介面方法名（revive var-naming）、gosec 對 SQL 欄位清單的 G101 誤判與有上界的 G115 轉型、forbidigo「金額禁 float」規則誤中 webhook 退避 jitter 亂數與 jsonb 數字型別還原、文件化契約的 nilerr（`VerifyApiKey` 無效 key 回 `Valid=false` 不回 error）。
 
-### 2.2 文件小修
-- `02 §0.2` ID 前綴 `ref_/dsp_/whe_` 與 SQL CHECK 的 `re_/dp_/we_` 不一致 → 以 SQL 為準更新 02。
-- `05 §7.2 #11` 寫不推 `payment.created`，OpenAPI/03 有此事件 → 以 OpenAPI 為準（目前實作推送全部 14 種）。
+### 2.2 文件小修 — 完成
+- `02 §0.2` ID 前綴已依 SQL 改為 `re_/dp_/we_`。
+- `05 §7.2 #11` 與 `02 附錄 B` 已以 OpenAPI 為準改為 14 種事件全部推送（與 `internal/webhook/domain/event.go` 實作一致）。
 
 ## 3. Schema backlog（Phase 1 第一個 migration）
 程式目前以既有欄位（多為 `metadata`/`settings` jsonb）安全落地，以下欄位化後可移除對應 workaround：

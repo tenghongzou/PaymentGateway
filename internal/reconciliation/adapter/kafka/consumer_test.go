@@ -35,10 +35,12 @@ func TestEventUUID(t *testing.T) {
 	u := uuid.New()
 	assert.Equal(t, u.String(), EventUUID(u.String(), ""))
 	evt := ids.New(ids.PrefixEvent)
-	_, want, _ := ids.Parse(evt)
+	_, want, err := ids.Parse(evt)
+	require.NoError(t, err)
 	assert.Equal(t, want.String(), EventUUID(evt, ""))
 	assert.Equal(t, want.String(), EventUUID("", evt))
-	assert.Equal(t, EventUUID("custom-1", ""), EventUUID("custom-1", ""))
+	// 非 uuid 的自訂 event_id：以 v5 雜湊穩定映射。
+	assert.Equal(t, uuid.NewSHA1(uuid.NameSpaceOID, []byte("custom-1")).String(), EventUUID("custom-1", ""))
 	assert.NotEmpty(t, EventUUID("custom-1", ""))
 	assert.Empty(t, EventUUID("", ""))
 }
@@ -57,7 +59,8 @@ func TestConsumer_Handle(t *testing.T) {
 	b, err := proto.Marshal(&paymentv1.PaymentEvent{EventId: evt})
 	require.NoError(t, err)
 	require.NoError(t, c.Handle(context.Background(), eventbus.Record{Value: b}))
-	_, want, _ := ids.Parse(evt)
+	_, want, err := ids.Parse(evt)
+	require.NoError(t, err)
 	assert.Equal(t, want.String(), spy.ids[1])
 
 	// poison 錯誤原樣上拋（eventbus 會重試後送 DLQ）。

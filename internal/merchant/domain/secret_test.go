@@ -50,7 +50,8 @@ func TestAESGCMCipherRoundTrip(t *testing.T) {
 	require.ErrorIs(t, err, ErrCiphertextInvalid)
 
 	// 每次 nonce 不同
-	ct2, _ := c.Encrypt("sk_live_secret", aad)
+	ct2, err := c.Encrypt("sk_live_secret", aad)
+	require.NoError(t, err)
 	assert.NotEqual(t, ct, ct2)
 
 	// 相容 plain:v1:

@@ -99,7 +99,7 @@ func (s *Server) ListMerchants(ctx context.Context, req *merchantv1.ListMerchant
 // ---- API key ----
 
 // CreateApiKey 建立 API Key；secret / signing_secret 只在此回應出現一次。
-func (s *Server) CreateApiKey(ctx context.Context, req *merchantv1.CreateApiKeyRequest) (*merchantv1.CreateApiKeyResponse, error) {
+func (s *Server) CreateApiKey(ctx context.Context, req *merchantv1.CreateApiKeyRequest) (*merchantv1.CreateApiKeyResponse, error) { //nolint:revive // 方法名由 proto 產生的介面固定
 	out, err := s.svc.CreateApiKey(ctx, app.CreateApiKeyInput{
 		MerchantID: req.GetMerchantId(), Mode: modeFromProto(req.GetMode()), Name: req.GetName(), Scopes: req.GetScopes(), ExpiresAt: timePtr(req.GetExpiresAt()),
 	})
@@ -110,7 +110,7 @@ func (s *Server) CreateApiKey(ctx context.Context, req *merchantv1.CreateApiKeyR
 }
 
 // RevokeApiKey 撤銷 API Key（冪等）。
-func (s *Server) RevokeApiKey(ctx context.Context, req *merchantv1.RevokeApiKeyRequest) (*merchantv1.RevokeApiKeyResponse, error) {
+func (s *Server) RevokeApiKey(ctx context.Context, req *merchantv1.RevokeApiKeyRequest) (*merchantv1.RevokeApiKeyResponse, error) { //nolint:revive // 方法名由 proto 產生的介面固定
 	k, err := s.svc.RevokeApiKey(ctx, req.GetMerchantId(), req.GetApiKeyId(), req.GetReason())
 	if err != nil {
 		return nil, grpcx.ErrorFromDomain(err)
@@ -119,7 +119,7 @@ func (s *Server) RevokeApiKey(ctx context.Context, req *merchantv1.RevokeApiKeyR
 }
 
 // ListApiKeys 列出 API Key。
-func (s *Server) ListApiKeys(ctx context.Context, req *merchantv1.ListApiKeysRequest) (*merchantv1.ListApiKeysResponse, error) {
+func (s *Server) ListApiKeys(ctx context.Context, req *merchantv1.ListApiKeysRequest) (*merchantv1.ListApiKeysResponse, error) { //nolint:revive // 方法名由 proto 產生的介面固定
 	items, next, err := s.svc.ListApiKeys(ctx, app.ListApiKeysInput{
 		MerchantID: req.GetMerchantId(), Mode: modeFromProto(req.GetMode()), IncludeInactive: req.GetIncludeInactive(), Page: pageFromProto(req.GetPage()),
 	})
@@ -138,7 +138,7 @@ func (s *Server) ListApiKeys(ctx context.Context, req *merchantv1.ListApiKeysReq
 //
 // 注意：查找用的 prefix 一律由完整 key 推導（前 16 碼 = pk_<mode>_ + 8 碼 lookup_id），
 // req.key_prefix 只作為一致性檢查（不一致視為 not_found）。
-func (s *Server) VerifyApiKey(ctx context.Context, req *merchantv1.VerifyApiKeyRequest) (*merchantv1.VerifyApiKeyResponse, error) {
+func (s *Server) VerifyApiKey(ctx context.Context, req *merchantv1.VerifyApiKeyRequest) (*merchantv1.VerifyApiKeyResponse, error) { //nolint:revive // 方法名由 proto 產生的介面固定
 	key := strings.TrimSpace(req.GetKey())
 	if p := req.GetKeyPrefix(); p != "" && !strings.HasPrefix(key, p) {
 		return &merchantv1.VerifyApiKeyResponse{Valid: false, Reason: app.ReasonNotFound}, nil

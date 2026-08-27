@@ -28,7 +28,7 @@ var DevPolicy = URLPolicy{AllowInsecure: true}
 func (p URLPolicy) ValidateURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrURLNotAllowed, err)
+		return nil, fmt.Errorf("%w: %w", ErrURLNotAllowed, err)
 	}
 	if u.User != nil {
 		return nil, fmt.Errorf("%w: userinfo not allowed", ErrURLNotAllowed)

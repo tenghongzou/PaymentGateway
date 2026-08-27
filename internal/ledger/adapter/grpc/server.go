@@ -90,16 +90,16 @@ func (s *Server) ListAccounts(ctx context.Context, req *ledgerv1.ListAccountsReq
 	}
 	f := app.AccountFilter{Currency: req.GetCurrency(), Qualifier: req.GetProvider()}
 	if req.GetMerchantId() != "" {
-		m, err := app.ParseMerchantID(req.GetMerchantId())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(err)
+		m, merr := app.ParseMerchantID(req.GetMerchantId())
+		if merr != nil {
+			return nil, grpcx.ErrorFromDomain(merr)
 		}
 		f.MerchantID = &m
 	}
 	if req.GetType() != ledgerv1.AccountType_ACCOUNT_TYPE_UNSPECIFIED {
-		kind, err := app.KindFromProto(req.GetType())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(err)
+		kind, kerr := app.KindFromProto(req.GetType())
+		if kerr != nil {
+			return nil, grpcx.ErrorFromDomain(kerr)
 		}
 		f.Kind = kind
 	}
@@ -167,9 +167,9 @@ func (s *Server) PostJournal(ctx context.Context, req *ledgerv1.PostJournalReque
 		Metadata:       req.GetMetadata(),
 	}
 	if req.GetMerchantId() != "" {
-		m, err := app.ParseMerchantID(req.GetMerchantId())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(err)
+		m, merr := app.ParseMerchantID(req.GetMerchantId())
+		if merr != nil {
+			return nil, grpcx.ErrorFromDomain(merr)
 		}
 		in.MerchantID = m
 	}
@@ -177,24 +177,24 @@ func (s *Server) PostJournal(ctx context.Context, req *ledgerv1.PostJournalReque
 		in.EffectiveAt = req.GetEffectiveAt().AsTime()
 	}
 	if req.GetReversesJournalId() != "" {
-		id, err := app.ParseJournalID(req.GetReversesJournalId())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(err)
+		id, jerr := app.ParseJournalID(req.GetReversesJournalId())
+		if jerr != nil {
+			return nil, grpcx.ErrorFromDomain(jerr)
 		}
 		in.ReversesJournalID = &id
 	}
 	for i, e := range req.GetEntries() {
-		acctID, err := app.ParseAccountID(e.GetAccountId())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(apperr.From(err).WithParam(entryParam(i, "account_id")))
+		acctID, eerr := app.ParseAccountID(e.GetAccountId())
+		if eerr != nil {
+			return nil, grpcx.ErrorFromDomain(apperr.From(eerr).WithParam(entryParam(i, "account_id")))
 		}
-		dir, err := app.DirectionFromProto(e.GetDirection())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(apperr.From(err).WithParam(entryParam(i, "direction")))
+		dir, eerr := app.DirectionFromProto(e.GetDirection())
+		if eerr != nil {
+			return nil, grpcx.ErrorFromDomain(apperr.From(eerr).WithParam(entryParam(i, "direction")))
 		}
-		amt, err := money.FromProto(e.GetAmount())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(domain.ErrInvalidCurrency.WithParam(entryParam(i, "amount")).Wrap(err))
+		amt, eerr := money.FromProto(e.GetAmount())
+		if eerr != nil {
+			return nil, grpcx.ErrorFromDomain(domain.ErrInvalidCurrency.WithParam(entryParam(i, "amount")).Wrap(eerr))
 		}
 		in.Entries = append(in.Entries, app.EntryInput{AccountID: acctID, Direction: dir, Amount: amt, Description: e.GetDescription()})
 	}
@@ -236,23 +236,23 @@ func (s *Server) ListJournals(ctx context.Context, req *ledgerv1.ListJournalsReq
 		Currency:      req.GetCurrency(),
 	}
 	if req.GetMerchantId() != "" {
-		m, err := app.ParseMerchantID(req.GetMerchantId())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(err)
+		m, merr := app.ParseMerchantID(req.GetMerchantId())
+		if merr != nil {
+			return nil, grpcx.ErrorFromDomain(merr)
 		}
 		f.MerchantID = &m
 	}
 	if req.GetAccountId() != "" {
-		a, err := app.ParseAccountID(req.GetAccountId())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(err)
+		a, aerr := app.ParseAccountID(req.GetAccountId())
+		if aerr != nil {
+			return nil, grpcx.ErrorFromDomain(aerr)
 		}
 		f.AccountID = &a
 	}
 	if req.GetSourceType() != ledgerv1.JournalSourceType_JOURNAL_SOURCE_TYPE_UNSPECIFIED {
-		st, err := app.SourceTypeFromProto(req.GetSourceType())
-		if err != nil {
-			return nil, grpcx.ErrorFromDomain(err)
+		st, serr := app.SourceTypeFromProto(req.GetSourceType())
+		if serr != nil {
+			return nil, grpcx.ErrorFromDomain(serr)
 		}
 		f.SourceType = st
 	}

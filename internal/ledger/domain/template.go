@@ -155,7 +155,8 @@ func templateCapture(ev PaymentEvent) (*Journal, error) {
 	if fee.IsPositive() {
 		j.Entries = append(j.Entries, entry(FeeRevenue(cur, live), Credit, fee, "platform fee"))
 	}
-	return j, j.Validate()
+	err = j.Validate()
+	return j, err
 }
 
 // J-REF-PEND：Dr merchant_payable[M]；Cr refund_clearing[M]（先扣商戶餘額、掛清算）。
@@ -172,7 +173,8 @@ func templateRefundPending(ev PaymentEvent) (*Journal, error) {
 		entry(MerchantPayable(ev.MerchantID, cur, live), Debit, ev.Amount, "refund reserved from merchant balance"),
 		entry(RefundClearing(ev.MerchantID, cur, live), Credit, ev.Amount, "refund awaiting PSP confirmation"),
 	}
-	return j, j.Validate()
+	err = j.Validate()
+	return j, err
 }
 
 // J-REF-OK：Dr refund_clearing[M]；Cr psp_receivable[provider]。
@@ -199,7 +201,8 @@ func templateRefundSucceeded(ev PaymentEvent) (*Journal, error) {
 			entry(FeeRevenue(cur, live), Credit, ev.Fee, TemplateJREFFEE+": refund fee revenue"),
 		)
 	}
-	return j, j.Validate()
+	err = j.Validate()
+	return j, err
 }
 
 // J-REF-FAIL：Dr refund_clearing[M]；Cr merchant_payable[M]（沖回 J-REF-PEND；reversal_of 由 app 層查出原 journal 後填入）。
@@ -216,7 +219,8 @@ func templateRefundFailed(ev PaymentEvent) (*Journal, error) {
 		entry(RefundClearing(ev.MerchantID, cur, live), Debit, ev.Amount, "refund clearing released"),
 		entry(MerchantPayable(ev.MerchantID, cur, live), Credit, ev.Amount, "refund returned to merchant balance"),
 	}
-	return j, j.Validate()
+	err = j.Validate()
+	return j, err
 }
 
 // J-CB-OPEN：Dr merchant_payable[M] amount；Cr chargeback_reserve[M] amount；
@@ -243,7 +247,8 @@ func templateDisputeOpened(ev PaymentEvent) (*Journal, error) {
 			entry(ChargebackFeeRevenue(cur, live), Credit, ev.Fee, "chargeback fee revenue"),
 		)
 	}
-	return j, j.Validate()
+	err = j.Validate()
+	return j, err
 }
 
 // J-CB-LOST：Dr chargeback_reserve[M]；Cr psp_receivable[provider]。
@@ -263,7 +268,8 @@ func templateDisputeLost(ev PaymentEvent) (*Journal, error) {
 		entry(ChargebackReserve(ev.MerchantID, cur, live), Debit, ev.Amount, "reserve consumed by chargeback"),
 		entry(PSPReceivable(ev.Provider, cur, live), Credit, ev.Amount, "chargeback deducted by PSP"),
 	}
-	return j, j.Validate()
+	err = j.Validate()
+	return j, err
 }
 
 // J-CB-WON：Dr chargeback_reserve[M]；Cr merchant_payable[M]。
@@ -287,7 +293,8 @@ func templateDisputeWon(ev PaymentEvent, pol Policy) (*Journal, error) {
 			entry(MerchantPayable(ev.MerchantID, cur, live), Credit, ev.Fee, TemplateJCBWonFee+": chargeback fee returned"),
 		)
 	}
-	return j, j.Validate()
+	err = j.Validate()
+	return j, err
 }
 
 // SettlementTemplate 產生 J-STL：Dr bank_cash[bank] net_paid；Dr psp_fee_expense[provider] psp_fees；Cr psp_receivable[provider] gross。
@@ -336,5 +343,6 @@ func SettlementTemplate(s SettlementPosted) (*Journal, error) {
 		j.Entries = append(j.Entries, entry(PSPFeeExpense(s.Provider, cur, live), Debit, s.PSPFees, "PSP fees"))
 	}
 	j.Entries = append(j.Entries, entry(PSPReceivable(s.Provider, cur, live), Credit, s.Gross, "settlement gross"))
-	return j, j.Validate()
+	err = j.Validate()
+	return j, err
 }

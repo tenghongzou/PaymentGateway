@@ -155,7 +155,9 @@ func scanRuns(rows pgx.Rows) ([]domain.Run, error) {
 		run.Status = domain.RunStatus(status)
 		run.Error = deref(errText)
 		if len(summary) > 0 {
-			_ = json.Unmarshal(summary, &run.Summary)
+			if err := json.Unmarshal(summary, &run.Summary); err != nil {
+				return nil, fmt.Errorf("postgres: unmarshal reconciliation_run summary: %w", err)
+			}
 		}
 		if run.Summary.ByKind == nil {
 			run.Summary.ByKind = map[string]int{}

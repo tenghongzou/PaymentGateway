@@ -25,7 +25,7 @@ var ErrPoisonMessage = errors.New("ledger: poison message")
 func (s *Service) HandlePaymentEvent(ctx context.Context, rec eventbus.Record) error {
 	var ev paymentv1.PaymentEvent
 	if err := proto.Unmarshal(rec.Value, &ev); err != nil {
-		return fmt.Errorf("%w: unmarshal PaymentEvent (topic=%s offset=%d): %v", ErrPoisonMessage, rec.Topic, rec.Offset, err)
+		return fmt.Errorf("%w: unmarshal PaymentEvent (topic=%s offset=%d): %w", ErrPoisonMessage, rec.Topic, rec.Offset, err)
 	}
 	eventIDStr := rec.EventID()
 	if eventIDStr == "" {
@@ -33,11 +33,11 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, rec eventbus.Record) e
 	}
 	eventID, err := ParseEventID(eventIDStr)
 	if err != nil {
-		return fmt.Errorf("%w: event_id %q: %v", ErrPoisonMessage, eventIDStr, err)
+		return fmt.Errorf("%w: event_id %q: %w", ErrPoisonMessage, eventIDStr, err)
 	}
 	dev, err := FromProtoPaymentEvent(&ev, eventID)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrPoisonMessage, err)
+		return fmt.Errorf("%w: %w", ErrPoisonMessage, err)
 	}
 	log := s.log.With("event_id", eventIDStr, "event_type", dev.Type, "payment_id", dev.PaymentID, "merchant_id", dev.MerchantPublicID)
 
@@ -57,10 +57,10 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, rec eventbus.Record) e
 		}
 		if err != nil {
 			// 事件內容不足以記帳（缺 provider / 金額 / 費用超過金額…）：屬 poison，交由 consumer 重試→DLQ。
-			return fmt.Errorf("%w: %v", ErrPoisonMessage, err)
+			return fmt.Errorf("%w: %w", ErrPoisonMessage, err)
 		}
-		if err := s.linkReversal(ctx, j); err != nil {
-			return err
+		if lerr := s.linkReversal(ctx, j); lerr != nil {
+			return lerr
 		}
 		_, replayed, err := s.postJournalTx(ctx, j)
 		if err != nil {

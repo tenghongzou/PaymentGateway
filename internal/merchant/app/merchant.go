@@ -31,7 +31,7 @@ func (s *Service) CreateMerchant(ctx context.Context, in CreateMerchantInput) (*
 	if err != nil {
 		return nil, err
 	}
-	err = s.tx.WithinTx(ctx, func(ctx context.Context) error {
+	txErr := s.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if ref := strings.TrimSpace(in.ExternalRef); ref != "" {
 			// TODO：DB 無 external_ref 專欄 / UNIQUE，目前為應用層檢查（併發下可能重複）。
 			existing, err := s.merchants.FindByExternalRef(ctx, ref)
@@ -47,8 +47,8 @@ func (s *Service) CreateMerchant(ctx context.Context, in CreateMerchantInput) (*
 		}
 		return s.emit(ctx, AggregateMerchant, EventMerchantCreated, m.PublicID(), merchantEventData(m))
 	})
-	if err != nil {
-		return nil, err
+	if txErr != nil {
+		return nil, txErr
 	}
 	return m, nil
 }

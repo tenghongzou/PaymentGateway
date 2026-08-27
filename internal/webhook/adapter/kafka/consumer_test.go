@@ -48,15 +48,15 @@ func TestHandler(t *testing.T) {
 
 	// 暫時性錯誤 → 回錯誤（不 commit）。
 	ing.err = errors.New("db down")
-	assert.Error(t, h.Handle(context.Background(), rec))
+	require.Error(t, h.Handle(context.Background(), rec))
 
 	// 不可重試錯誤：skipPoison=true 略過；false 回錯誤（→ DLQ）。
 	ing.err = domain.ErrUnsupportedEvent
-	assert.NoError(t, h.Handle(context.Background(), rec))
-	assert.Error(t, NewHandler(ing, nil, false).Handle(context.Background(), rec))
+	require.NoError(t, h.Handle(context.Background(), rec))
+	require.Error(t, NewHandler(ing, nil, false).Handle(context.Background(), rec))
 
 	// 壞 payload。
 	bad := eventbus.Record{Topic: "payment.events", Value: []byte{0xff, 0xff, 0xff}}
-	assert.NoError(t, NewHandler(ing, nil, true).Handle(context.Background(), bad))
+	require.NoError(t, NewHandler(ing, nil, true).Handle(context.Background(), bad))
 	assert.Error(t, NewHandler(ing, nil, false).Handle(context.Background(), bad))
 }

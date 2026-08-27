@@ -400,9 +400,9 @@ func (r *Discrepancies) InsertBatch(_ context.Context, ds []domain.Discrepancy) 
 	if err := r.s.err("discrepancies.insert"); err != nil {
 		return err
 	}
-	for _, d := range ds {
-		c := d
-		r.s.Discrepancies[d.ID] = &c
+	for i := range ds {
+		c := ds[i]
+		r.s.Discrepancies[c.ID] = &c
 	}
 	return nil
 }

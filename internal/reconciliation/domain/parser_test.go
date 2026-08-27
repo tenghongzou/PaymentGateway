@@ -1,7 +1,6 @@
 package domain
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,10 +70,10 @@ func TestMockParser_Edges(t *testing.T) {
 			lines, err := NewMockParser().Parse(strings.NewReader(tt.input))
 			if tt.wantErr != nil {
 				require.Error(t, err)
-				assert.True(t, errors.Is(err, tt.wantErr), "got %v", err)
+				assert.ErrorIs(t, err, tt.wantErr, "got %v", err)
 				if tt.wantLine > 0 {
 					var pe *ParseError
-					require.True(t, errors.As(err, &pe), "expected *ParseError, got %v", err)
+					require.ErrorAs(t, err, &pe, "expected *ParseError, got %v", err)
 					assert.Equal(t, tt.wantLine, pe.Line)
 					if tt.wantField != "" {
 						assert.Equal(t, tt.wantField, pe.Field)
@@ -148,7 +147,7 @@ func TestStripeParser_CurrencyExponent(t *testing.T) {
 			lines, err := NewStripeParser().Parse(strings.NewReader(tt.input))
 			if tt.wantErr {
 				require.Error(t, err)
-				assert.True(t, errors.Is(err, ErrParse), "got %v", err)
+				assert.ErrorIs(t, err, ErrParse, "got %v", err)
 				return
 			}
 			require.NoError(t, err)
