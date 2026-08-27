@@ -34,8 +34,8 @@ type Base struct {
 	// MigrationsDir 保留給運維契約（映像內為 /migrations）；程式實際使用 migrations 套件的 embed.FS。
 	MigrationsDir string `env:"PG_MIGRATIONS_DIR" envDefault:"/migrations"`
 
-	RedisAddr     string `env:"PG_REDIS_ADDR"`
-	RedisPassword string `env:"PG_REDIS_PASSWORD"`
+	ValkeyAddr     string `env:"PG_VALKEY_ADDR"`
+	ValkeyPassword string `env:"PG_VALKEY_PASSWORD"`
 
 	KafkaBrokers       []string `env:"PG_KAFKA_BROKERS" envSeparator:","`
 	KafkaConsumerGroup string   `env:"PG_KAFKA_CONSUMER_GROUP"`

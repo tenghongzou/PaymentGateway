@@ -38,7 +38,7 @@
 | 服務間同步通訊 | gRPC + Protobuf（`google.golang.org/grpc`） | mTLS（生產） |
 | 服務間非同步 | Kafka（事件），**Transactional Outbox** 模式 | 事件 payload 亦用 Protobuf；client 使用 `github.com/twmb/franz-go` |
 | 資料庫 | PostgreSQL 16，**database-per-service** | `pgx/v5`，migrations 用 `golang-migrate` 純 SQL |
-| 快取 / 冪等 / 限流 | Redis 7 | |
+| 快取 / 冪等 / 限流 | Valkey 8 | |
 | 祕密管理 | HashiCorp Vault（生產）/ env（本機） | PSP API key、webhook signing secret |
 | 可觀測性 | OpenTelemetry SDK → OTel Collector → Prometheus / Grafana / Jaeger / Loki | |
 | HTTP router | `github.com/go-chi/chi/v5` | 只在 api-gateway |
@@ -78,7 +78,7 @@
 
 | 服務 | gRPC port | DB | 職責 |
 |---|---|---|---|
-| `api-gateway` | HTTP 8080 | 無（Redis） | API Key/HMAC 驗證、`Idempotency-Key` 處理、限流、REST↔gRPC 轉譯、PSP inbound webhook 入口 |
+| `api-gateway` | HTTP 8080 | 無（Valkey） | API Key/HMAC 驗證、`Idempotency-Key` 處理、限流、REST↔gRPC 轉譯、PSP inbound webhook 入口 |
 | `merchant-service` | 9001 | `pg_merchant` | 商戶、API Key（hash 儲存）、Webhook 端點、路由偏好設定 |
 | `payment-service` | 9002 | `pg_payment` | Payment / Refund / Chargeback 聚合根與狀態機、路由與 failover、呼叫 provider adapter、發佈事件 |
 | `ledger-service` | 9003 | `pg_ledger` | 雙式記帳：帳戶、日記帳（journal）、分錄（entries）、餘額；消費 payment 事件記帳 |
@@ -134,7 +134,7 @@ created ──▶ requires_action(3DS) ──▶ authorized ──▶ captured �
 
 ### 6.1 冪等（Idempotency）
 - 所有寫入 REST API 必須帶 `Idempotency-Key`（UUID，商戶範圍內唯一，24h）。
-- api-gateway：Redis `SETNX` 鎖 + 儲存 `(request_hash, response)`；同 key 不同 payload → `409`。
+- api-gateway：Valkey `SETNX` 鎖 + 儲存 `(request_hash, response)`；同 key 不同 payload → `409`。
 - 服務層：`payment-service` 以 `(merchant_id, idempotency_key)` 唯一索引做最後防線。
 
 ### 6.2 Transactional Outbox

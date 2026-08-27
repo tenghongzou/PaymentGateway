@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/valkey-io/valkey-go"
+	"github.com/valkey-io/valkey-go/valkeycompat"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 
@@ -42,12 +44,19 @@ func setup(ctx context.Context, rt *app.Runtime, cfg Config) (*app.Hooks, error)
 	hooks := &app.Hooks{}
 	log := rt.Logger
 
-	if cfg.RedisAddr == "" {
-		return nil, errors.New("PG_REDIS_ADDR is required for api-gateway (idempotency / rate limit)")
+	if cfg.ValkeyAddr == "" {
+		return nil, errors.New("PG_VALKEY_ADDR is required for api-gateway (idempotency / rate limit)")
 	}
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DialTimeout: 3 * time.Second, ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second})
-	hooks.Closers = append(hooks.Closers, app.Closer{Name: "redis", Close: func(context.Context) error { return rdb.Close() }})
-	hooks.Ready = append(hooks.Ready, app.Check{Name: "redis", Fn: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }})
+	vc, err := valkey.NewClient(valkey.ClientOption{
+		InitAddress: []string{cfg.ValkeyAddr}, Password: cfg.ValkeyPassword,
+		Dialer: net.Dialer{Timeout: 3 * time.Second}, ConnWriteTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("valkey: connect %s: %w", cfg.ValkeyAddr, err)
+	}
+	vdb := valkeycompat.NewAdapter(vc)
+	hooks.Closers = append(hooks.Closers, app.Closer{Name: "valkey", Close: func(context.Context) error { vc.Close(); return nil }})
+	hooks.Ready = append(hooks.Ready, app.Check{Name: "valkey", Fn: func(ctx context.Context) error { return vdb.Ping(ctx).Err() }})
 
 	if cfg.PaymentServiceAddr == "" {
 		return nil, errors.New("PG_PAYMENT_SERVICE_ADDR is required")
@@ -92,8 +101,8 @@ func setup(ctx context.Context, rt *app.Runtime, cfg Config) (*app.Hooks, error)
 
 	gw := gateway.New(gateway.Deps{
 		Payments: paymentv1.NewPaymentServiceClient(payConn), Providers: providers, Verifier: verifier,
-		Replay: gateway.NewRedisReplayDetector(rdb), Idem: idempotency.NewRedisStore(rdb, cfg.IdempotencyTTL),
-		Limiter: gateway.NewRedisRateLimiter(rdb, cfg.RateLimitRPS), RPS: cfg.RateLimitRPS, Logger: log,
+		Replay: gateway.NewValkeyReplayDetector(vdb), Idem: idempotency.NewValkeyStore(vdb, cfg.IdempotencyTTL),
+		Limiter: gateway.NewValkeyRateLimiter(vdb, cfg.RateLimitRPS), RPS: cfg.RateLimitRPS, Logger: log,
 	})
 	rt.Mux.Handle("/", gw.Handler())
 	return hooks, nil

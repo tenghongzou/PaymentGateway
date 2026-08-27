@@ -30,7 +30,7 @@
 ```bash
 make tools          # 安裝 protoc-gen-go / protoc-gen-go-grpc / golangci-lint / migrate / buf 到 ./bin
 make proto          # buf generate → api/gen/go（沒有 buf 會自動改用 scripts/protoc-gen.sh）
-make compose-up     # 建 image + 啟動 postgres/redis/kafka/otel/jaeger/prometheus/grafana + 8 個服務
+make compose-up     # 建 image + 啟動 postgres/valkey/kafka/otel/jaeger/prometheus/grafana + 8 個服務
 ```
 
 其他常用：
@@ -59,7 +59,7 @@ make e2e                                 # 起 compose → 等 /healthz → go t
 | provider-mock gRPC / health | 9101 / 8081 | `localhost:9101` / `localhost:18101` |
 | provider-stripe gRPC / health | 9102 / 8081 | `localhost:9102` / `localhost:18102` |
 | PostgreSQL | 5432 | `localhost:5432`（superuser `postgres/postgres`；服務角色 `<svc>_owner` / `<svc>_app`，密碼同角色名，見 `deploy/compose/postgres/init.sql`） |
-| Redis | 6379 | `localhost:6379` |
+| Valkey | 6379 | `localhost:6379` |
 | Kafka（host listener） | 29092 | `localhost:29092`（容器內用 `kafka:9092`） |
 | OTel Collector OTLP gRPC / HTTP | 4317 / 4318 | 同 |
 | Jaeger UI | 16686 | http://localhost:16686 |
@@ -112,7 +112,7 @@ make compose-infra
 export PG_SERVICE_NAME=payment-service PG_ENV=dev PG_LOG_LEVEL=debug \
        PG_GRPC_ADDR=:9002 PG_HTTP_ADDR=:8081 \
        PG_DATABASE_URL='postgres://payment_owner:payment_owner@localhost:5432/pg_payment?sslmode=disable' \
-       PG_REDIS_ADDR=localhost:6379 PG_KAFKA_BROKERS=localhost:29092 \
+       PG_VALKEY_ADDR=localhost:6379 PG_KAFKA_BROKERS=localhost:29092 \
        PG_OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317 PG_OTEL_EXPORTER_OTLP_INSECURE=true \
        PG_MERCHANT_SERVICE_ADDR=localhost:9001 PG_PROVIDER_ADDRS=mock=localhost:9101 \
        PG_AUTO_MIGRATE=true PG_MIGRATIONS_DIR=$PWD/migrations
@@ -146,7 +146,7 @@ Kubernetes：Vault 提供 `PG_DATABASE_URL`（`*_app`）給服務、`PG_MIGRATE_
 
 部署設定依賴以下行為，請在 `pkg/` 共用實作：
 
-1. **HTTP 端點**（`PG_HTTP_ADDR`）：`GET /healthz`（process 活著即 200）、`GET /readyz`（DB/Redis/Kafka 連得上且 migration 完成才 200）、`GET /metrics`（可選；主要走 OTLP）。api-gateway 的這三個路徑與業務 API 同 port 8080，並排除在認證與限流之外。
+1. **HTTP 端點**（`PG_HTTP_ADDR`）：`GET /healthz`（process 活著即 200）、`GET /readyz`（DB/Valkey/Kafka 連得上且 migration 完成才 200）、`GET /metrics`（可選；主要走 OTLP）。api-gateway 的這三個路徑與業務 API 同 port 8080，並排除在認證與限流之外。
 2. **gRPC**：註冊 `grpc.health.v1.Health`；`PG_ENV=dev|staging` 時啟用 reflection。
 3. **優雅關機**：收到 SIGTERM 後先讓 `/readyz` 回 503，等待 in-flight 請求（上限 `terminationGracePeriodSeconds` 30s），再關 Kafka consumer、outbox relay、DB pool。容器是 distroless，沒有 shell，不可依賴 preStop 指令。
 4. **`PG_AUTO_MIGRATE=true`** 時在啟動流程最前面對 `$PG_MIGRATIONS_DIR/<short-name>` 執行 golang-migrate up（多副本同時啟動要用 advisory lock；golang-migrate 的 postgres driver 內建）。
@@ -168,8 +168,8 @@ Kubernetes：Vault 提供 `PG_DATABASE_URL`（`*_app`）給服務、`PG_MIGRATE_
 | `PG_MIGRATE_DATABASE_URL` | migration 用的 `*_owner`（DDL）連線；只給 migration Job，缺省時 Job 退回 `PG_DATABASE_URL` | 無 | 否 | migration Job |
 | `PG_AUTO_MIGRATE` | 啟動時自動執行 migration | `false` | 否 | 擁有 DB 的服務 |
 | `PG_MIGRATIONS_DIR` | migration 根目錄（服務自行加 `<short-name>`） | `/migrations` | 否 | 擁有 DB 的服務 |
-| `PG_REDIS_ADDR` | `host:port` | 無 | gateway 必填 | gateway（冪等/限流）、其餘可選快取 |
-| `PG_REDIS_PASSWORD` | Redis 密碼（Vault） | 空 | 生產必填 | 同上 |
+| `PG_VALKEY_ADDR` | `host:port` | 無 | gateway 必填 | gateway（冪等/限流）、其餘可選快取 |
+| `PG_VALKEY_PASSWORD` | Valkey 密碼（Vault） | 空 | 生產必填 | 同上 |
 | `PG_KAFKA_BROKERS` | 逗號分隔 broker | 無 | 是 | 全部（provider 可不用） |
 | `PG_KAFKA_CONSUMER_GROUP` | consumer group 名稱 | `PG_SERVICE_NAME` | 否 | ledger/webhook/recon |
 | `PG_KAFKA_SASL_USERNAME` / `PG_KAFKA_SASL_PASSWORD` / `PG_KAFKA_TLS` | MSK SASL/SCRAM 或 IAM；生產走 TLS | 空 / `false` | 生產必填 | 全部 |
@@ -192,7 +192,7 @@ Kubernetes：Vault 提供 `PG_DATABASE_URL`（`*_app`）給服務、`PG_MIGRATE_
 
 另外 Kubernetes 會注入 `POD_NAME`、`POD_NAMESPACE`、`NODE_NAME`、`OTEL_SERVICE_NAME`、`OTEL_RESOURCE_ATTRIBUTES`、`GOMEMLIMIT`（= memory limit）。
 
-祕密（`PG_DATABASE_URL`、`PG_REDIS_PASSWORD`、`PG_KAFKA_SASL_*`、`PG_STRIPE_*`、webhook signing secret 的 KMS 設定）在 Kubernetes 一律由 ExternalSecret 從 Vault KV-v2 拉取，路徑 `paymentgateway/<env>/common` 與 `paymentgateway/<env>/<service-name>`，**Vault 內的 key 就是環境變數名稱**。
+祕密（`PG_DATABASE_URL`、`PG_VALKEY_PASSWORD`、`PG_KAFKA_SASL_*`、`PG_STRIPE_*`、webhook signing secret 的 KMS 設定）在 Kubernetes 一律由 ExternalSecret 從 Vault KV-v2 拉取，路徑 `paymentgateway/<env>/common` 與 `paymentgateway/<env>/<service-name>`，**Vault 內的 key 就是環境變數名稱**。
 
 ## 3. 環境分層、分支與發版
 
@@ -265,7 +265,7 @@ AnalysisTemplate 查 Prometheus：`sum(rate(http_server_request_duration_seconds
 
 | 服務 | 主要擴展依據 | HPA / 建議 | 備註 |
 |---|---|---|---|
-| api-gateway | CPU 60%、RPS（`http_server_request_duration_seconds_count`） | 3 → 30/40 | 無狀態；Redis 是共享瓶頸，先看 Redis CPU |
+| api-gateway | CPU 60%、RPS（`http_server_request_duration_seconds_count`） | 3 → 30/40 | 無狀態；Valkey 是共享瓶頸，先看 Valkey CPU |
 | payment-service | CPU 60%、gRPC in-flight | 3 → 30/40 | 對 PSP 是 I/O bound，可用較多副本；失敗 failover 會放大 PSP 流量 |
 | merchant-service | CPU 70% | 2 → 10 | 讀多寫少；API key 驗證結果可由 gateway 快取 60s |
 | ledger-service | **Kafka consumer lag**（`kafka_consumergroup_lag{consumergroup="ledger-service"}`） | 2 → 12（= `payment.events` 分區數） | 副本數 ≤ 分區數；prod values 示範 External metric（prometheus-adapter 或 KEDA `ScaledObject`） |
@@ -286,7 +286,7 @@ AnalysisTemplate 查 Prometheus：`sum(rate(http_server_request_duration_seconds
 - **Kubernetes**：3 AZ node group；每個服務跨 zone 分散；PDB 防止節點維護同時驅逐；`priorityClassName` 可給 gateway/payment 較高優先權。
 - **PostgreSQL**：託管優先（RDS/Aurora PostgreSQL Multi-AZ，或 Cloud SQL HA）；自管則 Patroni + etcd + PgBouncer（transaction pooling；注意 `SKIP LOCKED` 與 advisory lock 需 session pooling 或在同一交易內）。每個服務獨立 database（可先同一 instance，之後拆 instance）。連線數：每服務 pool ≤ 20 × 副本數，總量受 `max_connections` 限制，超過即引入 PgBouncer。
 - **Kafka**：3 broker、`replication.factor=3`、`min.insync.replicas=2`、producer `acks=all`、`enable.idempotence=true`；託管 MSK / Confluent。
-- **Redis**：ElastiCache cluster-mode 或 Redis Sentinel（1 主 2 從）；冪等鎖資料若遺失，後果是「同 key 重送可能重複建單」——所以 payment-service 的 `(merchant_id, idempotency_key)` 唯一索引是最後防線；Redis 完全不可用時 gateway 對寫入 API 回 503（fail-closed）。
+- **Valkey**：ElastiCache cluster-mode 或 Valkey Sentinel（1 主 2 從）；冪等鎖資料若遺失，後果是「同 key 重送可能重複建單」——所以 payment-service 的 `(merchant_id, idempotency_key)` 唯一索引是最後防線；Valkey 完全不可用時 gateway 對寫入 API 回 503（fail-closed）。
 - **PSP**：routing 健康度（`pg_provider_healthy`、錯誤率）自動 failover；單一 PSP 故障不影響整體（01 §2）。
 - **Ingress**：ingress-nginx ≥ 3 副本跨 AZ，前面 NLB；TLS 由 cert-manager 管理。
 
@@ -301,7 +301,7 @@ AnalysisTemplate 查 Prometheus：`sum(rate(http_server_request_duration_seconds
 
 1. PostgreSQL：自動每日快照 + PITR；快照跨區複製；**每月自動還原演練**（CI job：還原到臨時 instance → 跑 `SELECT count(*)`、ledger 借貸平衡檢查 `SUM(debit) = SUM(credit)` → 銷毀）。
 2. Kafka：事件可從 outbox 表重發（outbox 保留 7 天再清理），消費者去重保證重播安全。
-3. Redis：不備份（冪等 key 24h、限流計數可丟）。
+3. Valkey：不備份（冪等 key 24h、限流計數可丟）。
 4. Vault：Raft 快照每日；unseal key 分持。
 5. 設定與 IaC：Helm values、Terraform 全在 git；`helm get values` 定期匯出以偵測 drift。
 6. 演練：每季一次 game day（kill 一個 AZ 的 node、模擬 PSP 全掛、模擬 Kafka 不可用 → 驗證 outbox 累積後自動追上）。
@@ -332,7 +332,7 @@ AnalysisTemplate 查 Prometheus：`sum(rate(http_server_request_duration_seconds
 | `PGGrpcErrorRateHigh` | 非用戶端錯誤碼 > 5% | page | 同上 |
 | `PGServiceDown` | target down 2m | page | `runbooks/service-down.md` |
 | `PGDBPoolSaturated` | pool 使用 > 90% | ticket | `runbooks/db-pool.md` |
-| `PGIdempotencyStoreErrors` | Redis 錯誤 > 1/s | page | `runbooks/redis.md` |
+| `PGIdempotencyStoreErrors` | Valkey 錯誤 > 1/s | page | `runbooks/valkey.md` |
 | `PGReconciliationMismatch` | 1h 內有差異 | ticket（finance） | `runbooks/reconciliation.md` |
 
 ### 8.3 Runbook 索引（`docs/runbooks/`，Phase 1 填寫）
@@ -343,7 +343,7 @@ AnalysisTemplate 查 Prometheus：`sum(rate(http_server_request_duration_seconds
 - `webhook-dead-letter.md`：查商戶端點回應 → 通知商戶 → `POST /admin/webhooks/{id}/replay`。
 - `provider-degraded.md`：查 PSP status page → 在 routing rules 手動停用 → 觀察 failover。
 - `ledger-imbalance.md`：**凍結 ledger 寫入**（feature flag）→ 找出 journal → 用反向分錄沖銷 → 事故報告（PCI/稽核）。
-- `kafka-lag.md`、`latency.md`、`5xx.md`、`service-down.md`、`db-pool.md`、`redis.md`、`reconciliation.md`、`rollback.md`（helm rollback + migrate down 決策樹）、`secret-rotation.md`（API key / webhook secret 雙金鑰輪替、Vault 動態 DB 憑證）。
+- `kafka-lag.md`、`latency.md`、`5xx.md`、`service-down.md`、`db-pool.md`、`valkey.md`、`reconciliation.md`、`rollback.md`（helm rollback + migrate down 決策樹）、`secret-rotation.md`（API key / webhook secret 雙金鑰輪替、Vault 動態 DB 憑證）。
 
 On-call：PagerDuty 單一 schedule（payments team），`severity=page` 進 PagerDuty，`ticket` 進 Jira，`info` 只進 Slack。
 
@@ -355,7 +355,7 @@ On-call：PagerDuty 單一 schedule（payments team），`severity=page` 進 Pag
 | Worker nodes | 6 × m6i.xlarge（3 AZ，on-demand；約 24 vCPU/96 GiB，實際負載 ~40%） | ~900 |
 | RDS PostgreSQL Multi-AZ | db.r6g.large（2 vCPU/16 GiB）+ 200 GiB gp3 + PITR | ~550 |
 | MSK | 3 × kafka.m5.large + 300 GiB | ~650 |
-| ElastiCache Redis | 2 × cache.r6g.large（primary + replica） | ~330 |
+| ElastiCache Valkey | 2 × cache.r6g.large（primary + replica） | ~330 |
 | NLB + 流量 | 1 NLB、~2 TB egress | ~200 |
 | 可觀測性 | 自建 Prometheus/Grafana/Jaeger/Loki 在上述 node（~2 node 份額）；或 Grafana Cloud ~300 | 0–300 |
 | Vault | HCP Vault Dedicated starter 或自建 3 節點（含在 node） | 0–400 |
@@ -369,7 +369,7 @@ On-call：PagerDuty 單一 schedule（payments team），`severity=page` 進 Pag
 ```
 PR ──▶ lint ─┬─▶ build(matrix 8 services, buildx, trivy) ──▶ (main/tag) push ghcr.io
          proto│
-         test ┴─▶ integration (postgres/redis services + testcontainers)
+         test ┴─▶ integration (postgres/valkey services + testcontainers)
          security (govulncheck, gitleaks, trivy fs)
          helm (lint, template, kubeconform, compose config)
 

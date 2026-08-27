@@ -1122,7 +1122,7 @@ paths:
       tags: [System]
       operationId: readyz
       summary: 就緒檢查
-      description: 檢查 Redis 與下游 gRPC 服務連線。任一關鍵依賴失敗回 `503`。供 readinessProbe 使用。
+      description: 檢查 Valkey 與下游 gRPC 服務連線。任一關鍵依賴失敗回 `503`。供 readinessProbe 使用。
       security: []
       responses:
         "200":
@@ -1133,7 +1133,7 @@ paths:
               example:
                 status: ok
                 checks:
-                  redis: ok
+                  valkey: ok
                   merchant-service: ok
                   payment-service: ok
                   ledger-service: ok
@@ -1146,7 +1146,7 @@ paths:
               example:
                 status: unavailable
                 checks:
-                  redis: ok
+                  valkey: ok
                   merchant-service: ok
                   payment-service: "error: connection refused"
                   ledger-service: ok

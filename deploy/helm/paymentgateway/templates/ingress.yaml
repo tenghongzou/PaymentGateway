@@ -13,7 +13,7 @@ metadata:
     {{- include "pg.labels" $ctx | nindent 4 }}
   annotations:
     {{- with $ing.rateLimit }}
-    # Edge rate limiting (per client IP). Merchant-level limits are enforced inside api-gateway (Redis).
+    # Edge rate limiting (per client IP). Merchant-level limits are enforced inside api-gateway (Valkey).
     nginx.ingress.kubernetes.io/limit-rps: {{ .rps | quote }}
     nginx.ingress.kubernetes.io/limit-connections: {{ .connections | quote }}
     nginx.ingress.kubernetes.io/limit-burst-multiplier: {{ .burstMultiplier | default 3 | quote }}

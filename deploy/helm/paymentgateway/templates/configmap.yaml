@@ -24,7 +24,7 @@ data:
   {{- else }}
   PG_AUTO_MIGRATE: "false"
   {{- end }}
-  PG_REDIS_ADDR: {{ $.Values.global.redis.addr | quote }}
+  PG_VALKEY_ADDR: {{ $.Values.global.valkey.addr | quote }}
   PG_KAFKA_BROKERS: {{ $.Values.global.kafka.brokers | quote }}
   PG_OTEL_EXPORTER_OTLP_ENDPOINT: {{ $.Values.global.otel.endpoint | quote }}
   PG_OTEL_EXPORTER_OTLP_INSECURE: {{ $.Values.global.otel.insecure | quote }}

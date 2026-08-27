@@ -66,6 +66,6 @@ const (
 	stateCompleted  = "completed"
 )
 
-func redisKey(merchantID, key string) string {
+func storeKey(merchantID, key string) string {
 	return "idem:" + merchantID + ":" + key
 }

@@ -27,7 +27,7 @@ make tools          # 安裝 protoc-gen-go / protoc-gen-go-grpc / golangci-lint 
 make proto          # 由 api/proto 產生 api/gen/go
 make build          # 編譯所有服務到 ./bin
 make test           # 單元測試
-make compose-up     # 啟動 PostgreSQL / Redis / Kafka / OTel / Jaeger / Grafana 與全部服務
+make compose-up     # 啟動 PostgreSQL / Valkey / Kafka / OTel / Jaeger / Grafana 與全部服務
 ```
 
 啟動後：

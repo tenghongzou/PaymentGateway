@@ -11,7 +11,7 @@
 |---|---|---|
 | `M` | 商戶後端 | 呼叫 REST API、接收 webhook |
 | `GW` | api-gateway（HTTP :8080） | 驗簽、冪等、限流、REST→gRPC |
-| `R` | Redis | 冪等鍵、API key 快取、重放 nonce、限流、provider 健康度滑動視窗 |
+| `R` | Valkey | 冪等鍵、API key 快取、重放 nonce、限流、provider 健康度滑動視窗 |
 | `MS` | merchant-service（:9001） | API key、webhook 端點、路由偏好、費率表 |
 | `PS` | payment-service（:9002） | Saga orchestrator |
 | `DB` | `pg_payment` | payment-service 專屬資料庫 |
@@ -99,7 +99,7 @@ sequenceDiagram
     autonumber
     participant M as 商戶後端
     participant GW as api-gateway
-    participant R as Redis
+    participant R as Valkey
     participant MS as merchant-service
     participant PS as payment-service
     participant DB as pg_payment
@@ -156,13 +156,13 @@ sequenceDiagram
 
 ### 1.2 文字步驟
 
-1. **驗證（GW，06 §3.3）**：解析 `Authorization: Bearer pk_live_…` → Redis `auth:key:{sha256(pk)}`（TTL 300s）未命中則 gRPC `LookupApiKey` 並做 Argonid 驗證 → 檢查 key / 商戶狀態 → `X-Timestamp` 在 ±300s 內 → 以 canonical string（timestamp、method、request target、sha256(body)）驗 `X-Signature`（輪替期間接受 current + previous） → 重放 nonce `replay:{key_id}:{sig[:32]}` → scope → 限流。任一步失敗回 `401/403/429`，**不會**碰冪等鍵。
+1. **驗證（GW，06 §3.3）**：解析 `Authorization: Bearer pk_live_…` → Valkey `auth:key:{sha256(pk)}`（TTL 300s）未命中則 gRPC `LookupApiKey` 並做 Argonid 驗證 → 檢查 key / 商戶狀態 → `X-Timestamp` 在 ±300s 內 → 以 canonical string（timestamp、method、request target、sha256(body)）驗 `X-Signature`（輪替期間接受 current + previous） → 重放 nonce `replay:{key_id}:{sig[:32]}` → scope → 限流。任一步失敗回 `401/403/429`，**不會**碰冪等鍵。
 2. **冪等鎖（GW，§10）**：`SET idem:{merchant_id}:{key} NX EX 30`；值含 `request_hash`。鎖 TTL 30s 略大於上游 gRPC deadline 25s，確保 gateway 崩潰後鎖會自動釋放。
 3. **路由（PS）**：依 02 §9 產生有序候選（硬過濾 → 健康過濾 → 商戶規則 → preferred → 成本 → 預設順序）。無候選 → `422 no_route_available`，不建立 payment。
 4. **建立聚合根（PS）**：第一個交易寫 `payments(created)` 與第一個 `payment_attempts(pending)` 並 commit。即使後續 PSP 呼叫卡住或行程重啟，payment 已存在、可被查詢與 sweeper 接手；`(merchant_id, idempotency_key)` 唯一索引在此生效。
 5. **Authorize（PS→PA）**：automatic 模式下 `Authorize(capture=true)` 一次完成授權與請款（T3）；adapter 對 PSP 的 HTTP timeout 為 8s（gRPC deadline 10s）。
 6. **套用結果**：經 `transition` helper 在同一 tx 寫 `payment.authorized` + `payment.captured` 兩個事件（02 T3），`seq` 分別為 version 2、3（或同 version 下以事件順序區分，以 04 為準）。
-7. **回應**：gateway 把 gRPC 回應轉成 REST JSON，寫入 Redis（`state=done`，TTL 24h），回 `201`。
+7. **回應**：gateway 把 gRPC 回應轉成 REST JSON，寫入 Valkey（`state=done`，TTL 24h），回 `201`。
 8. **Outbox relay**：與 payment-service 同行程的 relay worker 送到 Kafka；同一 `aggregate_id` 的事件因 partition key 相同而保序。
 9. **下游**：ledger-service（J-CAP）、webhook-service、reconciliation-service（`payment_records` 投影）各自以 `processed_events` 去重後處理。
 
@@ -172,15 +172,15 @@ sequenceDiagram
 |---|---|---|---|
 | 步驟 1 驗簽失敗 | — | 直接拒絕，不寫任何東西 | `401 signature_invalid` 等（02 §10） |
 | 步驟 3 無候選 provider | 硬過濾後為空 | 不建 payment；刪冪等鍵 | `422 no_route_available` |
-| 步驟 4 DB 不可用 | `CreatePayment` 回 `UNAVAILABLE` | gateway **刪除** Redis 冪等鍵後回 `503`，允許商戶以同 key 重試 | `503 service_unavailable`，`Retry-After: 1` |
-| 步驟 4 唯一索引衝突 | 同 key 已有 payment（Redis 鍵過期或 gateway 崩潰後的重試） | 比對 `idempotency_request_hash`：相同 → 回既有 payment；不同 → `FAILED_PRECONDITION` | `200` + `Idempotent-Replayed: true` / `409 idempotency_key_reuse` |
+| 步驟 4 DB 不可用 | `CreatePayment` 回 `UNAVAILABLE` | gateway **刪除** Valkey 冪等鍵後回 `503`，允許商戶以同 key 重試 | `503 service_unavailable`，`Retry-After: 1` |
+| 步驟 4 唯一索引衝突 | 同 key 已有 payment（Valkey 鍵過期或 gateway 崩潰後的重試） | 比對 `idempotency_request_hash`：相同 → 回既有 payment；不同 → `FAILED_PRECONDITION` | `200` + `Idempotent-Replayed: true` / `409 idempotency_key_reuse` |
 | 步驟 5 `declined_*` / `fraud_suspected` / `invalid_request` | provider 明確拒絕 | attempt→declined；無可 failover → payment→`failed`（T4，寫 `failure`）；outbox `payment.failed` | `402 card_declined`（資源已建立，body 含 payment 與 `decline_code`、`retryable`） |
 | 步驟 5 `provider_unavailable` / `provider_config_error` / `provider_rate_limited` | PSP 故障 | attempt→unavailable；failover 到下一個候選（§3）；全部失敗 → `failed`，`503 provider_unavailable` | 同上 |
 | 步驟 5 `provider_timeout` | 不知 PSP 有沒有扣款 | **不 failover**；attempt→`unknown`；`GetPaymentStatus` 最多 3 次（1s/2s/4s）；仍不確定則 payment 停 `created`，交給 `attempt-resolver`（最長 1h；之後 attempt→`needs_reconciliation`、payment→`failed(provider_timeout)`，由 reconciliation-service 兜底） | `504 provider_timeout`（body 含 payment，`status=created`）；商戶以同 key 重查或等 webhook |
 | 步驟 5 `duplicate_request` | PSP 端冪等衝突 | `GetPaymentStatus` 取回既有結果後套用 | 視結果 |
 | 步驟 6 tx2 失敗（DB 短暫錯誤） | PSP 已扣款但本地未記錄 | use case 以 `context.WithoutCancel` 重試 tx2（純 DB 操作）；行程崩潰則 `attempt-resolver` 以 `GetPaymentStatus` 修復 | 可能暫時看到 `created`，數分鐘內收斂 |
-| 步驟 7 gateway 寫 Redis 失敗 | 回應已產生 | 仍回 201；下次同 key 請求落到服務層唯一索引（回放成功） | 正常 |
-| 步驟 7 gateway 回應前崩潰 | 商戶收到連線錯誤 | 商戶重試同 key（需重新簽章）→ Redis 鎖 30s 內回 `409 idempotency_in_progress`；30s 後鎖過期 → 服務層回放 | 先 409 後 200 |
+| 步驟 7 gateway 寫 Valkey 失敗 | 回應已產生 | 仍回 201；下次同 key 請求落到服務層唯一索引（回放成功） | 正常 |
+| 步驟 7 gateway 回應前崩潰 | 商戶收到連線錯誤 | 商戶重試同 key（需重新簽章）→ Valkey 鎖 30s 內回 `409 idempotency_in_progress`；30s 後鎖過期 → 服務層回放 | 先 409 後 200 |
 | 步驟 8 relay 崩潰於 produce 後、UPDATE 前 | 事件重複送出 | 消費端 `processed_events` 去重（§8） | 無感 |
 | 步驟 9 ledger 記帳失敗 | 不平衡 / DB 錯 | 重試 3 次 → `payment.events.dlq`；`pg_ledger_imbalance_total` 告警 | 無感（餘額延後更新） |
 
@@ -276,7 +276,7 @@ sequenceDiagram
     autonumber
     participant PS as payment-service
     participant DB as pg_payment
-    participant R as Redis (健康度視窗)
+    participant R as Valkey (健康度視窗)
     participant PA1 as provider-stripe
     participant PA2 as provider-mock
     participant K as Kafka
@@ -322,7 +322,7 @@ sequenceDiagram
    - `not_found` → attempt→`unavailable`，可 failover；`declined` → attempt→`declined`，payment→`failed`。
    - `authorized` / `captured` → 正常套用（T2/T3）。
    - 仍不確定 → payment 維持 `created`（商戶得到 `504 provider_timeout`），交給 `attempt-resolver`：指數退避輪詢 `GetPaymentStatus`，**最長 1 小時**；查到 authorized / captured 走修復路徑（T2 / T3）；1 小時後仍 unknown → attempt 標記 `needs_reconciliation`、payment → `failed(provider_timeout)`、outbox `payment.failed`，由 reconciliation-service 在結算檔中兜底（PSP 若其實有扣款會以 `missing_internal` 浮現，人工 void / 退款）。**絕不**在不確定時 failover。
-4. **Circuit breaker**（02 §9.4；以 Redis 滑動視窗跨實例共享，維度 `provider × currency`）：
+4. **Circuit breaker**（02 §9.4；以 Valkey 滑動視窗跨實例共享，維度 `provider × currency`）：
    - 60s 視窗、≥ 20 個請求且 `provider_unavailable + provider_timeout` 比率 ≥ 30%，或連續 5 次 `provider_unavailable` → open。
    - open 30s 後 half_open，放行 3 筆探測，成功 2 筆 → closed。
    - `HealthCheck` 每 10s，連續 3 次失敗亦 open。
@@ -817,7 +817,7 @@ sequenceDiagram
     autonumber
     participant M as 商戶
     participant GW as api-gateway
-    participant R as Redis
+    participant R as Valkey
     participant PS as payment-service
 
     Note over M,PS: 情況 1：第一次請求
@@ -849,7 +849,7 @@ sequenceDiagram
     R-->>GW: {processing, hash(B3)}
     GW-->>M: 409 idempotency_error / idempotency_in_progress (Retry-After: 1)
 
-    Note over M,PS: 情況 5：key 過期（> 24h）或 Redis 資料遺失
+    Note over M,PS: 情況 5：key 過期（> 24h）或 Valkey 資料遺失
     M->>GW: POST /v1/payments (key=K1, body=B1)  [25 小時後]
     GW->>R: SET ... NX → OK（鍵已不存在）
     GW->>PS: CreatePayment
@@ -861,14 +861,14 @@ sequenceDiagram
 
 ### 10.2 情況總表（錯誤碼依 02 §10）
 
-| # | 情況 | Redis 狀態 | 行為 | 回應 |
+| # | 情況 | Valkey 狀態 | 行為 | 回應 |
 |---|---|---|---|---|
 | 1 | 首次請求 | 無 → `processing` → `done` | 正常處理 | 原始回應（201/200/4xx） |
 | 2 | 同 key 同 payload，已完成 | `done`，hash 相同 | 回放快取回應（原 status code 與 body） | 原回應 + `Idempotent-Replayed: true` |
 | 3 | 同 key 不同 payload | `done` 或 `processing`，hash 不同 | 拒絕 | `409 idempotency_error / idempotency_key_reuse` |
 | 4 | 同 key 同 payload，處理中 | `processing`，hash 相同 | **不等待**，立即拒絕（避免佔用 gateway 連線；v1 不做 long-poll） | `409 idempotency_error / idempotency_in_progress` + `Retry-After: 1` |
-| 5a | key 在 Redis 過期、同 payload | 無 | 服務層唯一索引攔截，hash 相同 → 回既有資源 | `200` + `Idempotent-Replayed: true` |
-| 5b | key 在 Redis 過期、不同 payload | 無 | 服務層 hash 不同 → `FAILED_PRECONDITION` | `409 idempotency_key_reuse` |
+| 5a | key 在 Valkey 過期、同 payload | 無 | 服務層唯一索引攔截，hash 相同 → 回既有資源 | `200` + `Idempotent-Replayed: true` |
+| 5b | key 在 Valkey 過期、不同 payload | 無 | 服務層 hash 不同 → `FAILED_PRECONDITION` | `409 idempotency_key_reuse` |
 | 6 | 缺少 `Idempotency-Key` | — | 寫入端點一律必填 | `400 idempotency_error / idempotency_key_missing` |
 | 7 | key 非 UUID | — | 拒絕 | `400 idempotency_error / idempotency_key_invalid` |
 | 8 | 處理中 gateway 崩潰 | `processing` 殘留 ≤ 30s | 鎖 TTL 到期自動釋放；之後進情況 5 | 先 409（≤ 30s），後 200 回放 |
@@ -881,10 +881,10 @@ sequenceDiagram
 ### 10.3 實作細節
 
 - **request_hash** = `sha256(method + "\n" + path + "\n" + canonical_json(body))`；canonical JSON 排序 key、去除空白，避免商戶 SDK 重新序列化造成誤判。
-- **Redis 值**：`{state, request_hash, status_code, headers(subset), body, created_at}`；body 上限 64KB。
-- **Redis 不可用**：gateway fail-closed，回 `503 service_unavailable`；不允許在沒有冪等保護下轉發寫入請求。
+- **Valkey 值**：`{state, request_hash, status_code, headers(subset), body, created_at}`；body 上限 64KB。
+- **Valkey 不可用**：gateway fail-closed，回 `503 service_unavailable`；不允許在沒有冪等保護下轉發寫入請求。
 - **服務層**：`CreatePayment` / `CreateRefund` 依唯一索引；衝突時讀回既有列、比對 `idempotency_request_hash`（由 gateway 以 gRPC metadata `x-pg-request-hash` 傳入）。對既有資源的操作（capture / cancel / confirm）由狀態機 + `capture_idempotency_key` / `pending_operation` 自然冪等。
-- **服務層保留期**：永久（隨資料列），所以即使 Redis 全失，同 key 也不會重複建立付款。
+- **服務層保留期**：永久（隨資料列），所以即使 Valkey 全失，同 key 也不會重複建立付款。
 - PSP inbound webhook 端點 `/psp/{provider}/webhook` **排除**在此 middleware 之外。
 
 ---
@@ -896,7 +896,7 @@ sequenceDiagram
 | Hop | Timeout | 重試 | 重試條件 | 備註 |
 |---|---|---|---|---|
 | 商戶 → api-gateway（HTTP server） | `ReadHeaderTimeout 5s`、`ReadTimeout 10s`、`WriteTimeout 30s`、handler 整體 **28s** | 由商戶決定 | — | 商戶 SDK client timeout ≥ 35s，同 `Idempotency-Key` + 新簽章重試 |
-| api-gateway → Redis | 100ms | 1 次 | 連線錯 / 逾時 | 失敗 → 503 fail-closed |
+| api-gateway → Valkey | 100ms | 1 次 | 連線錯 / 逾時 | 失敗 → 503 fail-closed |
 | api-gateway → merchant-service（`LookupApiKey`） | 2s | 2 次（100ms、300ms） | `UNAVAILABLE` | 結果快取 300s |
 | api-gateway → payment-service（寫入） | **25s**（gRPC deadline） | **0** | — | 容納 authorize saga 25s 預算 |
 | api-gateway → payment-service（讀取） | 3s | 2 次 | `UNAVAILABLE`、`DEADLINE_EXCEEDED` | 讀取冪等 |
@@ -984,7 +984,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    INF["基礎設施：PostgreSQL、Redis、Kafka、Vault、OTel Collector"]
+    INF["基礎設施：PostgreSQL、Valkey、Kafka、Vault、OTel Collector"]
     MIG["migrations（init container / CI migration job，pg_<svc>_migrator 角色）"]
     MS["merchant-service"]
     PA["provider adapters（provider-mock / provider-stripe）"]
@@ -1010,7 +1010,7 @@ flowchart TD
 規則：
 
 1. Kubernetes 下不強制啟動順序，靠 **readiness probe** 與 client 端重試收斂。`/readyz` 只在「自己的 DB 可連、migration 版本符合、Kafka producer 建立成功、Vault 憑證取得」時回 200。
-2. **api-gateway 的 readiness** 額外要求 Redis 可用與 merchant-service、payment-service 的 gRPC health 為 `SERVING`。
+2. **api-gateway 的 readiness** 額外要求 Valkey 可用與 merchant-service、payment-service 的 gRPC health 為 `SERVING`。
 3. payment-service **不**把 adapter 的健康列入 readiness（單一 PSP 故障不應讓 payment-service 下線），改用 circuit breaker 排除。
 4. 本機 docker-compose 用 `depends_on: condition: service_healthy` 近似上述順序。
 5. Migration 由 `pg_<svc>_migrator` 角色在 init container / CI job 執行（06 §6.3）；應用程式啟動時檢查 schema 版本不符則拒絕啟動。
@@ -1087,7 +1087,7 @@ sequenceDiagram
 | `refund-reconciler`（02 §5.3） | payment-service | leader | 每 5 分鐘 | `refunds.status=pending` 超過 2 分鐘 → `GetPaymentStatus`（含 refund 列表）→ 收斂；24h → `failed(provider_timeout)` + 釋放額度 | version | pending 超過 24h |
 | `authorization-expiring-notifier`（提案） | payment-service | leader | 每 10 分鐘 | `auth_expires_at` 在 24h 內且未通知 → outbox `payment.authorization_expiring` | `expiring_notified_at` | — |
 | `dispute-evidence-due-notifier`（02 §6.1） | payment-service | leader | 每 10 分鐘 | `evidence_due_at` 在 72h / 24h 內 → outbox `dispute.evidence_due_soon` | `due_soon_notified_72h/24h_at` | — |
-| `provider-health-probe`（02 §9.4） | payment-service | 每實例 | 每 10 秒 | 呼叫每個 adapter `HealthCheck`，更新 Redis 健康度視窗；連續 3 次失敗 → open | 唯讀 | provider 連續 unhealthy > 1 分鐘 |
+| `provider-health-probe`（02 §9.4） | payment-service | 每實例 | 每 10 秒 | 呼叫每個 adapter `HealthCheck`，更新 Valkey 健康度視窗；連續 3 次失敗 → open | 唯讀 | provider 連續 unhealthy > 1 分鐘 |
 | `outbox-lag-monitor` | 每個擁有 DB 的服務 | leader | 每 10 秒 | `now() − min(created_at) WHERE published_at IS NULL` → `pg_outbox_lag_seconds` | 唯讀 | lag > 30s 持續 2 分鐘 |
 | `outbox-cleanup` | 每個擁有 DB 的服務 | CronJob | 每日 03:00 | `DELETE ... WHERE published_at < now() − 7d`，每批 5000 | 純刪除 | outbox 列數 > 1000 萬 |
 | `processed-events-cleanup` | 每個消費服務 | CronJob | 每日 03:30 | 刪除 **30 天**前的 `processed_events` | 純刪除 | — |

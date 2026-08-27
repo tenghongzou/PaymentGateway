@@ -272,7 +272,7 @@ linters:
             - { pkg: "google.golang.org/grpc", desc: "domain has no infrastructure dependencies" }
             - { pkg: "github.com/segmentio/kafka-go", desc: "domain has no infrastructure dependencies" }
             - { pkg: "github.com/twmb/franz-go", desc: "domain has no infrastructure dependencies" }
-            - { pkg: "github.com/redis/go-redis", desc: "domain has no infrastructure dependencies" }
+            - { pkg: "github.com/valkey-io/valkey-go", desc: "domain has no infrastructure dependencies" }
         layer-app:
           list-mode: lax
           files: ["**/internal/*/app/**"]

@@ -23,7 +23,7 @@ spec:
       {{- include "pg.partOfSelector" $root | nindent 6 }}
   policyTypes: ["Ingress", "Egress"]
 ---
-# 2. Baseline egress for every pod: DNS, OTel collector, Redis, Kafka.
+# 2. Baseline egress for every pod: DNS, OTel collector, Valkey, Kafka.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -58,14 +58,14 @@ spec:
         {{- range $g.otel.ports }}
         - { protocol: TCP, port: {{ . }} }
         {{- end }}
-    # Redis (managed, outside the cluster)
-    - {{ if $g.redis.cidrs }}to:
-        {{- range $g.redis.cidrs }}
+    # Valkey (managed, outside the cluster)
+    - {{ if $g.valkey.cidrs }}to:
+        {{- range $g.valkey.cidrs }}
         - ipBlock:
             cidr: {{ . }}
         {{- end }}
       {{ end }}ports:
-        - { protocol: TCP, port: {{ $g.redis.port }} }
+        - { protocol: TCP, port: {{ $g.valkey.port }} }
     # Kafka (managed, outside the cluster)
     - {{ if $g.kafka.cidrs }}to:
         {{- range $g.kafka.cidrs }}

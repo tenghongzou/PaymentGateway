@@ -237,8 +237,8 @@ compose-ps: ## Show stack status
 	$(COMPOSE) ps
 
 .PHONY: compose-infra
-compose-infra: ## Start only infrastructure (postgres/redis/kafka/otel) for running services from the IDE
-	$(COMPOSE) up -d postgres redis kafka otel-collector jaeger prometheus grafana
+compose-infra: ## Start only infrastructure (postgres/valkey/kafka/otel) for running services from the IDE
+	$(COMPOSE) up -d postgres valkey kafka otel-collector jaeger prometheus grafana
 
 .PHONY: compose-config
 compose-config: ## Validate and render the compose file

@@ -26,7 +26,7 @@ PaymentGateway/
 │   ├── eventbus/   franz-go Producer（實作 outbox.Publisher）/ Consumer（手動 commit、重試、DLQ）
 │   ├── grpcx/      gRPC server/client 建構、interceptors、apperr ↔ gRPC status（ErrorDetail）
 │   ├── httpx/      REST 錯誤格式、JSON、RequestID/Recover/Logging/Timeout middleware、gRPC → REST 錯誤
-│   ├── idempotency/ Idempotency-Key 儲存（Redis / 記憶體）
+│   ├── idempotency/ Idempotency-Key 儲存（Valkey / 記憶體）
 │   ├── ids/        pay_/att_/re_/… 公開 ID（prefix + base32(UUIDv7)）
 │   ├── logx/       slog JSON、trace_id/request_id 注入、MaskPAN/MaskSecret
 │   ├── money/      Money 值物件（int64 最小單位、幣別小數位表、half-up bps）
@@ -44,7 +44,7 @@ PaymentGateway/
 
 | 層 | 可以 import | 不可 import | 內容 |
 |---|---|---|---|
-| `domain` | 標準庫、`pkg/money`、`pkg/ids`、`pkg/apperr` | `app`、`adapter`、pgx / grpc / kafka / redis | 純邏輯：狀態機（`CanTransition`）、聚合方法（`Authorize`/`Capture`/`Void`/`Fail`/`Expire`/`ReserveRefund`/`MarkRefunded`…）回傳要寫入的 `Event`；錯誤帶 01 §8 的 type/code |
+| `domain` | 標準庫、`pkg/money`、`pkg/ids`、`pkg/apperr` | `app`、`adapter`、pgx / grpc / kafka / valkey | 純邏輯：狀態機（`CanTransition`）、聚合方法（`Authorize`/`Capture`/`Void`/`Fail`/`Expire`/`ReserveRefund`/`MarkRefunded`…）回傳要寫入的 `Event`；錯誤帶 01 §8 的 type/code |
 | `app` | `domain`、`pkg/*`、`api/gen`（proto 型別） | `adapter` | use case 編排：交易邊界（`TxManager`）、兩階段寫入（鎖 → 預留 → 外部呼叫 → 套用）、failover 迴圈、事件 → outbox |
 | `adapter` | 全部 | 其他服務的 `internal/<b>` | 實作 ports：Postgres repo、gRPC server、provider client/router |
 
@@ -93,7 +93,7 @@ PaymentGateway/
 | 指令 | 內容 | 需要 |
 |---|---|---|
 | `go test ./...` | 單元測試（domain 狀態機全矩陣、app fake ports、gateway httptest、pkg/*） | 無（< 2 分鐘，無 docker） |
-| `go test -tags integration ./...` | testcontainers：`internal/payment/adapter/postgres`（套用 migrations/payment）、`pkg/idempotency`（Redis）、`pkg/eventbus`（Kafka） | Docker |
+| `go test -tags integration ./...` | testcontainers：`internal/payment/adapter/postgres`（套用 migrations/payment）、`pkg/idempotency`（Valkey）、`pkg/eventbus`（Kafka） | Docker |
 | `make e2e` 或 `go test -tags e2e ./test/e2e/` | 對 `http://localhost:8080` 跑建立 / 查詢 / 退款 / decline / failover / 3DS / void | compose 全套或三個服務本機啟動 |
 | `./scripts/dev-pay.sh` | 用 `PG_DEV_*` 憑證建立一筆 `tok_ok` 付款並查詢 | gateway + payment-service + provider-mock |
 
@@ -104,7 +104,7 @@ PG_SERVICE_NAME=provider-mock PG_GRPC_ADDR=:9101 PG_HTTP_ADDR=:18101 go run ./cm
 PG_SERVICE_NAME=payment-service PG_GRPC_ADDR=:9002 PG_HTTP_ADDR=:18002 PG_AUTO_MIGRATE=true \
   PG_DATABASE_URL='postgres://payment_owner:payment_owner@localhost:5432/pg_payment?sslmode=disable' \
   PG_KAFKA_BROKERS=localhost:29092 PG_PROVIDER_ADDRS=mock=localhost:9101 go run ./cmd/payment-service
-PG_SERVICE_NAME=api-gateway PG_HTTP_ADDR=:8080 PG_REDIS_ADDR=localhost:6379 PG_PAYMENT_SERVICE_ADDR=localhost:9002 \
+PG_SERVICE_NAME=api-gateway PG_HTTP_ADDR=:8080 PG_VALKEY_ADDR=localhost:6379 PG_PAYMENT_SERVICE_ADDR=localhost:9002 \
   PG_PROVIDER_ADDRS=mock=localhost:9101 PG_DEV_API_KEY=pk_test_dev_0000000000000000 \
   PG_DEV_SIGNING_SECRET=sk_test_dev_secret_change_me PG_DEV_MERCHANT_ID=0190a1b2-c3d4-7e5f-8a9b-000000000001 go run ./cmd/api-gateway
 ```

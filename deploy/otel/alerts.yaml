@@ -161,7 +161,7 @@ groups:
         for: 5m
         labels: { severity: page, team: payments }
         annotations:
-          summary: "Idempotency store (Redis) errors"
+          summary: "Idempotency store (Valkey) errors"
           description: "Gateway cannot guarantee idempotency; writes should fail closed (503) rather than double-charge."
       - alert: PGReconciliationMismatch
         expr: sum by (provider) (increase(pg_reconciliation_mismatch_total[1h])) > 0

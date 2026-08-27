@@ -32,7 +32,7 @@
 ### 1.3 冪等
 - 所有 `POST` / `PATCH` / `DELETE` **必須**帶 `Idempotency-Key`（UUID 建議），商戶範圍內 24 小時唯一。
 - 閘道行為（01 文件 §6.1）：
-  1. Redis `SETNX idem:{merchant_id}:{key}` 取得鎖；取不到 → `409 idempotency_key_in_use`。
+  1. Valkey `SETNX idem:{merchant_id}:{key}` 取得鎖；取不到 → `409 idempotency_key_in_use`。
   2. 若已有儲存結果：比對 `request_hash`（method + path + body 的 SHA-256）；不同 → `409 idempotency_key_payload_mismatch`；相同 → 重放原回應並附 `Idempotent-Replayed: true`。
   3. 服務層（payment-service）以 `(merchant_id, idempotency_key)` 唯一索引做最後防線。
 - **業務結果也被冪等**：第一次 `POST /payments` 被 PSP 拒絕（`201` + `status: failed`），重送同 key 仍回同一筆 `failed` 付款，不會再扣一次。要重試請換新的 key。
@@ -114,7 +114,7 @@ X-Signature:   v1=<hex(HMAC-SHA256(signing_secret, canonical))>
 - HMAC 金鑰為 `sk_live_…` **含前綴的完整字串**；輸出小寫 hex 64 字元，前面加 `v1=`。
 - request target **包含 `/v1` 前綴**（即 server URL 的 path 部分 + 端點路徑）。
 - `raw_body` 為請求原始 bytes；不得先 parse 再序列化。
-- 時間窗 ±300 秒（`401 timestamp_out_of_window`）；同一簽章 300 秒內重複出現回 `401 signature_replayed`（閘道以 Redis `SET replay:{key_id}:{sig[:32]} NX EX 300` 偵測）。
+- 時間窗 ±300 秒（`401 timestamp_out_of_window`）；同一簽章 300 秒內重複出現回 `401 signature_replayed`（閘道以 Valkey `SET replay:{key_id}:{sig[:32]} NX EX 300` 偵測）。
 - 閘道比對使用常數時間比較（`crypto/subtle.ConstantTimeCompare`）。
 - 納入 method 與 request target 的目的：防止把 `POST /v1/payments` 的合法簽章重放到 `POST /v1/refunds` 等其他端點。
 
@@ -124,7 +124,7 @@ sequenceDiagram
     autonumber
     participant M as Merchant backend
     participant G as api-gateway (:8080)
-    participant R as Redis
+    participant R as Valkey
     participant MS as merchant-service (:9001)
     participant PS as payment-service (:9002)
 

@@ -35,7 +35,7 @@ func (m *MemoryStore) WithClock(now func() time.Time) *MemoryStore {
 func (m *MemoryStore) Begin(_ context.Context, merchantID, key, requestHash string) (State, *Response, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := redisKey(merchantID, key)
+	k := storeKey(merchantID, key)
 	now := m.now()
 	if it, ok := m.items[k]; ok && now.Before(it.expiresAt) {
 		if it.rec.RequestHash != requestHash {
@@ -57,7 +57,7 @@ func (m *MemoryStore) Begin(_ context.Context, merchantID, key, requestHash stri
 func (m *MemoryStore) Complete(_ context.Context, merchantID, key string, resp Response) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := redisKey(merchantID, key)
+	k := storeKey(merchantID, key)
 	now := m.now()
 	it := m.items[k]
 	it.rec.State = stateCompleted
@@ -74,6 +74,6 @@ func (m *MemoryStore) Complete(_ context.Context, merchantID, key string, resp R
 func (m *MemoryStore) Abort(_ context.Context, merchantID, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.items, redisKey(merchantID, key))
+	delete(m.items, storeKey(merchantID, key))
 	return nil
 }

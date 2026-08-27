@@ -27,8 +27,8 @@ global:
     host: ""                      # informational / used by NOTES.txt
     port: 5432
     cidrs: []                     # NetworkPolicy egress targets, e.g. ["10.20.0.0/16"]; empty => any destination on the port
-  redis:
-    addr: ""                      # PG_REDIS_ADDR, e.g. master.pg-redis.xxxx.apne1.cache.amazonaws.com:6379
+  valkey:
+    addr: ""                      # PG_VALKEY_ADDR, e.g. master.pg-valkey.xxxx.apne1.cache.amazonaws.com:6379
     port: 6379
     cidrs: []
   kafka:
@@ -78,7 +78,7 @@ externalSecrets:
     name: vault-backend
     kind: ClusterSecretStore
   # Vault KV-v2 layout (keys inside each path are the exact env var names, e.g. PG_DATABASE_URL):
-  #   <pathPrefix>/<env>/common             -> shared (PG_REDIS_PASSWORD, PG_KAFKA_SASL_*)
+  #   <pathPrefix>/<env>/common             -> shared (PG_VALKEY_PASSWORD, PG_KAFKA_SASL_*)
   #   <pathPrefix>/<env>/<service-name>     -> service specific:
   #        PG_DATABASE_URL          (<svc>_app role, DML only - used by the running service)
   #        PG_MIGRATE_DATABASE_URL  (<svc>_owner role, DDL - used by the migration Job; optional)

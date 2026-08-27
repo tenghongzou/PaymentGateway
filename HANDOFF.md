@@ -5,7 +5,7 @@
 ## 10 分鐘上手
 1. 讀 [`docs/01-architecture.md`](docs/01-architecture.md)（單一事實來源）→ [`docs/10-codebase-guide.md`](docs/10-codebase-guide.md)（程式碼導覽）。
 2. `make tools && make proto && make build && go test ./...`
-3. `docker compose -f deploy/compose/docker-compose.yaml up -d postgres redis kafka`，啟動 `bin/provider-mock`、`bin/payment-service`、`bin/api-gateway`，跑 `scripts/dev-pay.sh` 與 `go test -tags e2e ./test/e2e/...`。
+3. `docker compose -f deploy/compose/docker-compose.yaml up -d postgres valkey kafka`，啟動 `bin/provider-mock`、`bin/payment-service`、`bin/api-gateway`，跑 `scripts/dev-pay.sh` 與 `go test -tags e2e ./test/e2e/...`。
 
 ## 交付摘要
 | 類別 | 內容 | 驗證 |

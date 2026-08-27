@@ -60,7 +60,7 @@ type Service struct {
 	consumer   string
 	log        *slog.Logger
 
-	// retryKeys 為 RetryDelivery 的冪等鍵（行程內、24h）。TODO: 多副本時改存 Redis / DB。
+	// retryKeys 為 RetryDelivery 的冪等鍵（行程內、24h）。TODO: 多副本時改存 Valkey / DB。
 	retryMu   sync.Mutex
 	retryKeys map[string]retryRecord
 }

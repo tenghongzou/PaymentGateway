@@ -143,7 +143,7 @@
 |---|---|---|
 | 介面 | `ProviderAdapter` | gRPC `pg.provider.v1.ProviderAdapter`：`Authorize / Capture / Void / Refund / GetPaymentStatus / ParseWebhook / HealthCheck` |
 | 值物件 | `ProviderError` | `category(ProviderErrorCategory), decline_code, provider_code, provider_message, retry_after?` |
-| 值物件 | `ProviderHealth` | `success_rate_1m, p95_latency_ms, circuit_state(closed/open/half_open), last_checked_at`；由 payment-service 以滑動視窗計算並存 Redis |
+| 值物件 | `ProviderHealth` | `success_rate_1m, p95_latency_ms, circuit_state(closed/open/half_open), last_checked_at`；由 payment-service 以滑動視窗計算並存 Valkey |
 
 ### 2.7 Context Map
 
@@ -538,7 +538,7 @@ stateDiagram-v2
 
 | 層 | 機制 | 防止 |
 |---|---|---|
-| api-gateway | `Idempotency-Key` + Redis `SETNX`（24h），儲存 `(request_hash, status, body)`；同 key 不同 hash → `409 idempotency_key_reuse`；處理中 → `409 idempotency_in_progress` | 商戶重送整個請求 |
+| api-gateway | `Idempotency-Key` + Valkey `SETNX`（24h），儲存 `(request_hash, status, body)`；同 key 不同 hash → `409 idempotency_key_reuse`；處理中 → `409 idempotency_in_progress` | 商戶重送整個請求 |
 | payment-service（DB） | 唯一索引（§8.2）+ `version` 樂觀鎖 + `pending_operation` 互斥 | gateway 快取失效、多個 gateway 實例競態 |
 | Provider | 每次 PSP 呼叫帶確定性冪等鍵（§4.2） | 網路重試造成 PSP 端重複授權/退款 |
 
@@ -633,7 +633,7 @@ func (uc *CaptureUseCase) Execute(ctx context.Context, cmd CaptureCommand) (*Pay
 | `card.country` / `customer.ip` 國別 | Payment | 本地收單偏好（本地卡走本地 PSP 成功率較高） |
 | `preferred_provider`（請求參數） | 商戶 | 商戶指定；仍受硬過濾與健康度限制 |
 | `RoutingRule[]` | merchant-service | 商戶自訂 prefer / exclude / split |
-| Provider 健康度 | payment-service（Redis 滑動視窗） | 排除 circuit open、降低高錯誤率者優先序 |
+| Provider 健康度 | payment-service（Valkey 滑動視窗） | 排除 circuit open、降低高錯誤率者優先序 |
 | Provider 成本 | `ProviderAccount.cost_schedule` | 成本排序 |
 | 平台預設順序 | 設定 `PG_ROUTING_DEFAULT_ORDER` | 最終 tie-breaker |
 | `live_mode` | ApiKey | `test` 模式只能路由到 `provider-mock` 或各 PSP 的 test 帳戶 |
@@ -672,7 +672,7 @@ flowchart TD
 
 | 參數 | 值 |
 |---|---|
-| 視窗 | 60s 滑動視窗（Redis sorted set 或 Lua 計數），按 `provider × currency` 維度 |
+| 視窗 | 60s 滑動視窗（Valkey sorted set 或 Lua 計數），按 `provider × currency` 維度 |
 | 開路條件 | 視窗內請求 ≥ 20 且 `provider_unavailable + provider_timeout` 比率 ≥ 30%，或連續 5 次 `provider_unavailable` |
 | 開路時間 | 30s；之後 `half_open`，放行最多 3 筆探測，成功 2 筆即 `closed` |
 | `HealthCheck` | 每 10s 呼叫 adapter `HealthCheck`；連續 3 次失敗亦開路 |
@@ -747,7 +747,7 @@ flowchart TD
 | | `provider_rejected` | 502 | Provider 回 `invalid_request`（閘道端設定/映射問題，已告警） |
 | `api_error` | `internal_error` | 500 | |
 | | `concurrent_modification` | 409 | 樂觀鎖重試耗盡 |
-| | `service_unavailable` | 503 | 依賴（DB/Redis/下游 gRPC）不可用 |
+| | `service_unavailable` | 503 | 依賴（DB/Valkey/下游 gRPC）不可用 |
 
 回應範例：
 

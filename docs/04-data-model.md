@@ -662,7 +662,7 @@ UPDATE payments
 
 | 層級 | 機制 | 鍵 |
 |---|---|---|
-| api-gateway | Redis `SETNX` + `(request_hash, response)` 快取 24h | `Idempotency-Key` |
+| api-gateway | Valkey `SETNX` + `(request_hash, response)` 快取 24h | `Idempotency-Key` |
 | payment-service | `UNIQUE (merchant_id, idempotency_key)` on `payments` / `refunds`；`idempotency_request_hash` 比對 payload，不同 → `409 idempotency_error` | `(merchant_id, idempotency_key)` |
 | PSP 端 | 以 `payment_id + ":auth"`、`payment_id + ":cap"` 等固定字串作 PSP idempotency key | — |
 | 事件消費 | `processed_events (event_id, consumer)` PK，`INSERT ... ON CONFLICT DO NOTHING` 與業務寫入同交易 | `(event_id, consumer)` |
@@ -743,7 +743,7 @@ processed_events (event_id uuid, consumer text, processed_at, PRIMARY KEY (event
 
 | 需求 | 方式 | 範例 |
 |---|---|---|
-| 同步、低延遲、需要最新值 | gRPC 呼叫擁有資料的服務 | payment-service 建立付款前呼叫 merchant-service `GetRoutingPreferences`（以 `version` 做本地快取失效）；api-gateway 驗 API key 呼叫 merchant-service（Redis 快取 60s） |
+| 同步、低延遲、需要最新值 | gRPC 呼叫擁有資料的服務 | payment-service 建立付款前呼叫 merchant-service `GetRoutingPreferences`（以 `version` 做本地快取失效）；api-gateway 驗 API key 呼叫 merchant-service（Valkey 快取 60s） |
 | 非同步、可容忍秒級延遲、需要在本地以 SQL 過濾/JOIN | 消費事件建立**讀模型（projection）** | webhook-service 的 `endpoints`；reconciliation-service 的 `payment_records`、`ledger_postings` |
 | 對外列表 / 報表 | 由 api-gateway 組合多個 gRPC 回應；重度報表走 Phase 3 的資料倉儲（CDC：`wal_level = logical` 已在 compose 開啟） | `GET /v1/payments/{id}` 同時回 payment（payment-service）與 ledger balance（ledger-service） |
 

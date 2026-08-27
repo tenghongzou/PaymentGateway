@@ -3,6 +3,8 @@
 - **Status**：Accepted（2026-08）
 - **關聯**：`01-architecture.md` §6.1；`05-flows-and-sequences.md` §10；`pkg/idempotency`
 
+> **註（2026-08-27）**：依 ADR-0013，第一層儲存自 Redis 改為 Valkey（wire-compatible，設計不變）。本文為歷史紀錄不改寫，文中 Redis 皆讀作 Valkey。
+
 ## Context
 
 商戶的網路重試、SDK 自動重試、以及使用者重複點擊，都會讓同一個「建立付款」請求抵達多次。支付系統必須保證**同一個意圖只執行一次**，並讓重試者得到與原始請求相同的結果。

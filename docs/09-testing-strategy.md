@@ -7,10 +7,10 @@
 ```mermaid
 flowchart TB
     L7["負載測試（k6，500 TPS 目標）<br/>nightly / release 前"]
-    L6["混沌測試（provider 延遲 / 錯誤注入、Kafka / Redis 中斷）<br/>每週 / release 前"]
+    L6["混沌測試（provider 延遲 / 錯誤注入、Kafka / Valkey 中斷）<br/>每週 / release 前"]
     L5["端到端（docker-compose + provider-mock 情境）<br/>每個 PR（精簡集）/ main（完整集）"]
     L4["契約測試（buf breaking、OpenAPI 驗證、adapter 對 PSP sandbox）<br/>每個 PR"]
-    L3["整合測試（testcontainers：PostgreSQL / Kafka / Redis）<br/>每個 PR"]
+    L3["整合測試（testcontainers：PostgreSQL / Kafka / Valkey）<br/>每個 PR"]
     L2["應用層測試（use case + fake ports）<br/>每個 PR"]
     L1["領域單元測試（狀態機、money、ledger 不變條件、property-based）<br/>每次 commit"]
     L7 --- L6 --- L5 --- L4 --- L3 --- L2 --- L1
@@ -103,7 +103,7 @@ build tag `//go:build integration`；`make test-integration`。
 
 - `testinfra.Postgres(t)`：啟動 `postgres:16`，執行該服務的 migrations（`golang-migrate`），回傳 pool；每個測試以 `BEGIN ... ROLLBACK` 或獨立 schema 隔離；容器以 `testcontainers` 的 reuse 模式在同一 package 共享。
 - `testinfra.Kafka(t)`：`redpanda` 容器（啟動快），自動建 topic。
-- `testinfra.Redis(t)`：`redis:7`。
+- `testinfra.Valkey(t)`：`valkey/valkey:8`。
 
 必測：
 
@@ -111,7 +111,7 @@ build tag `//go:build integration`；`make test-integration`。
 - **Outbox relay**：寫 N 筆 → relay 送到 Kafka → 全部 `published_at` 非空；模擬 Kafka 不可用（停止容器）→ relay 退避、恢復後補送；relay 在 produce 後、UPDATE 前被 kill → 重送 → 消費端去重。
 - **Consumer**：重複訊息只處理一次；handler 失敗 3 次後進 DLQ 且 offset 前進；poison message 直接 DLQ；處理中崩潰（不 commit offset）→ 重送 → 去重。
 - **Ledger DB 約束**：不平衡 journal 在 commit 時被 deferred trigger 拒絕；UPDATE / DELETE entries 被拒絕。
-- **api-gateway middleware**：冪等 10 種情況（`05` §10.2）逐一用真 Redis 測；HMAC 驗簽（正確、錯誤、時間窗外、重放）；限流。
+- **api-gateway middleware**：冪等 10 種情況（`05` §10.2）逐一用真 Valkey 測；HMAC 驗簽（正確、錯誤、時間窗外、重放）；限流。
 - **gRPC server**：以 `bufconn` 起 server，驗證錯誤碼映射、deadline 傳遞（server 收到的 `ctx.Deadline()` 與 client 設定一致）、interceptor 的 trace 傳遞。
 - **Migration**：`up` 後 `down` 再 `up` 不報錯；`up` 在已有資料的 schema 上可執行（expand/contract 檢查，對比上一版 tag）。
 
@@ -131,7 +131,7 @@ build tag `//go:build integration`；`make test-integration`。
 
 ### 2.5 端到端（docker-compose + provider-mock）
 
-`make e2e`：起 `deploy/compose/docker-compose.yaml`（全部服務 + Redpanda + PostgreSQL + Redis + provider-mock），以 Go 測試（`test/e2e`，build tag `e2e`）透過 REST 操作並以 **商戶 webhook 接收器**（測試內啟動的 HTTP server，註冊為商戶端點）與 **REST 查詢** 斷言結果。
+`make e2e`：起 `deploy/compose/docker-compose.yaml`（全部服務 + Redpanda + PostgreSQL + Valkey + provider-mock），以 Go 測試（`test/e2e`，build tag `e2e`）透過 REST 操作並以 **商戶 webhook 接收器**（測試內啟動的 HTTP server，註冊為商戶端點）與 **REST 查詢** 斷言結果。
 
 情境表（每列一個測試；「精簡集」標 ★ 在每個 PR 跑，其餘在 main / nightly）：
 
@@ -161,11 +161,11 @@ build tag `//go:build integration`；`make test-integration`。
 | 22 | 對帳 | 上傳含 匹配 / 金額不符 / PSP 多一筆 的結算檔 | case 數量與類型正確；`post_adjustment` 後 ledger 有反向 / 調整分錄 |
 | 23 | graceful shutdown | 在 in-flight 付款期間 `docker stop`（SIGTERM）payment-service | in-flight 完成且狀態一致；outbox 無遺失；重啟後 resolver 收斂 |
 | 24 | Kafka 短暫中斷 | `docker pause redpanda` 30s | 付款 API 仍成功；恢復後 ledger / webhook 補上；`pg_outbox_lag_seconds` 曾升高後歸零 |
-| 25 | Redis 中斷 | `docker pause redis` | 寫入 API 回 503（fail-closed）；GET 正常；恢復後正常 |
+| 25 | Valkey 中斷 | `docker pause valkey` | 寫入 API 回 503（fail-closed）；GET 正常；恢復後正常 |
 
 ### 2.6 混沌測試
 
-工具：`toxiproxy`（在 compose 中置於 payment-service ↔ provider-mock、gateway ↔ Redis、服務 ↔ Kafka 之間）+ provider-mock 的控制介面（§3）。
+工具：`toxiproxy`（在 compose 中置於 payment-service ↔ provider-mock、gateway ↔ Valkey、服務 ↔ Kafka 之間）+ provider-mock 的控制介面（§3）。
 
 | 實驗 | 注入 | 預期 |
 |---|---|---|

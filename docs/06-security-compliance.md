@@ -39,7 +39,7 @@
 | `api-gateway` → 各服務 gRPC | proto 無卡號欄位；`PaymentMethod` 只有 `token, brand, last4, bin, exp_month, exp_year` |
 | Kafka 事件 payload | proto 同上；`pkg/eventbus` producer 啟用 payload PAN 掃描（抽樣 1%，命中即告警） |
 | PostgreSQL 各 DB | schema 無卡號欄位；`card_last4 CHAR(4)`、`card_bin CHAR(8)`（僅 6 或 8 碼）；CI 檢查 migration 不得新增含 `pan/card_number/cvv/cvc` 的欄位名 |
-| Redis（冪等快取、限流、健康度） | 冪等快取存的是回應 body（無卡號）與請求 hash（非原文） |
+| Valkey（冪等快取、限流、健康度） | 冪等快取存的是回應 body（無卡號）與請求 hash（非原文） |
 | 日誌 / trace / metrics | §2.3 遮罩；span attribute 白名單；metrics label 不得含任何使用者輸入 |
 | PSP inbound webhook 原文 | PSP webhook 不含完整 PAN（Stripe/Adyen 只含 last4）；仍以 envelope encryption 儲存、90 天 TTL |
 | 對商戶 Webhook payload | 由 API 回應同一序列化器產生，欄位同 REST |
@@ -155,7 +155,7 @@ flowchart LR
 | `lookup_id` | 明文，索引 `(mode, lookup_id)` |
 | 顯示 | 後台只顯示 `pk_live_` + `lookup_id` + `…`；secret 永不再顯示 |
 
-驗證成本控制：Argon2id 驗證約 50–100 ms，不可每請求執行。`api-gateway` 在**首次驗證成功後**於 Redis 寫入 `auth:key:{sha256(pk)}` → `{key_id, merchant_id, mode, scopes, status, secret_version}`（TTL 300s），之後以 SHA-256 查表；signing secret 明文只放在 `api-gateway` **行程內記憶體快取**（TTL 300s，`merchant.events` 的 `api_key.rotated/revoked` 立即清除），**不得寫入 Redis**。
+驗證成本控制：Argon2id 驗證約 50–100 ms，不可每請求執行。`api-gateway` 在**首次驗證成功後**於 Valkey 寫入 `auth:key:{sha256(pk)}` → `{key_id, merchant_id, mode, scopes, status, secret_version}`（TTL 300s），之後以 SHA-256 查表；signing secret 明文只放在 `api-gateway` **行程內記憶體快取**（TTL 300s，`merchant.events` 的 `api_key.rotated/revoked` 立即清除），**不得寫入 Valkey**。
 
 ### 3.3 請求簽章
 
@@ -190,16 +190,16 @@ X-Signature: v1=<signature>
 ```
 1.  解析 Authorization；格式不符 → 401 invalid_api_key
 2.  mode = 前綴決定；lookup_id = key[8:16]
-3.  Redis 查 auth:key:{sha256(pk)}；miss → gRPC merchant-service.LookupApiKey(mode, lookup_id)
+3.  Valkey 查 auth:key:{sha256(pk)}；miss → gRPC merchant-service.LookupApiKey(mode, lookup_id)
       → 對回傳的所有候選（最多 2 把）做 Argon2id verify；都失敗 → 401 invalid_api_key
-      → 成功：寫 Redis（TTL 300s），並取 signing secret 放行程內快取
+      → 成功：寫 Valkey（TTL 300s），並取 signing secret 放行程內快取
 4.  status = revoked → 401 api_key_revoked；expires_at < now → 401 api_key_expired
 5.  merchant.status = suspended → 403 merchant_suspended；closed → 403 merchant_closed
 6.  X-Timestamp 缺/非整數 → 401 signature_missing；|now − ts| > 300s → 401 timestamp_out_of_window
 7.  讀 body（上限 1 MiB），計算 canonical，期望簽章 = HMAC(secret_current)；
     key 狀態為 rotating 且有 secret_previous 時亦接受 HMAC(secret_previous)
     比對用 crypto/subtle.ConstantTimeCompare；不符 → 401 signature_invalid
-8.  重放防護：Redis SET replay:{key_id}:{sig[:32]} 1 NX EX 300；已存在 → 401 signature_replayed
+8.  重放防護：Valkey SET replay:{key_id}:{sig[:32]} 1 NX EX 300；已存在 → 401 signature_replayed
 9.  scope 檢查 → 403 insufficient_permissions
 10. 將 merchant_id / key_id / mode 放入 context 與 trace attributes；下游 gRPC metadata 帶 merchant_id（由 gateway 簽發的內部 header，不可由外部傳入）
 ```
@@ -226,11 +226,11 @@ sequenceDiagram
     MS-->>GW: merchant.events api_key.rotated → 清快取
     Note over GW: 到期自動 → revoked；期間每次使用舊 key 發 api_key.deprecated_use 通知
     M->>MS: （緊急）POST /v1/api_keys/{id}/revoke
-    MS-->>GW: api_key.revoked（Kafka）→ 刪 Redis + 記憶體快取（< 1s）
+    MS-->>GW: api_key.revoked（Kafka）→ 刪 Valkey + 記憶體快取（< 1s）
 ```
 
 - 輪替不需停機；兩把 key 各自有獨立 secret，**不做 secret 共用**。
-- 撤銷立即生效：除了事件驅動的快取清除，`api-gateway` 對 `revoked` 的 key 亦在 Redis 寫入 `auth:revoked:{key_id}`（TTL 24h）作為第二道判斷。
+- 撤銷立即生效：除了事件驅動的快取清除，`api-gateway` 對 `revoked` 的 key 亦在 Valkey 寫入 `auth:revoked:{key_id}`（TTL 24h）作為第二道判斷。
 - 平台可強制輪替（外洩事件）：設定 `force_rotate_by`，逾期未輪替的 key 自動 `revoked` 並通知商戶。
 - 所有建立 / retire / revoke 皆進稽核日誌（§8）。
 
@@ -383,7 +383,7 @@ sequenceDiagram
 | gRPC | `pkg/grpcx` 建 server/client 時強制 `tls.RequireAndVerifyClientCert`、TLS 1.3、驗證 peer SPIFFE ID；`PG_GRPC_INSECURE=true` 只允許在 `PG_ENV=local` |
 | Authz | `pkg/grpcx` interceptor 依下表允許清單檢查 caller SPIFFE ID × gRPC service/method；不在表內 → `PERMISSION_DENIED` 並稽核 |
 | Kafka | mTLS（同 CA）+ ACL：每服務只可 produce 自己的 topic、consume 訂閱的 topic，consumer group 固定命名 `{service}.{topic}` |
-| PostgreSQL / Redis / Vault | TLS 必開（`sslmode=verify-full`、Redis TLS、Vault TLS）；憑證由同一 CA 或雲端受管 CA |
+| PostgreSQL / Valkey / Vault | TLS 必開（`sslmode=verify-full`、Valkey TLS、Vault TLS）；憑證由同一 CA 或雲端受管 CA |
 | 外部 egress | 只有 `provider-*` 與 `webhook-service` 可連外；`provider-*` 限 PSP 網域（egress gateway FQDN allowlist） |
 
 ### 6.2 呼叫允許矩陣（gRPC）
@@ -453,7 +453,7 @@ pki_int/issue/pg-{env}-services                                # 僅在不使用
 |---|---|
 | PostgreSQL 資料卷 | 雲端受管磁碟加密（AES-256），KMS CMK 每 DB 一把（`pg-{env}-{svc}-disk`），年度輪替 |
 | 備份 / WAL 歸檔 | `pgBackRest` 或 WAL-G → 物件儲存，SSE-KMS 使用**獨立 CMK**（`pg-{env}-backup`），跨帳號/區域複本，Object Lock 35 天；每月還原演練 |
-| Redis | TLS + AUTH；啟用磁碟加密；`appendonly no`（冪等快取允許遺失；限流/健康度亦然）；不存任何 L2/L3 資料 |
+| Valkey | TLS + AUTH；啟用磁碟加密；`appendonly no`（冪等快取允許遺失；限流/健康度亦然）；不存任何 L2/L3 資料 |
 | Kafka | broker 磁碟加密；topic retention：`payment.events` 30 天（ledger 為事實來源）；L2 欄位在事件中已是必要最小集合 |
 | 物件儲存（爭議證據檔、結算檔、稽核歸檔） | SSE-KMS、Object Lock（稽核：compliance mode 7 年） |
 | 容器映像 / CI | 無祕密；cosign 簽章 |
@@ -466,7 +466,7 @@ pki_int/issue/pg-{env}-services                                # 僅在不使用
 | 服務間 | TLS 1.3 only + mTLS（§6.1） |
 | 服務 → PSP | TLS 1.2+，驗證系統 CA；Stripe 等支援時啟用 certificate pinning 於 adapter（以 SPKI hash，保留備援 pin） |
 | webhook-service → 商戶 | TLS 1.2+，驗證公開 CA；不接受自簽（test mode 可設 `allow_insecure_tls` 僅對 `pk_test_`） |
-| DB / Redis / Kafka / Vault | TLS，`verify-full` |
+| DB / Valkey / Kafka / Vault | TLS，`verify-full` |
 
 ### 7.3 應用層（欄位級）envelope encryption
 
@@ -585,7 +585,7 @@ flowchart TD
 | 18 | Elevation of privilege | test key 操作 live 資源 | 資金 | key mode 與資源 `live_mode` 強綁；路由層拒絕 test → 真實 PSP | — |
 | 19 | Elevation of privilege | SQL injection | 全部資料 | pgx 參數化查詢；禁止字串拼接（golangci-lint `sqlclosecheck`、semgrep 規則）；`statement_timeout` | — |
 | 20 | Elevation of privilege | `provider-stripe` pod 被入侵後橫向移動 | 其他服務 | adapter 無 DB、Vault policy 只含自己的 secret、NetworkPolicy 只能到 PSP 與 gateway；PSP key 使用 restricted key | PSP key 被濫用 → PSP 端 IP allowlist + 異常告警 |
-| 21 | Replay | 重放合法請求造成重複退款 | 資金 | timestamp 300s 窗 + Redis 簽章 nonce；`Idempotency-Key`；DB 唯一鍵 | — |
+| 21 | Replay | 重放合法請求造成重複退款 | 資金 | timestamp 300s 窗 + Valkey 簽章 nonce；`Idempotency-Key`；DB 唯一鍵 | — |
 | 22 | Race | 併發兩筆退款總和超過可退金額 | 資金 | `SELECT ... FOR UPDATE` + `refund_reserved_amount`（02 文件 §5.2） | — |
 | 23 | Supply chain | 惡意相依套件 / 被竄改的映像 | 全部 | `go.sum` 鎖定、`govulncheck`、Renovate 需審查、SBOM、cosign 簽章 + admission 驗證 | 零日 → 快速修補 SLA |
 | 24 | Tampering | 攻擊者修改商戶路由規則把交易導到高成本/惡意 Provider | 資金、成本 | Provider 只能從平台白名單選；規則變更稽核 + 商戶通知；Provider 憑證由平台管 | — |

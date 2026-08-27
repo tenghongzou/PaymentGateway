@@ -125,7 +125,7 @@ func (g *Gateway) Idempotency(next http.Handler) http.Handler {
 			httpx.WriteAppError(w, r, apperr.ErrIdempotencyInUse)
 			return
 		case err != nil:
-			// Redis 不可用：fail-closed（docs/05 §10.3）。
+			// Valkey 不可用：fail-closed（docs/05 §10.3）。
 			httpx.WriteAppError(w, r, apperr.ErrServiceUnavailable.Wrap(err))
 			return
 		}

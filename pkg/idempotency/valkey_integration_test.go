@@ -6,26 +6,29 @@ import (
 	"context"
 	"testing"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
+	tcvalkey "github.com/testcontainers/testcontainers-go/modules/valkey"
+	"github.com/valkey-io/valkey-go"
+	"github.com/valkey-io/valkey-go/valkeycompat"
 )
 
-func TestRedisStoreFlow(t *testing.T) {
+func TestValkeyStoreFlow(t *testing.T) {
 	ctx := context.Background()
-	c, err := tcredis.Run(ctx, "redis:7-alpine")
+	c, err := tcvalkey.Run(ctx, "valkey/valkey:8-alpine")
 	require.NoError(t, err)
 	testcontainers.CleanupContainer(t, c)
 	uri, err := c.ConnectionString(ctx)
 	require.NoError(t, err)
-	opt, err := redis.ParseURL(uri)
+	opt, err := valkey.ParseURL(uri)
 	require.NoError(t, err)
-	rdb := redis.NewClient(opt)
-	defer rdb.Close()
+	client, err := valkey.NewClient(opt)
+	require.NoError(t, err)
+	defer client.Close()
+	vdb := valkeycompat.NewAdapter(client)
 
-	s := NewRedisStore(rdb, 0)
+	s := NewValkeyStore(vdb, 0)
 	st, _, err := s.Begin(ctx, "m", "k", "h")
 	require.NoError(t, err)
 	assert.Equal(t, StateNew, st)

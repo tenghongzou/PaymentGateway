@@ -19,7 +19,7 @@ x-app-env: &app-env
   PG_LOG_LEVEL: ${PG_LOG_LEVEL:-debug}
   PG_AUTO_MIGRATE: "true"
   PG_MIGRATIONS_DIR: /migrations
-  PG_REDIS_ADDR: redis:6379
+  PG_VALKEY_ADDR: valkey:6379
   PG_KAFKA_BROKERS: kafka:9092
   PG_OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
   PG_OTEL_EXPORTER_OTLP_INSECURE: "true"
@@ -52,7 +52,7 @@ x-app-common: &app-common
 x-depends-infra: &depends-infra
   postgres:
     condition: service_healthy
-  redis:
+  valkey:
     condition: service_healthy
   kafka:
     condition: service_healthy
@@ -96,14 +96,14 @@ services:
     networks:
       - pg
 
-  redis:
-    image: redis:7-alpine
-    container_name: pg-redis
-    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: pg-valkey
+    command: ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${VALKEY_PORT:-6379}:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -283,7 +283,7 @@ services:
     ports:
       - "${GATEWAY_PORT:-8080}:8080"
     depends_on:
-      redis:
+      valkey:
         condition: service_healthy
       otel-collector:
         condition: service_started

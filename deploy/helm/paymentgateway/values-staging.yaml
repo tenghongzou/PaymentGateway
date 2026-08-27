@@ -5,8 +5,8 @@ global:
   autoMigrate: true               # services migrate on boot; migration Job is still rendered for parity
   imageTag: ""                    # set by CI to the commit SHA: --set global.imageTag=sha-<sha>
   imagePullPolicy: Always
-  redis:
-    addr: pg-staging-redis.internal:6379
+  valkey:
+    addr: pg-staging-valkey.internal:6379
     cidrs: ["10.30.0.0/16"]
   postgres:
     host: pg-staging.cluster-abc.ap-northeast-1.rds.amazonaws.com

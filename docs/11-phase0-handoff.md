@@ -59,7 +59,7 @@
 
 ## 5. 功能 TODO（依服務）
 
-**payment-service**：expire / auth-expiry sweeper、operation-reconciler（capture/void 逾時收斂）、refund-reconciler、`ListRefunds / GetDispute / ListDisputes / SubmitDisputeEvidence`、Redis 滑動視窗 circuit breaker（目前單實例記憶體版）、`PG_PROVIDER_RETRY_SAME_ON_UNAVAILABLE` 預設值於多 provider 時應改 false。
+**payment-service**：expire / auth-expiry sweeper、operation-reconciler（capture/void 逾時收斂）、refund-reconciler、`ListRefunds / GetDispute / ListDisputes / SubmitDisputeEvidence`、Valkey 滑動視窗 circuit breaker（目前單實例記憶體版）、`PG_PROVIDER_RETRY_SAME_ON_UNAVAILABLE` 預設值於多 provider 時應改 false。
 
 **api-gateway**：簽章 canonical 無 nonce——同一商戶同一秒送出完全相同請求會被 `signature_replayed` 擋下（API 設計師評估加 `X-Nonce`）；merchant.events 驅動的 API key 快取失效。
 
@@ -69,7 +69,7 @@
 
 **ledger-service**：`aggregate_version` 舊事件丟棄、`refund.succeeded` 早於 `refund.created` 的 deferred 處理、`RefundSucceeded.fee` 歸屬（商戶費 vs PSP 成本）確認。
 
-**webhook-service**：dead_letter 時寫 outbox `webhook.delivery.dead_lettered`、72h 全失敗自動停用、每端點 in-flight 上限、`RetryDelivery` 冪等鍵改 Redis/DB、thin payload、指標。
+**webhook-service**：dead_letter 時寫 outbox `webhook.delivery.dead_lettered`、72h 全失敗自動停用、每端點 in-flight 上限、`RetryDelivery` 冪等鍵改 Valkey/DB、thin payload、指標。
 
 **reconciliation-service**：Stripe parser 完整欄位、`s3://` 來源、`ResolveDiscrepancy` 的 `ADJUST_LEDGER/RESYNC_PAYMENT`、自動 re-match、`ledger_postings` 讀模型。
 
@@ -78,7 +78,7 @@
 ## 6. 本機跑起來
 ```bash
 make tools && make proto && make build
-docker compose -f deploy/compose/docker-compose.yaml up -d postgres redis kafka
+docker compose -f deploy/compose/docker-compose.yaml up -d postgres valkey kafka
 # 建 dev 商戶與金鑰
 eval "$(PG_ENV=dev PG_DATABASE_URL='postgres://merchant_owner:merchant_owner@localhost:5432/pg_merchant?sslmode=disable' ./bin/merchant-service seed-dev 2>/dev/null)"
 # 或用 PG_DEV_* 直接給 gateway（見 deploy/compose/.env.example）

@@ -20,7 +20,7 @@
 |---|---|---|---|
 | **Core Payments** | 3 | Tech Lead ×1、Backend Engineer ×2 | 商戶 REST API、付款/退款/爭議狀態機、路由與 failover、冪等、商戶與 API Key 管理 |
 | **Ledger & Recon** | 3 | Tech Lead ×1、Backend Engineer ×2（至少一位具會計/金融背景） | 雙式記帳、餘額、對帳、差異報表、（Phase 3）結算撥款與報表 |
-| **Platform / Infra** | 2 | SRE ×2（其中一位為 Platform Lead） | CI/CD、K8s/Helm、Kafka/Postgres/Redis/Vault 營運、可觀測性平台、DR、容量與效能 |
+| **Platform / Infra** | 2 | SRE ×2（其中一位為 Platform Lead） | CI/CD、K8s/Helm、Kafka/Postgres/Valkey/Vault 營運、可觀測性平台、DR、容量與效能 |
 | **Integrations（PSP adapters）** | 2 | Tech Lead ×1、Backend Engineer ×1 | ProviderAdapter 契約、provider-mock / stripe / adyen / linepay / ecpay、PSP inbound webhook 驗簽、對商戶的 webhook 投遞 |
 | **Security & Compliance** | 1 + 0.5 | Security Engineer ×1、Compliance 顧問 ×0.5（外部/兼任） | 威脅模型、簽章與金鑰管理、Vault 政策、PCI-DSS SAQ、滲透測試協調、稽核證據 |
 | **跨 squad** | 2 | Product Owner ×1、QA/SDET ×1 | PO：backlog、商戶需求、驗收；SDET：E2E/契約/負載測試框架、測試資料、品質門檻 |
@@ -127,12 +127,13 @@ R = Responsible（執行）、A = Accountable（最終負責，僅一人）、C 
    | 0004 | `0004-money-int64-minor-units.md` | 金額以 int64 最小貨幣單位表示，`pkg/money` | Core、Ledger |
    | 0005 | `0005-saga-orchestration-payment-service.md` | payment-service 作為 Saga orchestrator | Core |
    | 0006 | `0006-provider-adapter-as-service.md` | 每個 PSP 一個 adapter service，實作同一 ProviderAdapter proto | Integrations |
-   | 0007 | `0007-idempotency-key-two-layer.md` | 兩層冪等：api-gateway（Redis）+ payment-service（DB 唯一索引） | Core、Platform |
+   | 0007 | `0007-idempotency-key-two-layer.md` | 兩層冪等：api-gateway（Valkey）+ payment-service（DB 唯一索引） | Core、Platform |
    | 0008 | `0008-state-table-plus-append-only-events.md` | 狀態表 + append-only 事件表（Event Sourcing-lite） | Core、Ledger |
    | 0009 | `0009-ledger-append-only-and-reversal.md` | 帳本只能 INSERT，錯帳以反向分錄沖銷 | Ledger |
    | 0010 | `0010-rest-external-grpc-internal-no-graphql.md` | 對外 REST、對內 gRPC，不採用 GraphQL | Core、Integrations |
    | 0011 | `0011-kafka-over-nats-jetstream.md` | 事件匯流排選 Kafka 而非 NATS JetStream | Platform |
    | 0012 | `0012-commit-generated-protobuf.md` | protoc 產物 commit 進 repo，CI 驗證未手改 | 全員（Platform 維護 CI 檢查） |
+   | 0013 | `0013-valkey-over-redis.md` | 快取 / 冪等 / 限流儲存改用 Valkey 8（授權與 ElastiCache 對齊） | Core、Platform |
 
    > PCI 範圍策略（不接觸 PAN、使用 PSP tokenization）目前記錄於 `docs/06-security-compliance.md`，尚無獨立 ADR；若 Phase 2 商戶後台或 hosted fields 導致範圍重新評估，應以 ADR-0013 正式記錄（見風險 R2）。
 
@@ -353,7 +354,7 @@ gantt
 | `pkg/httpx` | Core | 01 文件第 8 節錯誤格式、request id、recovery、JSON helper |
 | `pkg/otel` | Platform | tracer/meter/logger 初始化、OTLP exporter、Kafka header 傳播 |
 | `pkg/sig` | Security | HMAC-SHA256 `t=,v1=` 格式簽章/驗證、常數時間比較、時間窗、雙 secret 輪替 |
-| `pkg/idempotency` | Core | Redis `SETNX` 鎖、`(request_hash, response)` 儲存、24h TTL、衝突偵測（ADR-0007 第一層） |
+| `pkg/idempotency` | Core | Valkey `SETNX` 鎖、`(request_hash, response)` 儲存、24h TTL、衝突偵測（ADR-0007 第一層） |
 | `pkg/outbox` | Platform（relay）+ Ledger（消費端） | outbox 表 schema 與 `Write(tx, event)`、relay worker（polling + `FOR UPDATE SKIP LOCKED`）、`processed_events` 去重 helper（ADR-0003） |
 | `pkg/eventbus` | Platform | Kafka producer/consumer 封裝（ADR-0011 選定 Kafka；Go client library 由後續 ADR 決定）、trace header、重試與 DLQ topic 慣例 |
 
@@ -368,7 +369,7 @@ gantt
 
 #### E0.4 本機環境 docker-compose — Sprint 1 — Size: M — Squad: Platform
 
-- **目標**：`make up` 啟動 Postgres（5 個 DB）、Redis、Kafka（KRaft 單節點）、OTel Collector、Prometheus、Grafana、Jaeger、Loki 與全部 8 個服務；`make down`、`make reset-db`、`make migrate`。
+- **目標**：`make up` 啟動 Postgres（5 個 DB）、Valkey、Kafka（KRaft 單節點）、OTel Collector、Prometheus、Grafana、Jaeger、Loki 與全部 8 個服務；`make down`、`make reset-db`、`make migrate`。
 - **涵蓋**：`deploy/compose/`、`deploy/otel/`、`Makefile`、`docs/07-deployment.md` 本機章節。
 - **User stories**：
   - As a new team member, I want 在 clone 後 15 分鐘內看到一筆付款的 trace 出現在 Jaeger, so that 我能立刻理解系統如何串接。
@@ -394,7 +395,7 @@ gantt
 
 #### E0.6 api-gateway MVP — Sprint 1 後半 ～ 2 — Size: L — Squad: Core Payments
 
-- **目標**：chi router、Bearer + HMAC 驗證（5 分鐘時間窗）、`Idempotency-Key` middleware（Redis）、簡單限流（per merchant token bucket）、REST↔gRPC 轉譯（ADR-0010）、01 文件第 8 節錯誤格式、`/psp/{provider}/webhook` 入口（轉交對應 adapter 的 `ParseWebhook`）。
+- **目標**：chi router、Bearer + HMAC 驗證（5 分鐘時間窗）、`Idempotency-Key` middleware（Valkey）、簡單限流（per merchant token bucket）、REST↔gRPC 轉譯（ADR-0010）、01 文件第 8 節錯誤格式、`/psp/{provider}/webhook` 入口（轉交對應 adapter 的 `ParseWebhook`）。
 - **涵蓋**：`internal/apigateway`、`pkg/httpx`、`pkg/idempotency`、`api/openapi`。
 - **User stories**：
   - As a merchant, I want 重送帶同一 `Idempotency-Key` 的請求得到同一個回應, so that 網路重試不會造成重複付款。
@@ -505,7 +506,7 @@ gantt
 | **E1.7 Chargeback 處理** | 4–5 | M | Core（主）+ Ledger | Stripe dispute webhook → `disputed`；`chargeback_won/lost`；ledger `chargeback_reserve` 提列與釋放；對商戶通知與證據提交 API（透傳 Stripe） | payment-service、ledger-service、webhook-service、provider-stripe | As a merchant, I want 收到爭議通知並能上傳證據, so that 我能爭取勝訴；As a finance operator, I want 爭議金額在帳本中被保留, so that 餘額反映風險 | Stripe 測試卡 `4000000000000259` 流程跑通；won/lost 分錄平衡；超過 PSP 期限的證據提交被拒並提示 | E1.1、E1.3 |
 | **E1.8 生產環境與 DR** | 3–5 | L | Platform | Helm chart、K8s（staging + production）、Vault（動態 DB 憑證、PSP key）、mTLS（cert-manager）、managed Kafka 與 Postgres、備份與 PITR、DR 演練（RPO 5 分鐘 / RTO 1 小時）、SLO 與 page 級告警、on-call 工具；更新 `docs/07-deployment.md` | 全部 | As an SRE, I want 一鍵從備份在另一區域還原並跑通 E2E, so that DR 不只是文件；As a Security Engineer, I want 服務只能以 Vault 短期憑證連 DB, so that 憑證外洩影響受限 | staging 與 production 以同一 chart 不同 values 部署；DR 演練紀錄（時間、RPO/RTO 實測）；所有 page 告警有 runbook；滾動更新零失敗請求（負載測試期間驗證） | E0.4、E0.11 |
 | **E1.9 安全強化與 PCI SAQ-A** | 4–5 | M | Security + Compliance | 威脅模型定稿；依賴與容器掃描進 CI；金鑰輪替 runbook 與演練（API key、webhook secret、PSP key、mTLS cert）；稽核日誌（誰改了商戶設定）；PCI SAQ-A 填寫與證據；外部滲透測試排程（執行於 Phase 2） | api-gateway、merchant-service、全部 | As a Compliance 顧問, I want 技術控制清單對應 SAQ-A 每一題, so that 稽核可一次通過；As a Security Engineer, I want 每季輪替所有金鑰且有演練紀錄, so that 輪替不會在緊急時才第一次做 | SAQ-A 簽署完成；輪替演練在 staging 完成且零停機；CI 阻擋 high/critical 漏洞；稽核日誌不可竄改（append-only + 外送） | E1.8 |
-| **E1.10 負載測試與效能** | 5 | M | SDET + Platform | k6 腳本（建立付款、查詢、退款混合）；目標 500 TPS 持續 30 分鐘、建立付款 P99 < 300ms（不含 PSP）；找出瓶頸（Redis 冪等、outbox relay、DB index）並修正；容量模型文件 | 全部 | As an SRE, I want 知道每個服務在 500 TPS 下的 CPU/記憶體/連線數, so that Helm 的 requests/limits 與 HPA 有依據 | 報告含 P50/P95/P99、錯誤率 0、outbox lag < 2 秒、ledger imbalance 0；HPA 設定依結果調整 | E1.8、provider-mock 延遲注入 |
+| **E1.10 負載測試與效能** | 5 | M | SDET + Platform | k6 腳本（建立付款、查詢、退款混合）；目標 500 TPS 持續 30 分鐘、建立付款 P99 < 300ms（不含 PSP）；找出瓶頸（Valkey 冪等、outbox relay、DB index）並修正；容量模型文件 | 全部 | As an SRE, I want 知道每個服務在 500 TPS 下的 CPU/記憶體/連線數, so that Helm 的 requests/limits 與 HPA 有依據 | 報告含 P50/P95/P99、錯誤率 0、outbox lag < 2 秒、ledger imbalance 0；HPA 設定依結果調整 | E1.8、provider-mock 延遲注入 |
 | **E1.11 Pilot 商戶 onboarding** | 5–6 | S | PO + Core | 商戶整合文件（快速開始、驗簽範例 Node/Go/PHP、錯誤碼表、測試卡）、sandbox 環境與測試 key、支援流程（工單、SLA 回覆時間）、商戶協議草案（SLA 99.95%） | api-gateway、docs | As a pilot merchant, I want 在一天內從拿到 key 到完成第一筆 sandbox 付款, so that 整合成本低 | 一家 pilot 商戶在 staging 完成整合且通過驗收清單；文件由非團隊成員試讀通過 | E1.1、E1.4 |
 | **Sprint 6 Hardening 與 Go-live** | 6 | M | 全員 | 凍結功能；bug 修復；Go-live checklist（第 5 節）逐項完成；production 首筆真實交易（小額）；監控 72 小時 | 全部 | — | 第 5 節 checklist 全部勾選；Go/No-go 會議紀錄；首週無 Sev1 | 所有 Phase 1 epic |
 
@@ -538,7 +539,7 @@ gantt
 | **E3.2 多幣別記帳** | 12–13 | L | Core + Ledger | 每幣別獨立帳戶（`merchant_payable:TWD`、`:USD`…）；PSP 結算幣別與交易幣別不同時記錄 PSP 匯率與換匯損益（不自行換匯，01 文件非目標）；多幣別餘額查詢與報表 | payment-service、ledger-service、reconciliation-service | As a merchant selling globally, I want 看到每個幣別的餘額與 PSP 換匯後的結算金額, so that 財務能入帳 | 不同幣別永不混算（`pkg/money` 保證）；換匯損益帳戶平衡；對帳支援結算幣別 ≠ 交易幣別 | E1.3、E2.6 |
 | **E3.3 商戶報表與匯出** | 13–14 | M | Ledger + PO | 月結帳單、交易明細匯出（CSV/Excel）、排程寄送、財務報表（收入、手續費、退款率、爭議率）、後台整合 | reconciliation-service 或獨立 reporting 模組、商戶後台 | As a merchant accountant, I want 每月 1 日收到上月帳單與明細, so that 結帳流程不需人工請求 | 報表數字與帳本一致（自動比對）；大商戶（100 萬筆/月）匯出 < 5 分鐘；排程可靠 | E2.5、E3.1 |
 | **E3.4 provider-ecpay** | 12–13 | M | Integrations | 綠界 ECPay adapter（信用卡、ATM 虛擬帳號等非同步付款方式）；ECPay 對帳檔 | provider-ecpay | As a merchant in Taiwan, I want 提供 ATM 轉帳, so that 無卡客群可付款 | 非同步付款方式的 `requires_action` → 逾期失效流程；對帳檔匯入 | E2.4 經驗、E2.6 |
-| **E3.5 稽核就緒與 DR 演練** | 14–15 | M | Security + Platform + Compliance | 年度 PCI SAQ 更新；DR 全面演練（含 Kafka 與 Redis）；稽核證據自動蒐集；事故演練（game day：雙重扣款、PSP 全掛、ledger 不平衡） | 全部 | As a Compliance 顧問, I want 所有稽核證據在一個地方且自動更新, so that 稽核準備從週變成天 | DR 演練達 RPO/RTO；三場 game day 紀錄與改進項目；SAQ 更新簽署 | E1.8、E1.9、E2.8 |
+| **E3.5 稽核就緒與 DR 演練** | 14–15 | M | Security + Platform + Compliance | 年度 PCI SAQ 更新；DR 全面演練（含 Kafka 與 Valkey）；稽核證據自動蒐集；事故演練（game day：雙重扣款、PSP 全掛、ledger 不平衡） | 全部 | As a Compliance 顧問, I want 所有稽核證據在一個地方且自動更新, so that 稽核準備從週變成天 | DR 演練達 RPO/RTO；三場 game day 紀錄與改進項目；SAQ 更新簽署 | E1.8、E1.9、E2.8 |
 
 **M3 退出條件**：至少一家商戶完成一次真實撥款且三方金額相等；多幣別商戶報表經財務驗證；ECPay 上線。
 
@@ -562,12 +563,12 @@ gantt
 | R2 | **PCI 範圍擴大**（例如商戶後台、hosted fields 實作方式或日誌意外含卡號）導致從 SAQ-A 變 SAQ-A-EP 甚至 SAQ-D | 3 | 5 | 15 | `docs/06-security-compliance.md` 明訂不接觸 PAN（建議補 ADR 正式化）；api-gateway 入口做 PAN pattern 偵測並拒絕（Luhn 檢查）；log 欄位白名單；Security review 為所有前端/輸入相關 PR 必要 reviewer；Phase 2 開始前重新評估範圍 | 若範圍擴大，立即凍結相關功能並找 QSA 諮詢，調整 Phase 2 時程 | Security Engineer | 開放 |
 | R3 | **帳本一致性缺陷**（借貸不平衡、事件漏記/重記、沖銷錯誤）造成商戶餘額錯誤 | 3 | 5 | 15 | DB constraint + append-only role（ADR-0009）；`processed_events` 去重；每日一致性 job（E1.3）；`pg_ledger_imbalance_total` page 級告警；金流變更需 Ledger reviewer；property-based 測試 | 發現時凍結撥款（Phase 3）與對外餘額顯示，以反向分錄修正並出具事故報告 | Ledger TL | 開放 |
 | R4 | **Kafka 營運複雜度**（partition 重平衡、consumer lag、順序保證、DLQ 處理）超出 2 人 SRE 能力 | 4 | 3 | 12 | 使用 managed Kafka；Phase 0 即以 `payment_id` 為 key 保序；consumer 統一用 `pkg/eventbus` 封裝；lag 告警；DLQ 處理 runbook；Phase 1 安排 Kafka 訓練 | 若 lag 長期無法控制，評估退回「outbox + 直接 gRPC 通知」的過渡方案（需新 ADR supersede ADR-0011） | Platform Lead | 開放 |
-| R5 | **雙重扣款事故**（冪等失效、failover 時第一個 PSP 實際已成功、重試風暴） | 2 | 5 | 10 | 三層冪等（Redis、DB 唯一索引、PSP idempotency key 透傳；前兩層見 ADR-0007）；failover 前先 `GetPaymentStatus` 確認未知結果；每筆 Authorize 帶 PSP 端 idempotency key；對帳偵測「PSP 有、我方無」的交易；混沌測試注入逾時 | 啟動 Sev1；以對帳找出受影響交易，24 小時內自動退款並通知商戶；事後檢討 | Core Payments TL | 開放 |
+| R5 | **雙重扣款事故**（冪等失效、failover 時第一個 PSP 實際已成功、重試風暴） | 2 | 5 | 10 | 三層冪等（Valkey、DB 唯一索引、PSP idempotency key 透傳；前兩層見 ADR-0007）；failover 前先 `GetPaymentStatus` 確認未知結果；每筆 Authorize 帶 PSP 端 idempotency key；對帳偵測「PSP 有、我方無」的交易；混沌測試注入逾時 | 啟動 Sev1；以對帳找出受影響交易，24 小時內自動退款並通知商戶；事後檢討 | Core Payments TL | 開放 |
 | R6 | **人員缺口 / 關鍵人員離職**（特別是 Ledger 與 Integrations 各僅 2–3 人） | 3 | 4 | 12 | 每個服務至少兩人熟悉（pairing、輪流 on-call）；runbook 與 ADR 文件化；Phase 1 前補齊 Integrations 第 2 人；避免單人長期負責同一服務 | 重新排定 sprint 優先序，必要時外包非核心（商戶後台前端、adapter）；PM 維護替補名單 | PM | 開放 |
 | R7 | **法規變動**（台灣電子支付機構管理條例、個資法、PSD2/SCA 要求、PSP 合約條款）影響功能或上市資格 | 2 | 4 | 8 | Compliance 顧問每季法規掃描；3DS/SCA 流程在 Phase 0 即設計為一等公民；不持有資金（直接由 PSP 結算到商戶）以避開電支牌照，Phase 3 撥款設計前再確認 | 若需牌照，Phase 3 撥款改為「指令 PSP payout」而非自行持有資金 | Compliance 顧問 | 開放 |
 | R8 | **Phase 1 時程過度樂觀**（8 週內完成 Stripe、ledger、對帳、生產環境、SAQ） | 4 | 3 | 12 | Sprint 6 保留為 hardening；E1.5 對帳與 E1.7 chargeback 標記為可降級（M1 可接受手動對帳一週）；每 sprint 燃盡追蹤；Sprint 4 結束做 M1 可行性檢查點 | 若 Sprint 4 檢查點落後 > 20%，M1 範圍縮減為「Stripe + ledger + webhook 重試」，對帳延至 Sprint 7 | PM | 開放 |
 | R9 | **Webhook 投遞壓垮商戶或被濫用**（商戶端點緩慢導致 worker 阻塞、SSRF 風險） | 3 | 3 | 9 | per endpoint 併發上限與逾時；端點 URL 驗證（禁止內網 IP、需 HTTPS）；連續失敗自動停用；投遞 worker 與消費 worker 分離 | 停用問題端點並通知商戶；必要時全域降速 | Integrations TL | 開放 |
-| R10 | **Redis 故障導致冪等層失效**（api-gateway 的 SETNX 不可用） | 2 | 4 | 8 | Redis 為 fail-closed（不可用時寫入 API 回 503 而非略過冪等）；managed Redis 高可用；DB 唯一索引為最後防線 | 切換到 standby；事後用對帳確認無重複 | Platform Lead | 開放 |
+| R10 | **Valkey 故障導致冪等層失效**（api-gateway 的 SETNX 不可用） | 2 | 4 | 8 | Valkey 為 fail-closed（不可用時寫入 API 回 503 而非略過冪等）；managed Valkey 高可用；DB 唯一索引為最後防線 | 切換到 standby；事後用對帳確認無重複 | Platform Lead | 開放 |
 | R11 | **商戶後台需要前端能力，團隊無前端工程師** | 4 | 2 | 8 | Phase 2 開始前決定：外包前端或採用低程式碼管理後台框架；BFF API 先行由 Core 開發，前端可平行 | 若外包延誤，M2 以「API + 基本 CLI 工具」替代後台，後台延至 Phase 3 | PO | 開放 |
 | R12 | **PSP 合約或費率談判延遲**（Adyen、LINE Pay 申請流程數週至數月） | 3 | 3 | 9 | Phase 1 即啟動 Adyen 與 LINE Pay 的商務申請；sandbox 帳號先行；adapter 以契約測試開發不等正式帳號 | 調整 Phase 2 順序：先 LINE Pay（申請較快）後 Adyen | PO | 開放 |
 | R13 | **跨 DB 沒有分散式交易，Saga 補償邏輯出錯**（例如 capture 成功但 outbox relay 長時間停擺，商戶久未收到通知） | 3 | 3 | 9 | outbox lag 告警（> 30 秒 warning，> 5 分鐘 page）；relay 多副本 + `SKIP LOCKED`；商戶可用 `GET /v1/payments/{id}` 主動查詢（文件強調不可只依賴 webhook） | 重啟 relay；重放 outbox；通知受影響商戶 | Platform Lead | 開放 |
@@ -584,7 +585,7 @@ gantt
 
 - [ ] **負載測試**：500 TPS 持續 30 分鐘，建立付款 P99 < 300ms（不含 PSP），錯誤率 0，outbox lag < 2 秒，`pg_ledger_imbalance_total` = 0（E1.10 報告附上）。
 - [ ] **滾動更新驗證**：負載期間執行部署，零失敗請求。
-- [ ] **DR 演練**：已於上線前 2 週內完成一次完整演練（Postgres PITR 還原、Kafka 重建、Redis 切換），實測 RPO ≤ 5 分鐘、RTO ≤ 1 小時，紀錄存檔。
+- [ ] **DR 演練**：已於上線前 2 週內完成一次完整演練（Postgres PITR 還原、Kafka 重建、Valkey 切換），實測 RPO ≤ 5 分鐘、RTO ≤ 1 小時，紀錄存檔。
 - [ ] **備份**：所有 5 個 DB 每日全備 + WAL 歸檔；還原測試通過；備份加密且跨區域。
 - [ ] **告警到位**：SLO（可用性 99.95%、P99）burn-rate 告警；`pg_ledger_imbalance_total > 0`、outbox lag、webhook 失敗率、provider 錯誤率、DB 連線數、Kafka lag、憑證到期均有告警；每個 page 級告警有 runbook 連結且經 on-call 演練。
 - [ ] **Runbook**：每個服務有 `docs/runbooks/<service>.md`，至少涵蓋：服務無回應、DB 連線耗盡、outbox 停擺、PSP 全面失敗、ledger 不平衡、webhook 死信處理、金鑰輪替、回滾。
@@ -594,7 +595,7 @@ gantt
 - [ ] **設定與祕密**：production 所有 `PG_*` 變數已依 `docs/07-deployment.md` 審閱；Stripe live key 存於 Vault 且僅 provider-stripe 可讀；webhook signing secret 已在 Stripe dashboard 設定且驗簽測試通過。
 - [ ] **資料**：production DB 已跑完 migrations；seed 資料僅限必要（無測試商戶）。
 - [ ] **E2E 在 production**：以內部測試商戶與真實小額交易（例如 TWD 10）完成付款、退款，並確認 ledger、webhook、對帳。
-- [ ] **相依服務**：Stripe 帳號為 live 模式且 KYC 完成；managed Kafka / Postgres / Redis 的 SLA 與支援合約生效。
+- [ ] **相依服務**：Stripe 帳號為 live 模式且 KYC 完成；managed Kafka / Postgres / Valkey 的 SLA 與支援合約生效。
 
 ### 5.2 合規與安全
 
