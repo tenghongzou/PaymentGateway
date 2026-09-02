@@ -157,7 +157,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      security-events: write
     strategy:
       fail-fast: false
       matrix:
@@ -233,12 +232,15 @@ jobs:
         env:
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-      - name: upload trivy sarif
-        if: always() && env.PUSH == 'true'
-        uses: github/codeql-action/upload-sarif@v3
+      # 此 repo 未啟用 GitHub Code Scanning（private repo 需 Advanced Security），upload-sarif 會 403；
+      # SARIF 先以 workflow artifact 保存，日後啟用 Code Scanning 再改回 github/codeql-action/upload-sarif。
+      - name: upload trivy sarif (artifact)
+        if: always() && hashFiles(format('trivy-{0}.sarif', matrix.service)) != ''
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: trivy-${{ matrix.service }}.sarif
-          category: trivy-${{ matrix.service }}
+          name: trivy-image-${{ matrix.service }}
+          path: trivy-${{ matrix.service }}.sarif
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   security:
@@ -247,7 +249,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-      security-events: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -277,11 +278,13 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "0"
-      - uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      - name: upload trivy fs sarif (artifact)
+        if: always() && hashFiles('trivy-fs.sarif') != ''
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: trivy-fs.sarif
-          category: trivy-fs
+          name: trivy-fs
+          path: trivy-fs.sarif
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   helm:

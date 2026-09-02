@@ -1,0 +1,21 @@
+# gitleaks 設定：沿用官方預設規則，只放行已知的假憑證所在位置。
+# 真正的祕密一律不進 repo（見 docs/06-security-compliance.md）；此處放行的都是文件範例、契約範例、測試 fixture 與 env 範本。
+title = "PaymentGateway gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Placeholder credentials in docs, API contract examples, test fixtures and env templates"
+paths = [
+  '''^docs/''',
+  '''^api/openapi/''',
+  '''\.env\.example$''',
+  '''_test\.go$''',
+  '''^test/''',
+]
+regexes = [
+  # 範例用的假 key：sk_test_placeholder 與 base64("foobarbazqux1234567890abcdefgh")
+  '''(sk|pk)_(test|live)_placeholder''',
+  '''Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdo''',
+]
