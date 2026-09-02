@@ -1,6 +1,16 @@
 # binaries / tools
 /bin/
 /dist/
+# `go build ./cmd/<svc>` 在 repo 根目錄產出的 binary（正式產物走 make build → /bin/）
+/api-gateway
+/merchant-service
+/payment-service
+/ledger-service
+/webhook-service
+/reconciliation-service
+/provider-mock
+/provider-stripe
+/.ci-out/
 *.exe
 *.test
 *.out

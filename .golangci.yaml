@@ -147,7 +147,6 @@ linters:
       check:
         - switch
         - map
-      check-generated: false
       explicit-exhaustive-switch: false
       ignore-enum-types: ""
 

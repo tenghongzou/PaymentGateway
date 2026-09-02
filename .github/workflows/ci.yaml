@@ -222,7 +222,7 @@ jobs:
           provenance: ${{ env.PUSH == 'true' }}
           sbom: ${{ env.PUSH == 'true' }}
       - name: trivy image scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:commit-${{ github.sha }}
           format: sarif
@@ -267,7 +267,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_SUMMARY: "true"
       - name: trivy fs (vuln + misconfig + secrets on Dockerfile/helm/compose)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -299,12 +299,15 @@ jobs:
           helm lint $CH --strict -f $CH/values-staging.yaml
           helm lint $CH --strict -f $CH/values-production.yaml
       - name: helm template
+        # 輸出放在 workspace 內：下一步 kubeconform 是 docker action，只掛載 $GITHUB_WORKSPACE，看不到 runner 的 /tmp。
         run: |
           set -e
           CH=deploy/helm/paymentgateway
-          helm template pg $CH --kube-version=1.30.0 -n payments > /tmp/default.yaml
-          helm template pg $CH --kube-version=1.30.0 -n payments -f $CH/values-staging.yaml > /tmp/staging.yaml
-          helm template pg $CH --kube-version=1.30.0 -n payments -f $CH/values-production.yaml > /tmp/production.yaml
+          OUT=.ci-out/helm
+          mkdir -p "$OUT"
+          helm template pg $CH --kube-version=1.30.0 -n payments > "$OUT/default.yaml"
+          helm template pg $CH --kube-version=1.30.0 -n payments -f $CH/values-staging.yaml > "$OUT/staging.yaml"
+          helm template pg $CH --kube-version=1.30.0 -n payments -f $CH/values-production.yaml > "$OUT/production.yaml"
       - name: kubeconform
         uses: docker://ghcr.io/yannh/kubeconform:v0.6.7
         with:
@@ -313,7 +316,7 @@ jobs:
             -kubernetes-version 1.30.0
             -schema-location default
             -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
-            /tmp/default.yaml /tmp/staging.yaml /tmp/production.yaml
+            .ci-out/helm/default.yaml .ci-out/helm/staging.yaml .ci-out/helm/production.yaml
       - name: compose config
         run: |
           cd deploy/compose
